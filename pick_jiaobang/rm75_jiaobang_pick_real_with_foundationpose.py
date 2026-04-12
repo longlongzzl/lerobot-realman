@@ -718,7 +718,7 @@ def register_scene_obstacles(env, demo, bridge_mod, T_base_cam: np.ndarray, scen
         global_box_scale = float(max(getattr(args, "scene_obstacle_box_scale", 1.0), 1e-3))
         object_box_scale = float(max(getattr(object_spec, "scene_obstacle_box_scale", 1.0) or 1.0, 1e-3))
         placed_box_scale = (
-            float(max(getattr(args, "placed_scene_obstacle_box_scale", 1.10), 1e-3))
+            float(max(getattr(args, "placed_scene_obstacle_box_scale", 1.0), 1e-3))
             if is_placed_obstacle
             else 1.0
         )
@@ -854,7 +854,7 @@ def build_arg_parser():
     parser.add_argument(
         "--placed-scene-obstacle-box-scale",
         type=float,
-        default=1.10,
+        default=1.0,
         help="Extra planner-box scale multiplier applied only to already placed scene obstacles cached from previous cycles.",
     )
     parser.add_argument("--camera-width", type=int, default=640)
@@ -2050,6 +2050,48 @@ def sync_demo_gripper_state(demo, closed: bool, steps: int = 3):
             print(f"[sim gripper] {'closed' if closed else 'opened'} preview after {total_steps} steps, pad gap={gap:.4f} m")
     except Exception as exc:
         print(f"[warn] failed to sync simulated gripper state: {exc}")
+
+
+def get_current_active_object_world_pose_matrix(demo) -> np.ndarray | None:
+    try:
+        obj_pose = demo.base_env.obj.pose
+        return pose_to_matrix(flatten_np(obj_pose.p)[:3], flatten_np(obj_pose.q)[:4]).astype(np.float32)
+    except Exception:
+        return None
+
+
+def remember_current_active_object_world_pose_for_scene_cache(demo) -> np.ndarray | None:
+    T_world_obj = get_current_active_object_world_pose_matrix(demo)
+    if T_world_obj is None:
+        return None
+    demo._scene_cache_placed_object_world_pose = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4).copy()
+    return demo._scene_cache_placed_object_world_pose
+
+
+def settle_released_active_object_for_scene_cache(demo, args) -> np.ndarray | None:
+    settle_steps = 60
+    demo._freeze_active_object_before_grasp = False
+    demo._frozen_active_object_pose = None
+    if settle_steps > 0:
+        gripper_open_value = float(getattr(args, "gripper_open", -1.0))
+        try:
+            demo.hold_current_and_set_gripper(gripper_open_value, steps=settle_steps)
+            print(f"[place settle] simulated {settle_steps} step(s) after release to let the object settle")
+        except Exception as exc:
+            print(f"[warn] failed to settle released object in simulation: {exc}")
+    try:
+        demo.refresh_runtime_handles(rebuild_visual=False)
+    except Exception:
+        pass
+    sync_planner_qpos_from_demo(demo)
+    update_attached_box_visual(demo, visible=False)
+    T_world_obj = remember_current_active_object_world_pose_for_scene_cache(demo)
+    if T_world_obj is not None:
+        print(
+            "[place settle] remembered released object pose at world translation="
+            f"{np.round(T_world_obj[:3, 3], 6).tolist()}"
+        )
+    return T_world_obj
 
 
 def confirm_simple_action(label: str, args, bridge_mod=None, env=None, repeats: int = 8) -> bool:
@@ -3290,6 +3332,45 @@ def make_lifted_tcp_pose(demo, lift_height: float, retreat_distance: float = 0.0
     return make_pose_with_position(tcp_pose, tcp_p)
 
 
+def make_tcp_axis_retreat_pose(demo, retreat_distance: float):
+    from transforms3d.quaternions import quat2mat
+
+    tcp_pose = demo.tcp.pose
+    tcp_p = flatten_np(tcp_pose.p)[:3].copy().astype(np.float32)
+    tcp_q = flatten_np(tcp_pose.q)[:4].copy().astype(np.float32)
+    R_tcp = quat2mat(tcp_q).astype(np.float32)
+    approaching = _normalize_vec(R_tcp[:, 2])
+    if approaching is None:
+        return make_pose_with_position(tcp_pose, tcp_p)
+    tcp_p = (tcp_p - approaching * float(retreat_distance)).astype(np.float32)
+    return make_pose_with_position(tcp_pose, tcp_p)
+
+
+def plan_post_place_clearance_path(
+    demo,
+    *,
+    retreat_distance: float = 0.05,
+    start_q=None,
+    label: str = "post_place_clearance",
+):
+    clearance_pose = make_tcp_axis_retreat_pose(demo, retreat_distance)
+    q_start = np.asarray(demo.current_arm_qpos() if start_q is None else start_q, dtype=np.float32).reshape(-1)[:7]
+    q_path = plan_lift_path(
+        demo,
+        clearance_pose,
+        use_attach=False,
+        label=label,
+        start_q=q_start,
+        planning_time=2.0,
+        rrt_range=0.10,
+        allow_pose_rrt_fallback=True,
+        max_segment_joint_delta=0.35,
+        max_segment_joint7_delta=0.45,
+        max_segment_norm_delta=0.60,
+    )
+    return clearance_pose, q_path
+
+
 def confirm_joint_path_motion(demo, bridge_mod, label: str, q_path, args) -> bool:
     if not q_path:
         print(f"[planner] {label} is a zero-length joint path; nothing to confirm")
@@ -3588,15 +3669,30 @@ def align_real_robot_to_sim_start(demo, bridge_mod, real_exec: RealmanJointExecu
     return ok, q_sent
 
 
-def execute_pose_path_stage(demo, bridge_mod, real_exec: RealmanJointExecutor | None, label: str, pose, q_path, gripper_pos: float, args, *, use_attach: bool = False, allow_start_in_collision: bool = False):
+def execute_pose_path_stage(
+    demo,
+    bridge_mod,
+    real_exec: RealmanJointExecutor | None,
+    label: str,
+    pose,
+    q_path,
+    gripper_pos: float,
+    args,
+    *,
+    use_attach: bool = False,
+    allow_start_in_collision: bool = False,
+    skip_confirmation: bool = False,
+):
     q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in q_path]
     if not q_path:
         q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
         print(f"[planner] {label} is a zero-length pose path; skipping execution")
         return True, q_current
-    if not confirm_planned_motion_or_skip(demo, bridge_mod, label, pose, q_path[-1], args, q_preview_path=q_path):
+    if not skip_confirmation and not confirm_planned_motion_or_skip(demo, bridge_mod, label, pose, q_path[-1], args, q_preview_path=q_path):
         print(f"[abort] user cancelled before executing {label}")
         return False, None
+    if skip_confirmation:
+        print(f"[planner] auto-executing {label} without separate preview/confirmation")
     if real_exec is not None:
         ok, q_sent = execute_real_waypoint_path_with_shadow(
             demo,
@@ -4182,8 +4278,12 @@ def cache_successfully_placed_object_world_pose(demo, object_name: str, object_a
     if normalized is None:
         return
     try:
-        obj_pose = demo.base_env.obj.pose
-        T_world_obj = pose_to_matrix(flatten_np(obj_pose.p)[:3], flatten_np(obj_pose.q)[:4]).astype(np.float32)
+        cached_pose = getattr(demo, "_scene_cache_placed_object_world_pose", None)
+        if cached_pose is not None:
+            T_world_obj = np.asarray(cached_pose, dtype=np.float32).reshape(4, 4)
+        else:
+            obj_pose = demo.base_env.obj.pose
+            T_world_obj = pose_to_matrix(flatten_np(obj_pose.p)[:3], flatten_np(obj_pose.q)[:4]).astype(np.float32)
     except Exception as exc:
         print(f"[scene cache] failed to cache placed object {normalized}: {exc}")
         return

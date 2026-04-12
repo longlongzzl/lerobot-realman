@@ -116,6 +116,7 @@ class RM75CuRoboPlanner:
         self._collision_enabled = self._robot_cfg_has_collision_model(self.robot_cfg_dict)
         self._empty_world = self.mods["WorldConfig"]()
         self._world = self._empty_world
+        self._mesh_world_initialized = False
         self.ik_solver = self._build_ik_solver()
         self.motion_gen = self._build_motion_gen()
 
@@ -768,6 +769,13 @@ class RM75CuRoboPlanner:
                 "World collision updates need a formal robot config with collision_spheres."
             )
         world_cfg = self.build_world_from_obstacles(cuboids=cuboids, meshes=meshes)
+        needs_mesh_world = len(list(meshes or [])) > 0
+        if needs_mesh_world and not self._mesh_world_initialized:
+            self._world = world_cfg
+            self.ik_solver = self._build_ik_solver()
+            self.motion_gen = self._build_motion_gen()
+            self._mesh_world_initialized = True
+            return
         self.motion_gen.update_world(world_cfg)
         self.ik_solver.update_world(world_cfg)
         self._world = world_cfg

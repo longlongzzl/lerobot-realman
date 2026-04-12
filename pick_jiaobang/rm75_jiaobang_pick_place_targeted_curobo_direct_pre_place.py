@@ -793,6 +793,38 @@ def _evaluate_curobo_pose_candidates_goalset(
     chunk_size = int(getattr(args, "curobo_batch_chunk_size", 64))
     if chunk_size <= 0:
         chunk_size = len(remaining)
+    ik_screened = []
+    ik_status_counts = {}
+    ik_screen_total = len(remaining)
+    for start_idx in range(0, len(remaining), chunk_size):
+        chunk = remaining[start_idx : start_idx + chunk_size]
+        planner_poses = [
+            _convert_demo_tcp_pose_to_curobo_ee_pose(
+                demo,
+                item["pose"],
+                ee_link_name=ee_link_name,
+            )
+            for item in chunk
+        ]
+        start_qs = [start_q for _ in chunk]
+        ik_results = planner.solve_batch_start_goal_ik(
+            start_qs,
+            planner_poses,
+            num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if num_ik_seeds is None else num_ik_seeds),
+        )
+        for candidate, ik_result in zip(chunk, ik_results):
+            status_key = str(ik_result.status)
+            ik_status_counts[status_key] = int(ik_status_counts.get(status_key, 0)) + 1
+            if ik_result.success:
+                ik_screened.append(candidate)
+    remaining = ik_screened
+    status_summary = ", ".join(f"{k}={v}" for k, v in sorted(ik_status_counts.items()))
+    print(
+        f"[curobo][diag] {label} IK prefilter kept {len(remaining)}/{ik_screen_total} candidate(s); "
+        f"statuses: {status_summary or 'none'}"
+    )
+    if not remaining:
+        return []
     num_chunks = max(1, (len(remaining) + chunk_size - 1) // chunk_size)
     print(
         f"[curobo] {label} evaluating {len(remaining)} candidate(s) "
@@ -1755,34 +1787,45 @@ def run_targeted_place_episode_curobo_direct(
     demo._attached_box_visual_visible = False
     demo._attached_object_visual_active = False
     targeted.base.update_attached_box_visual(demo, visible=False)
-    targeted._mark_place_rule_success(rule, place_state_cache, place_choice["slot_name"])
-
-    if direct_place_mode:
-        q_retreat_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in reversed(q_pre_place_path[:-1])]
-    else:
-        q_retreat_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in reversed(q_place_path[:-1])]
-    if q_retreat_path:
+    clearance_pose, q_clearance_path = targeted.base.plan_post_place_clearance_path(
+        demo,
+        retreat_distance=0.05,
+        label="post_place_clearance",
+    )
+    clearance_executed = False
+    if q_clearance_path:
         ok, _ = targeted.base.execute_pose_path_stage(
             demo,
             bridge_mod,
             real_exec,
-            "post_place_retreat",
-            place_choice["pose"],
-            q_retreat_path,
+            "post_place_clearance",
+            clearance_pose,
+            q_clearance_path,
             args.real_gripper_open,
             args,
             use_attach=False,
+            skip_confirmation=True,
         )
         if not ok:
-            if relaxed_target_collision:
-                targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
-            print("[warn] post-place retreat execution failed after the object was already released; keeping the placement result and ending this cycle without retreat")
-            print("[done] completed one targeted place motion; post-place retreat was skipped")
-            return True
+            print("[warn] post-place clearance execution failed after release; continuing to settle the object in place")
+        else:
+            clearance_executed = True
+            print(
+                "[place] post_place_clearance final q:",
+                np.round(np.asarray(q_clearance_path[-1], dtype=np.float32).reshape(-1)[:7], 5).tolist(),
+            )
+    else:
+        print("[warn] post-place clearance planning failed after release; settling the object without moving the arm away first")
+
+    targeted.base.settle_released_active_object_for_scene_cache(demo, args)
+    targeted._mark_place_rule_success(rule, place_state_cache, place_choice["slot_name"])
 
     if relaxed_target_collision:
         targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
-    print("[done] completed one targeted place motion and retreated after release")
+    if clearance_executed:
+        print("[done] completed one targeted place motion and cleared 5cm along the gripper axis before settling the released object")
+    else:
+        print("[done] completed one targeted place motion; post-place clearance did not execute, so the next cycle will start from the release pose")
     return True
 
 

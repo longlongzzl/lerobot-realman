@@ -113,11 +113,41 @@ def build_arg_parser():
         default=[0.0, 0.02, 0.04],
         help="Additional world-z hover heights to try on top of each rule's base hover_height when building pre_place candidates.",
     )
+    parser.add_argument(
+        "--carry-sim-arm-across-cycles",
+        dest="carry_sim_arm_across_cycles",
+        action="store_true",
+        default=True,
+        help="When repeating cycles in simulation, carry the final simulated arm joint state into the next recreated env so planning continues from the previous cycle's end posture. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-carry-sim-arm-across-cycles",
+        dest="carry_sim_arm_across_cycles",
+        action="store_false",
+        help="Reset the simulated arm to the new env's default start state on every cycle.",
+    )
+    parser.add_argument(
+        "--post-place-retreat-after-release",
+        dest="post_place_retreat_after_release",
+        action="store_true",
+        default=False,
+        help="After releasing the object, execute the planned retreat trajectory before ending the cycle.",
+    )
+    parser.add_argument(
+        "--no-post-place-retreat-after-release",
+        dest="post_place_retreat_after_release",
+        action="store_false",
+        help="Do not execute post-place retreat; keep the arm at the release pose so the next cycle plans from there. Enabled by default.",
+    )
     return parser
 
 
 def parse_args():
     return build_arg_parser().parse_args()
+
+
+def _need_hidden_post_place_clearance(args) -> bool:
+    return False
 
 
 def maybe_print_and_exit_place_rules(args):
@@ -1134,24 +1164,25 @@ def run_targeted_place_episode(demo, bridge_mod, real_exec, args, scene_capture_
                     continue
 
                 q_retreat_candidate = None
-                try:
-                    base.sync_demo_arm_qpos(demo, np.asarray(q_place_candidate[-1], dtype=np.float32).reshape(-1)[:7])
-                    q_retreat_candidate = base.plan_lift_path(
-                        demo,
-                        candidate.retreat_pose,
-                        variant_name=args.variant,
-                        use_attach=False,
-                        label="post_place_retreat" if candidate.variant_label is None else f"post_place_retreat_{candidate.variant_label}",
-                        planning_time=min(float(args.fixed_goal_planning_time), 3.0),
-                        rrt_range=float(args.fixed_goal_rrt_range),
-                        start_q=np.asarray(q_place_candidate[-1], dtype=np.float32).reshape(-1)[:7],
-                        allow_pose_rrt_fallback=False,
-                        max_segment_joint_delta=0.45,
-                        max_segment_joint7_delta=0.45,
-                        max_segment_norm_delta=0.75,
-                    )
-                finally:
-                    base.sync_demo_arm_qpos(demo, q_eval_saved)
+                if _need_hidden_post_place_clearance(args):
+                    try:
+                        base.sync_demo_arm_qpos(demo, np.asarray(q_place_candidate[-1], dtype=np.float32).reshape(-1)[:7])
+                        q_retreat_candidate = base.plan_lift_path(
+                            demo,
+                            candidate.retreat_pose,
+                            variant_name=args.variant,
+                            use_attach=False,
+                            label="post_place_retreat" if candidate.variant_label is None else f"post_place_retreat_{candidate.variant_label}",
+                            planning_time=min(float(args.fixed_goal_planning_time), 3.0),
+                            rrt_range=float(args.fixed_goal_rrt_range),
+                            start_q=np.asarray(q_place_candidate[-1], dtype=np.float32).reshape(-1)[:7],
+                            allow_pose_rrt_fallback=False,
+                            max_segment_joint_delta=0.45,
+                            max_segment_joint7_delta=0.45,
+                            max_segment_norm_delta=0.75,
+                        )
+                    finally:
+                        base.sync_demo_arm_qpos(demo, q_eval_saved)
 
                 place_plan = candidate
                 q_place_path = q_place_candidate
@@ -1250,33 +1281,45 @@ def run_targeted_place_episode(demo, bridge_mod, real_exec, args, scene_capture_
     demo._attached_box_visual_visible = False
     demo._attached_object_visual_active = False
     base.update_attached_box_visual(demo, visible=False)
+    clearance_pose, q_clearance_path = base.plan_post_place_clearance_path(
+        demo,
+        retreat_distance=0.05,
+        label="post_place_clearance",
+    )
+    clearance_executed = False
+    if q_clearance_path:
+        ok, _ = base.execute_pose_path_stage(
+            demo,
+            bridge_mod,
+            real_exec,
+            "post_place_clearance",
+            clearance_pose,
+            q_clearance_path,
+            args.real_gripper_open,
+            args,
+            use_attach=False,
+            skip_confirmation=True,
+        )
+        if not ok:
+            print("[warn] post-place clearance execution failed after release; continuing to settle the object in place")
+        else:
+            clearance_executed = True
+            print(
+                "[place] post_place_clearance final q:",
+                np.round(np.asarray(q_clearance_path[-1], dtype=np.float32).reshape(-1)[:7], 5).tolist(),
+            )
+    else:
+        print("[warn] post-place clearance planning failed after release; settling the object without moving the arm away first")
+
+    base.settle_released_active_object_for_scene_cache(demo, args)
     _mark_place_rule_success(rule, place_state_cache, place_plan.slot_name)
 
-    if q_retreat_path is None:
-        if relaxed_target_collision:
-            _set_scene_obstacle_planner_box_scale(demo, place_plan.target_name, 1.0)
-        print("[warn] post-place retreat planning failed after the object was already released; keeping the placement result and ending this cycle without retreat")
-        print("[done] completed one targeted place motion; post-place retreat was skipped")
-        return True
-    ok, _ = base.execute_pose_path_stage(
-        demo,
-        bridge_mod,
-        real_exec,
-        "post_place_retreat",
-        place_plan.retreat_pose,
-        q_retreat_path,
-        args.real_gripper_open,
-        args,
-        use_attach=False,
-    )
     if relaxed_target_collision:
         _set_scene_obstacle_planner_box_scale(demo, place_plan.target_name, 1.0)
-    if not ok:
-        print("[warn] post-place retreat execution failed after the object was already released; keeping the placement result and ending this cycle without retreat")
-        print("[done] completed one targeted place motion; post-place retreat was skipped")
-        return True
-
-    print("[done] completed one targeted place motion and retreated after release")
+    if clearance_executed:
+        print("[done] completed one targeted place motion and cleared 5cm along the gripper axis before settling the released object")
+    else:
+        print("[done] completed one targeted place motion; post-place clearance did not execute, so the next cycle will start from the release pose")
     return True
 
 
@@ -1356,6 +1399,7 @@ def main():
     cycle_idx = 0
     scene_capture_cache: dict | None = {} if bool(getattr(args, "reuse_foundationpose_scene_across_cycles", True)) else None
     place_state_cache: dict = {"used_slots_by_target": {}}
+    previous_cycle_final_q: np.ndarray | None = None
     try:
         if args.execute_real:
             real_exec = base.RealmanJointExecutor(args)
@@ -1415,9 +1459,25 @@ def main():
             print(f"[cycle {cycle_idx}] targeted place: {rule.primitive} -> {rule.target_object_name}")
             print(f"[cycle {cycle_idx}] selected obstacles: {cycle_args.selected_obstacle_object_names}")
             print(f"\n================ cycle {cycle_idx} ================")
+            final_sim_arm_q = None
             try:
                 env, demo = base.create_demo(cycle_args, bridge_mod, planner_mod, scene_capture_cache=scene_capture_cache)
+                if (
+                    previous_cycle_final_q is not None
+                    and bool(getattr(base_args, "carry_sim_arm_across_cycles", True))
+                ):
+                    base.sync_demo_arm_qpos(demo, previous_cycle_final_q)
+                    print(
+                        f"[cycle {cycle_idx}] seeded sim arm from previous cycle final q: "
+                        f"{np.round(previous_cycle_final_q, 5).tolist()}"
+                    )
                 ok = run_targeted_place_episode(demo, bridge_mod, real_exec, cycle_args, scene_capture_cache, place_state_cache)
+                if ok:
+                    final_sim_arm_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                    print(
+                        f"[cycle {cycle_idx}] final sim arm q after place cycle: "
+                        f"{np.round(final_sim_arm_q, 5).tolist()}"
+                    )
             finally:
                 base.close_env_quietly(env)
                 gc.collect()
@@ -1425,6 +1485,8 @@ def main():
             if not ok:
                 final_ok = False
                 break
+            if final_sim_arm_q is not None:
+                previous_cycle_final_q = final_sim_arm_q
             base.cache_successfully_placed_object_world_pose(demo, cycle_args.object_name, cycle_args)
             if not base_args.repeat_forever and cycle_idx >= int(base_args.repeat_count):
                 break
