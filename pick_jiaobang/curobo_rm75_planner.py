@@ -256,6 +256,65 @@ class RM75CuRoboPlanner:
         result = self.solve_ik(start_q, goal_pose, num_seeds=num_seeds)
         return result.goal_joint
 
+    def solve_batch_start_goal_ik(
+        self,
+        start_qs: Sequence[Sequence[float]],
+        goal_poses: Sequence[Any],
+        *,
+        num_seeds: Optional[int] = None,
+    ) -> list[CuRoboPlanResult]:
+        start_qs = list(start_qs or [])
+        goal_poses = list(goal_poses or [])
+        if len(start_qs) == 0 or len(goal_poses) == 0:
+            return []
+        if len(start_qs) != len(goal_poses):
+            raise ValueError(
+                f"start_qs and goal_poses must have the same length, got {len(start_qs)} and {len(goal_poses)}"
+            )
+        if len(goal_poses) == 1:
+            return [self.solve_ik(start_qs[0], goal_poses[0], num_seeds=num_seeds)]
+
+        start_state = self._make_multi_start_state(start_qs)
+        goal = self._make_batch_pose(goal_poses)
+        use_num_seeds = self.config.num_ik_seeds if num_seeds is None else int(num_seeds)
+
+        self.ik_solver.reset_seed()
+        result = self.ik_solver.solve_batch(
+            goal,
+            retract_config=start_state.position.clone(),
+            seed_config=start_state.position.unsqueeze(1).clone(),
+            return_seeds=1,
+            num_seeds=use_num_seeds,
+            use_nn_seed=False,
+        )
+
+        success_arr = self._to_numpy(result.success).reshape(-1).astype(bool)
+        flat_solution = None if result.solution is None else self._to_numpy(result.solution).reshape(-1, result.solution.shape[-1])
+        position_error = None if getattr(result, "position_error", None) is None else self._to_numpy(result.position_error).reshape(-1)
+        rotation_error = None if getattr(result, "rotation_error", None) is None else self._to_numpy(result.rotation_error).reshape(-1)
+        outputs: list[CuRoboPlanResult] = []
+        for idx, success in enumerate(success_arr.tolist()):
+            goal_joint = None
+            if bool(success) and flat_solution is not None and idx < flat_solution.shape[0]:
+                goal_joint = np.asarray(flat_solution[idx], dtype=np.float32).reshape(-1)[:7]
+            outputs.append(
+                CuRoboPlanResult(
+                    success=bool(success),
+                    status="Success" if bool(success) else "IK_FAIL",
+                    goal_joint=goal_joint,
+                    solve_time=float(result.solve_time),
+                    ik_time=float(result.solve_time),
+                    raw_result=result,
+                    debug={
+                        "batch_index": int(idx),
+                        "position_error": None if position_error is None or idx >= position_error.shape[0] else float(position_error[idx]),
+                        "rotation_error": None if rotation_error is None or idx >= rotation_error.shape[0] else float(rotation_error[idx]),
+                        "ik_success_count": int(self.mods["torch"].count_nonzero(result.success).item()),
+                    },
+                )
+            )
+        return outputs
+
     def plan_to_pose(
         self,
         start_q: Sequence[float],

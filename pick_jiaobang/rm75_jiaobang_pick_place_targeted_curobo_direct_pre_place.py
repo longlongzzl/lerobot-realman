@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -12,8 +13,8 @@ import rm75_jiaobang_pick_place_targeted_curobo as curobo_wrapper
 def build_arg_parser():
     parser = curobo_wrapper.build_arg_parser()
     parser.description = (
-        "FoundationPose -> direct cuRobo grasp -> close gripper -> cuRobo candidate-selected "
-        "pre-place -> short constrained release descent."
+        "FoundationPose -> direct cuRobo grasp -> close gripper -> cuRobo direct place "
+        "without pre-place fallback."
     )
     parser.set_defaults(
         targeted_place_staging=False,
@@ -21,6 +22,9 @@ def build_arg_parser():
         curobo_ee_link="gripper_tcp",
         insert_vertical_axial_spin_deg=[0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0],
         topdown_grasp_yaw_variant_deg=[0.0],
+        tabletop_place_yaw_variant_deg=[0.0, -30.0, 30.0, -60.0, 60.0],
+        tabletop_place_tilt_toward_robot_deg=[0.0, 15.0],
+        tabletop_place_axial_spin_deg=[0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0],
     )
     parser.add_argument(
         "--direct-release-approach-distance",
@@ -753,8 +757,8 @@ def _evaluate_curobo_pose_candidates_goalset(
     if not remaining:
         return []
 
+    ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
     if bool(getattr(args, "curobo_debug", False)):
-        ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
         ee_link = _get_robot_link_by_name(demo, ee_link_name)
         base_pose = targeted.base.flatten_np(demo.robot.pose.p)[:3]
         print(
@@ -949,12 +953,42 @@ def _evaluate_curobo_pose_candidates_multi_start(
     chunk_size = int(getattr(args, "curobo_batch_chunk_size", 64))
     if chunk_size <= 0:
         chunk_size = len(remaining)
+    ik_screened = []
+    ik_fail_count = 0
+    ik_screen_total = len(remaining)
+    for start_idx in range(0, len(remaining), chunk_size):
+        chunk = remaining[start_idx : start_idx + chunk_size]
+        planner_poses = [
+            _convert_demo_tcp_pose_to_curobo_ee_pose(
+                demo,
+                item["pose"],
+                ee_link_name=ee_link_name,
+            )
+            for item in chunk
+        ]
+        start_qs = [np.asarray(item["start_q"], dtype=np.float32).reshape(-1)[:7] for item in chunk]
+        ik_results = planner.solve_batch_start_goal_ik(
+            start_qs,
+            planner_poses,
+            num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if num_ik_seeds is None else num_ik_seeds),
+        )
+        for candidate, ik_result in zip(chunk, ik_results):
+            if not ik_result.success:
+                ik_fail_count += 1
+                continue
+            ik_screened.append(candidate)
+    remaining = ik_screened
+    print(
+        f"[curobo] {label} IK prefilter kept {len(remaining)}/{ik_screen_total} start-goal pair(s)"
+    )
+    if not remaining:
+        return []
+
     num_chunks = max(1, (len(remaining) + chunk_size - 1) // chunk_size)
     print(
         f"[curobo] {label} evaluating {len(remaining)} start-goal pair(s) "
         f"in {num_chunks} batch chunk(s) of size <= {chunk_size}"
     )
-    ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
 
     for chunk_idx, start_idx in enumerate(range(0, len(remaining), chunk_size), start=1):
         chunk = remaining[start_idx : start_idx + chunk_size]
@@ -1044,6 +1078,8 @@ def _evaluate_curobo_pose_candidates_multi_start(
 def _build_direct_grasp_candidates(demo, args):
     raw_grasp_pose = demo.build_topdown_grasp_pose()
     grasp_mode = str(getattr(args, "grasp_mode", "object_normal") or "object_normal").strip().lower()
+    grasp_variant_args = SimpleNamespace(**vars(args))
+    grasp_variant_args.topdown_grasp_yaw_variant_deg = [0.0]
     object_axis_world = None
     try:
         extents = np.asarray(
@@ -1085,7 +1121,7 @@ def _build_direct_grasp_candidates(demo, args):
             seen.add(key)
             variants.append((str(label), pose))
 
-        for label, pose in targeted.base.build_grasp_pose_variants(demo, raw_grasp_pose, args):
+        for label, pose in targeted.base.build_grasp_pose_variants(demo, raw_grasp_pose, grasp_variant_args):
             _append(label, pose)
 
         if grasp_mode not in elongated_modes:
@@ -1367,6 +1403,7 @@ def _evaluate_joint_grasp_place_chains(
     screen_max_attempts_arg = None if screen_max_attempts <= 0 else screen_max_attempts
     screen_num_ik_seeds_arg = None if screen_num_ik_seeds <= 0 else screen_num_ik_seeds
     screen_num_trajopt_seeds_arg = None if screen_num_trajopt_seeds <= 0 else screen_num_trajopt_seeds
+    direct_pair_candidates = []
     try:
         for grasp_choice in grasp_candidates:
             grasp_label = str(grasp_choice["label"])
@@ -1391,129 +1428,58 @@ def _evaluate_joint_grasp_place_chains(
             direct_place_candidates.sort(key=_pre_place_screen_sort_key)
             if max_place_candidates > 0:
                 direct_place_candidates = direct_place_candidates[:max_place_candidates]
-            if direct_place_candidates:
-                direct_place_successes = _evaluate_curobo_pose_candidates(
-                    planner,
-                    demo,
-                    args,
-                    grasp_terminal_q,
-                    direct_place_candidates,
-                    label=f"joint_direct_place_for_{grasp_label}",
-                    prefer_verticality=(rule.primitive == "insert_vertical"),
-                    use_attach=True,
-                    timeout=screen_timeout_arg,
-                    max_attempts=screen_max_attempts_arg,
-                    num_ik_seeds=screen_num_ik_seeds_arg,
-                    num_trajopt_seeds=screen_num_trajopt_seeds_arg,
-                )
-            else:
-                direct_place_successes = []
-            if direct_place_successes:
-                for candidate in direct_place_successes:
-                    q_pre_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in candidate["q_path"]]
-                    q_place_candidate = [np.asarray(q_pre_place_path[-1], dtype=np.float32).reshape(-1)[:7]]
-                    release_metrics, release_score = _path_metrics_and_score(q_pre_place_path[-1], q_place_candidate)
-                    total_score = float(grasp_choice["score"]) + float(candidate["score"]) + float(release_score)
-                    chain = {
-                        "grasp_choice": grasp_choice,
-                        "pre_place_choice": candidate,
-                        "q_pre_place_path": q_pre_place_path,
-                        "q_place_path": q_place_candidate,
-                        "release_metrics": release_metrics,
-                        "release_score": float(release_score),
-                        "total_score": total_score,
-                        "direct_place_mode": True,
-                    }
-                    print(
-                        f"[joint_search] feasible direct-place chain: grasp={grasp_label}, "
-                        f"place={candidate['label']}, total_score={total_score:.3f}, "
-                        f"waypoints={len(q_pre_place_path)}"
-                    )
-                    chains.append(chain)
-                    if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
-                        break
-                if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
-                    break
-                continue
+            for candidate in direct_place_candidates:
+                pair_item = dict(candidate)
+                pair_item["start_q"] = grasp_terminal_q
+                pair_item["grasp_choice"] = grasp_choice
+                direct_pair_candidates.append(pair_item)
 
-            pre_place_candidates = _build_direct_pre_place_candidates(
-                demo,
-                bridge_mod,
-                scene_capture_cache,
-                rule,
-                place_state_cache,
-                args,
+        if direct_pair_candidates:
+            print(
+                f"[joint_search] direct-place pair candidate count: {len(direct_pair_candidates)} "
+                f"from {len(grasp_candidates)} grasp winner(s)"
             )
-            if not pre_place_candidates:
-                print(f"[joint_search] {grasp_label}: no targeted place candidate could be built")
-                continue
-            pre_place_candidates.sort(key=_pre_place_screen_sort_key)
-            if max_place_candidates > 0:
-                pre_place_candidates = pre_place_candidates[:max_place_candidates]
-            if rule.primitive == "insert_vertical":
-                pre_place_candidates = _filter_pre_place_candidates_by_verticality(pre_place_candidates, args)
-            pre_place_successes = _evaluate_curobo_pose_candidates(
+            direct_place_successes = _evaluate_curobo_pose_candidates_multi_start(
                 planner,
                 demo,
                 args,
-                grasp_terminal_q,
-                pre_place_candidates,
-                label=f"joint_pre_place_for_{grasp_label}",
-                prefer_verticality=(rule.primitive == "insert_vertical"),
+                direct_pair_candidates,
+                label="joint_direct_place_pairs",
                 use_attach=True,
                 timeout=screen_timeout_arg,
                 max_attempts=screen_max_attempts_arg,
                 num_ik_seeds=screen_num_ik_seeds_arg,
                 num_trajopt_seeds=screen_num_trajopt_seeds_arg,
             )
-            if not pre_place_successes:
-                print(f"[joint_search] {grasp_label}: no pre-place candidate passed cuRobo")
-                continue
-
-            pre_place_successes.sort(
-                key=lambda item: (
-                    float(grasp_choice["score"]) + float(item["score"]),
-                    float(item["score"]),
-                    float(grasp_choice["score"]),
+            for candidate in direct_place_successes:
+                grasp_choice = candidate["grasp_choice"]
+                grasp_label = str(grasp_choice["label"])
+                q_direct_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in candidate["q_path"]]
+                release_metrics, release_score = _path_metrics_and_score(
+                    q_direct_place_path[-1],
+                    [np.asarray(q_direct_place_path[-1], dtype=np.float32).reshape(-1)[:7]],
                 )
-            )
-            for candidate in pre_place_successes:
-                q_pre_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in candidate["q_path"]]
-                q_place_candidate = _plan_short_curobo_cartesian_descent(
-                    planner,
-                    demo,
-                    args,
-                    np.asarray(q_pre_place_path[-1], dtype=np.float32).reshape(-1)[:7],
-                    candidate["pose"],
-                    candidate["place_pose"],
-                    label="release" if candidate["variant_label"] is None else f"release_{candidate['variant_label']}",
-                )
-                if q_place_candidate is None:
-                    continue
-                release_metrics, release_score = _path_metrics_and_score(q_pre_place_path[-1], q_place_candidate)
                 total_score = float(grasp_choice["score"]) + float(candidate["score"]) + float(release_score)
                 chain = {
                     "grasp_choice": grasp_choice,
                     "pre_place_choice": candidate,
-                    "q_pre_place_path": q_pre_place_path,
-                    "q_place_path": q_place_candidate,
+                    "q_pre_place_path": q_direct_place_path,
+                    "q_place_path": [np.asarray(q_direct_place_path[-1], dtype=np.float32).reshape(-1)[:7]],
                     "release_metrics": release_metrics,
                     "release_score": float(release_score),
                     "total_score": total_score,
-                    "direct_place_mode": False,
+                    "direct_place_mode": True,
                 }
                 print(
-                    f"[joint_search] feasible chain: grasp={grasp_label}, "
-                    f"pre_place={candidate['label']}, total_score={total_score:.3f}, "
-                    f"release_waypoints={release_metrics['waypoint_count']}"
+                    f"[joint_search] feasible direct-place chain: grasp={grasp_label}, "
+                    f"place={candidate['label']}, total_score={total_score:.3f}, "
+                    f"waypoints={len(q_direct_place_path)}"
                 )
                 chains.append(chain)
                 if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
                     break
-            if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
-                break
         if not chains:
-            print("[joint_search] no direct-place or release descent chain stayed feasible")
+            print("[joint_search] no direct-place chain stayed feasible")
     finally:
         targeted.base.sync_demo_arm_qpos(demo, saved_q)
 
@@ -1676,10 +1642,11 @@ def run_targeted_place_episode_curobo_direct(
     targeted._register_transport_attached_box(demo, args)
     _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, "post_grasp_escape", use_attach=True)
 
-    pre_place_successes = None
+    direct_place_successes = None
     relaxed_target_collision = False
+    direct_place_mode = True
     if selected_joint_chain is None:
-        pre_place_candidates = _build_direct_pre_place_candidates(
+        direct_place_candidates = _build_direct_place_candidates(
             demo,
             bridge_mod,
             scene_capture_cache,
@@ -1687,86 +1654,39 @@ def run_targeted_place_episode_curobo_direct(
             place_state_cache,
             args,
         )
-        if not pre_place_candidates:
-            print("[FAIL] no targeted place candidate could be built")
+        if not direct_place_candidates:
+            print("[FAIL] no direct targeted place candidate could be built")
             return False
 
-        pre_place_successes = _evaluate_curobo_pose_candidates(
+        if rule.primitive == "insert_vertical":
+            direct_place_candidates = _filter_pre_place_candidates_by_verticality(direct_place_candidates, args)
+
+        direct_place_successes = _evaluate_curobo_pose_candidates(
             planner,
             demo,
             args,
             np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
-            pre_place_candidates,
-            label="direct_pre_place",
+            direct_place_candidates,
+            label="direct_place",
             prefer_verticality=(rule.primitive == "insert_vertical"),
             use_attach=True,
         )
-        if not pre_place_successes:
-            print("[FAIL] cuRobo pre-place planning failed for all allowed rotation candidates")
-            targeted.base.inspect_failed_pose(
-                demo,
-                bridge_mod,
-                "pre_place",
-                args,
-                pose=pre_place_candidates[0]["pose"],
-                gripper_closed=True,
-                use_attach=True,
-            )
-            return False
-
-        place_choice = None
-        q_pre_place_path = None
-        q_place_path = None
-        for candidate in pre_place_successes:
-            slot_suffix = f", slot={candidate['slot_name']}" if candidate.get("slot_name") else ""
-            variant_suffix = f", variant={candidate['variant_label']}" if candidate.get("variant_label") else ""
-            print(
-                f"[place] source={args.object_name}, primitive={rule.primitive}, "
-                f"target={candidate['target_name']}{slot_suffix}{variant_suffix}, "
-                f"tcp_verticality={candidate['tcp_verticality']:.3f}"
-            )
-            print("[place] pre_place p:", np.round(targeted.base.flatten_np(candidate["pose"].p)[:3], 6), "q:", np.round(targeted.base.flatten_np(candidate["pose"].q)[:4], 6))
-            print("[place] place p:", np.round(targeted.base.flatten_np(candidate["place_pose"].p)[:3], 6), "q:", np.round(targeted.base.flatten_np(candidate["place_pose"].q)[:4], 6))
-            q_pre_place_path = candidate["q_path"]
-            q_place_candidate = _plan_short_curobo_cartesian_descent(
-                planner,
-                demo,
-                args,
-                np.asarray(q_pre_place_path[-1], dtype=np.float32).reshape(-1)[:7],
-                candidate["pose"],
-                candidate["place_pose"],
-                label="release" if candidate["variant_label"] is None else f"release_{candidate['variant_label']}",
-            )
-            if q_place_candidate is None:
-                print(f"[place] constrained release descent failed for variant={candidate['variant_label']}; trying the next cuRobo-selected candidate")
-                continue
-            place_choice = candidate
-            q_place_path = q_place_candidate
-            if rule.primitive == "insert_vertical":
-                relaxed_target_collision = targeted._set_scene_obstacle_planner_box_scale(
-                    demo,
-                    candidate["target_name"],
-                    float(args.place_insert_target_collision_scale),
-                )
-            break
-
-        if place_choice is None or q_pre_place_path is None or q_place_path is None:
-            print("[FAIL] no cuRobo pre-place candidate yielded a valid constrained release descent")
+        if not direct_place_successes:
+            print("[FAIL] cuRobo direct-place planning failed and pre-place fallback is disabled")
             targeted.base.inspect_failed_pose(
                 demo,
                 bridge_mod,
                 "place",
                 args,
-                pose=pre_place_successes[0]["place_pose"],
+                pose=direct_place_candidates[0]["pose"],
                 gripper_closed=True,
                 use_attach=True,
             )
             return False
-    else:
-        place_choice = selected_joint_chain["pre_place_choice"]
-        q_pre_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in selected_joint_chain["q_pre_place_path"]]
-        q_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in selected_joint_chain["q_place_path"]]
-        direct_place_mode = bool(selected_joint_chain.get("direct_place_mode", False))
+
+        place_choice = direct_place_successes[0]
+        q_pre_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in place_choice["q_path"]]
+        q_place_path = [np.asarray(q_pre_place_path[-1], dtype=np.float32).reshape(-1)[:7]]
         slot_suffix = f", slot={place_choice['slot_name']}" if place_choice.get("slot_name") else ""
         variant_suffix = f", variant={place_choice['variant_label']}" if place_choice.get("variant_label") else ""
         print(
@@ -1774,10 +1694,27 @@ def run_targeted_place_episode_curobo_direct(
             f"target={place_choice['target_name']}{slot_suffix}{variant_suffix}, "
             f"tcp_verticality={place_choice['tcp_verticality']:.3f}"
         )
-        print("[place] pre_place p:", np.round(targeted.base.flatten_np(place_choice["pose"].p)[:3], 6), "q:", np.round(targeted.base.flatten_np(place_choice["pose"].q)[:4], 6))
-        print("[place] place p:", np.round(targeted.base.flatten_np(place_choice["place_pose"].p)[:3], 6), "q:", np.round(targeted.base.flatten_np(place_choice["place_pose"].q)[:4], 6))
-        if direct_place_mode:
-            print("[place] selected chain uses direct place motion; skipping separate release motion stage")
+        print("[place] direct place p:", np.round(targeted.base.flatten_np(place_choice["pose"].p)[:3], 6), "q:", np.round(targeted.base.flatten_np(place_choice["pose"].q)[:4], 6))
+        if rule.primitive == "insert_vertical":
+            relaxed_target_collision = targeted._set_scene_obstacle_planner_box_scale(
+                demo,
+                place_choice["target_name"],
+                float(args.place_insert_target_collision_scale),
+            )
+    else:
+        place_choice = selected_joint_chain["pre_place_choice"]
+        q_pre_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in selected_joint_chain["q_pre_place_path"]]
+        q_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in selected_joint_chain["q_place_path"]]
+        direct_place_mode = True
+        slot_suffix = f", slot={place_choice['slot_name']}" if place_choice.get("slot_name") else ""
+        variant_suffix = f", variant={place_choice['variant_label']}" if place_choice.get("variant_label") else ""
+        print(
+            f"[place] source={args.object_name}, primitive={rule.primitive}, "
+            f"target={place_choice['target_name']}{slot_suffix}{variant_suffix}, "
+            f"tcp_verticality={place_choice['tcp_verticality']:.3f}"
+        )
+        print("[place] direct place p:", np.round(targeted.base.flatten_np(place_choice["pose"].p)[:3], 6), "q:", np.round(targeted.base.flatten_np(place_choice["pose"].q)[:4], 6))
+        print("[place] selected chain uses direct place motion; separate pre-place/release stages are disabled")
         if rule.primitive == "insert_vertical":
             relaxed_target_collision = targeted._set_scene_obstacle_planner_box_scale(
                 demo,
@@ -1801,23 +1738,7 @@ def run_targeted_place_episode_curobo_direct(
             targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
         return False
 
-    direct_place_mode = bool(selected_joint_chain.get("direct_place_mode", False)) if selected_joint_chain is not None else False
-    if not direct_place_mode:
-        ok, _ = targeted.base.execute_pose_path_stage(
-            demo,
-            bridge_mod,
-            real_exec,
-            "release" if place_choice["variant_label"] is None else f"release_{place_choice['variant_label']}",
-            place_choice["place_pose"],
-            q_place_path,
-            args.real_gripper_close,
-            args,
-            use_attach=True,
-        )
-        if not ok:
-            if relaxed_target_collision:
-                targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
-            return False
+    # direct-place-only mode: no separate release stage
 
     print("\n[open gripper at place]")
     if not targeted.base.confirm_simple_action("open the real gripper at the targeted place", args, bridge_mod=bridge_mod, env=demo.env, repeats=6):
