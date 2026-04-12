@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Hand-eye: compute_to_hand.py",
+      "type": "python",
+      "request": "launch",
+      "program": "/home/zhangzhao/桌面/lerobot/hand_eye_calibration/compute_to_hand.py",
+      "cwd": "/home/zhangzhao/桌面/lerobot/hand_eye_calibration",
+      "env": {
+        "PYTHONPATH": "/home/zhangzhao/桌面/lerobot:/home/zhangzhao/桌面/lerobot/lerobot-sim2real"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "env_info": {
+    "env_id": "SO101GraspCube-v1",
+    "env_kwargs": {
+      "num_envs": 1,
+      "reconfiguration_freq": 1,
+      "obs_mode": "rgb+segmentation",
+      "render_mode": "all",
+      "render_backend": "cpu",
+      "sim_backend": "cpu",
+      "base_camera_settings": {
+        "pos": 

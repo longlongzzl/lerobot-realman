@@ -1,0 +1,60 @@
+# Nested repos
+.git/
+**/.git/
+.gitmodules
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+venv/
+env/
+.venv-pyroki/
+
+# IDE
+.idea/
+.vscode/
+
+# Logs / outputs
+*.log
+logs/
+wandb/
+runs/
+output/
+outputs/
+results/
+
+# Archives / data
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+data/
+datasets/
+*.npy
+*.npz
+*.pkl
+
+# Models
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+checkpoints/
+
+# Media
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.gif
+
+# System
+.DS_Store
+Thumbs.db

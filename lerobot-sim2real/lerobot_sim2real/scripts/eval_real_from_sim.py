@@ -1,0 +1,531 @@
+import json
+import time
+from typing import Optional
+import gymnasium as gym
+import torch
+from lerobot_sim2real.utils.safety import setup_safe_exit
+from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+from lerobot_sim2real.config.real_robot import create_real_robot
+from mani_skill.agents.robots.lerobot.manipulator import LeRobotRealAgent
+from mani_skill.envs.sim2real_env import Sim2RealEnv
+import cv2
+import numpy as np
+import tyro
+from mani_skill.utils.visualization.misc import tile_images
+from mani_skill.utils import sapien_utils
+from dataclasses import dataclass
+import matplotlib.pyplot as plt
+
+
+
+
+
+
+
+
+@dataclass
+class Args:
+    env_id: str = "SO100GraspCube-v1"
+    """The environment id to train on"""
+    env_kwargs_json_path: Optional[str] = None
+    """Path to a json file containing additional environment kwargs to use."""
+
+def overlay_envs(sim_env, real_env):
+    """
+    Overlays sim_env observtions onto real_env observations
+    Requires matching ids between the two environments' sensors
+    e.g. id=phone_camera sensor in real_env / real_robot config, must have identical id in sim_env
+    """
+    real_obs = real_env.get_obs()["sensor_data"]
+    sim_obs = sim_env.get_obs()["sensor_data"]
+    assert sorted(real_obs.keys()) == sorted(
+        sim_obs.keys()
+    ), f"real camera names {real_obs.keys()} and sim camera names {sim_obs.keys()} differ"
+
+    overlaid_dict = sim_env.get_obs()["sensor_data"]
+    overlaid_imgs = []
+    for name in overlaid_dict:
+        real_imgs = real_obs[name]["rgb"][0] / 255
+        sim_imgs = overlaid_dict[name]["rgb"][0].cpu() / 255
+        overlaid_imgs.append(0.5 * real_imgs + 0.5 * sim_imgs)
+
+    return tile_images(overlaid_imgs)
+
+
+def update_camera(sim_env):
+    global camera_offset, fov_offset, last_frame_time, help_message_printed
+    current_time = time.time()
+    delta_time = current_time - last_frame_time
+    last_frame_time = current_time
+
+    # Reset camera position and FOV on backspace
+    if "backspace" in active_keys:
+        camera_offset = torch.zeros(3, dtype=torch.float32)
+        fov_offset = 0.0
+
+    # Camera movement mapping based on active keys
+    if "w" in active_keys:
+        camera_offset[0] -= MOVEMENT_SPEED * delta_time  # Move forward
+    if "s" in active_keys:
+        camera_offset[0] += MOVEMENT_SPEED * delta_time  # Move back
+    if "d" in active_keys:
+        camera_offset[1] += MOVEMENT_SPEED * delta_time  # Move right
+    if "a" in active_keys:
+        camera_offset[1] -= MOVEMENT_SPEED * delta_time  # Move left
+    if "up" in active_keys:
+        camera_offset[2] += MOVEMENT_SPEED * delta_time  # Move up
+    if "down" in active_keys:
+        camera_offset[2] -= MOVEMENT_SPEED * delta_time  # Move down
+
+    # FOV control
+    if "left" in active_keys:
+        fov_offset -= FOV_CHANGE_SPEED * delta_time
+    if "right" in active_keys:
+        fov_offset += FOV_CHANGE_SPEED * delta_time
+
+    # update camera position and fov
+    pos = sim_env.unwrapped.base_camera_settings["pos"] + camera_offset
+    pose = sapien_utils.look_at(pos, sim_env.unwrapped.base_camera_settings["target"])
+    sim_env.unwrapped.camera_mount.set_pose(pose)
+    sim_env.unwrapped._sensors["base_camera"].camera.set_fovy(
+        sim_env.unwrapped.base_camera_settings["fov"] + fov_offset
+    )
+
+    if len(active_keys) > 0:
+        print("current_camera_position", pose.p)
+        print(
+            "current_camera_fov",
+            sim_env.unwrapped.base_camera_settings["fov"] + fov_offset,
+        )
+        help_message_printed = False  # Reset the flag when there's movement
+    elif (
+        not help_message_printed
+    ):  # Only print help message if it hasn't been printed yet
+        print("=== Commands for controlling sim camera ===")
+        print(
+            "press: (w), (a) to move in x, (s), (d) to move in y, (up), (down) to move in z, (left), (right) to change fov of simulation camera"
+        )
+        print("press: (backspace) to reset, close figure to exit")
+        print()
+        help_message_printed = True
+
+camera_offset = torch.zeros(3, dtype=torch.float32)
+fov_offset = 0.0
+active_keys = set()
+last_frame_time = time.time()
+MOVEMENT_SPEED = 0.1  # units per second
+FOV_CHANGE_SPEED = 0.1  # radians per second
+help_message_printed = False  # Flag to track if we've printed the help message
+
+
+def on_key_press(event):
+    global active_keys
+    active_keys.add(event.key)
+
+
+def on_key_release(event):
+    global active_keys
+    active_keys.discard(event.key)
+
+# def main(args: Args):
+#     real_robot = create_real_robot(uid="so100")
+#     real_robot.connect()
+# #     real_robot.connect(calibrate=False)
+# #     real_robot.calibrate()
+#    # real_robot.disconnect()
+#
+#     setup_safe_exit(sim_env, real_env, real_agent)
+
+class LeRobotRealAgentWithQposTracking:
+    def __init__(self, real_robot):
+        self.real_robot = real_robot
+        # 初始化min和max为非常大的正值和负值
+        self.min_qpos = torch.full_like(torch.empty(1), float('inf'))
+        self.max_qpos = torch.full_like(torch.empty(1), float('-inf'))
+
+    def update_min_max_qpos(self, current_qpos):
+        # 更新最小值和最大值
+        self.min_qpos = torch.min(self.min_qpos, current_qpos)
+        self.max_qpos = torch.max(self.max_qpos, current_qpos)
+
+    def get_qpos_range(self):
+        return self.min_qpos, self.max_qpos
+
+
+
+import argparse
+
+import gymnasium as gym
+import mani_skill
+from mani_skill.agents.controllers.base_controller import DictController
+from mani_skill.envs.sapien_env import BaseEnv
+def parse_args(args=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-r", "--robot-uid", type=str, default="so101", help="The id of the robot to place in the environment")
+    parser.add_argument("-b", "--sim-backend", type=str, default="auto", help="Which simulation backend to use. Can be 'auto', 'cpu', 'gpu'")
+    parser.add_argument("-c", "--control-mode", type=str, default="pd_joint_pos", help="The control mode to use. Note that for new robots being implemented if the _controller_configs is not implemented in the selected robot, we by default provide two default controllers, 'pd_joint_pos' and 'pd_joint_delta_pos' ")
+    parser.add_argument("-k", "--keyframe", type=str, help="The name of the keyframe of the robot to display")
+    parser.add_argument("--shader", default="default", type=str, help="Change shader used for rendering. Default is 'default' which is very fast. Can also be 'rt' for ray tracing and generating photo-realistic renders. Can also be 'rt-fast' for a faster but lower quality ray-traced renderer")
+    parser.add_argument("--keyframe-actions", action="store_true", help="Whether to use the selected keyframe to set joint targets to try and hold the robot in its position")
+    parser.add_argument("--random-actions", action="store_true", help="Whether to sample random actions to control the agent. If False, no control signals are sent and it is just rendering.")
+    parser.add_argument("--none-actions", action="store_true", help="If set, then the scene and rendering will update each timestep but no joints will be controlled via code. You can use this to control the robot freely via the GUI.")
+    parser.add_argument("--zero-actions", action="store_true", help="Whether to send zero actions to the robot. If False, no control signals are sent and it is just rendering.")
+    parser.add_argument("--sim-freq", type=int, default=100, help="Simulation frequency")
+    parser.add_argument("--control-freq", type=int, default=20, help="Control frequency")
+    parser.add_argument(
+        "-s",
+        "--seed",
+        type=int,
+        help="Seed the random actions and environment. Default is no seed",
+    )
+    args = parser.parse_args()
+    return args
+
+import time
+import tkinter as tk
+from tkinter import ttk
+import threading
+import cv2
+
+
+class ActionTuner:
+    dim = 6
+
+    def __init__(self, org_pos):
+        self.root = tk.Tk()
+        self.root.title("Action Tuner")
+        self.v = [0.0] * self.dim
+
+        # 设置初始Action值
+        self.vals = []
+        for i in range(self.dim):
+            self.vals.append(tk.DoubleVar(value=org_pos[i]))
+
+        # 创建滑块
+        for i in range(self.dim):
+            self.create_slider(f"{i}", self.vals[i], -3.0, 3.0, i)
+
+        # 显示Action值标签
+        self.label = tk.Label(self.root, text="")
+        self.update_label()
+        self.label.grid(row=self.dim, column=0, columnspan=2, pady=10)
+
+        # 绑定更新事件
+        for i in range(self.dim):
+            self.vals[i].trace("w", self.update_label)
+
+        self.updated = True
+
+    def create_slider(self, name, variable, min_val, max_val, row):
+        """创建一个滑块"""
+        label = tk.Label(self.root, text=f"{name} Dim")
+        label.grid(row=row, column=0, padx=10, pady=5)
+
+        slider = ttk.Scale(
+            self.root, from_=min_val, to=max_val, orient="horizontal", variable=variable, length=1000
+        )
+        slider.grid(row=row, column=1, padx=10, pady=5)
+
+    def update_label(self, *args):
+        """更新Action显示标签"""
+        v = []
+        for i in range(self.dim):
+            v.append(self.vals[i].get())
+        self.v = v
+
+        # self.label.config(text=f"P: {self.p:.2f}, I: {self.i:.2f}, D: {self.d:.2f}, i_clip_thres: {self.i_clip_thres:.2f}, i_clip_coef: {self.i_clip_coef:.2f}")
+
+        self.updated = True
+
+class ActionTunerRunner:
+    def __init__(self, org_pos):
+        self.app = None
+        self.org_pos = org_pos
+        # 创建并启动GUI线程
+        gui_thread = threading.Thread(target=self.run_gui)
+        gui_thread.daemon = True  # 守护线程，主线程结束时自动退出
+        gui_thread.start()
+
+    def run_gui(self):
+        """运行Tkinter GUI的线程"""
+        self.app = ActionTuner(self.org_pos)
+        self.app.root.mainloop()
+
+
+
+# def main():
+#     args = parse_args()
+#     env = gym.make(
+#         "Empty-v1",
+#         obs_mode="none",
+#         reward_mode="none",
+#         enable_shadow=True,
+#         control_mode=args.control_mode,
+#         robot_uids=args.robot_uid,
+#         sensor_configs=dict(shader_pack=args.shader),
+#         human_render_camera_configs=dict(shader_pack=args.shader),
+#         viewer_camera_configs=dict(shader_pack=args.shader),
+#         render_mode="human",
+#         sim_config=dict(sim_freq=args.sim_freq, control_freq=args.control_freq),
+#         sim_backend=args.sim_backend,
+#     )
+#     env.reset(seed=0)
+#     env: BaseEnv = env.unwrapped
+#     print(f"Selected robot {args.robot_uid}. Control mode: {args.control_mode}")
+#     print("Selected Robot has the following keyframes to view: ")
+#     print(env.agent.keyframes.keys())
+#     env.agent.robot.set_qpos(env.agent.robot.qpos * 0)
+#     kf = None
+#     if len(env.agent.keyframes) > 0:
+#         kf_name = None
+#         if args.keyframe is not None:
+#             kf_name = args.keyframe
+#             kf = env.agent.keyframes[kf_name]
+#         else:
+#             for kf_name, kf in env.agent.keyframes.items():
+#                 # keep the first keyframe we find
+#                 break
+#         if kf.qpos is not None:
+#             env.agent.robot.set_qpos(kf.qpos)
+#             env.agent.controller.reset()
+#         if kf.qvel is not None:
+#             env.agent.robot.set_qvel(kf.qvel)
+#         env.agent.robot.set_pose(kf.pose)
+#         if kf_name is not None:
+#             print(f"Viewing keyframe {kf_name}")
+#     if env.gpu_sim_enabled:
+#         env.scene._gpu_apply_all()
+#         env.scene.px.gpu_update_articulation_kinematics()
+#         env.scene._gpu_fetch_all()
+#
+#
+#     env.render()
+#
+#     #viewer.paused = True
+#
+#     org_pos = env.agent.robot.qpos.cpu().flatten()
+#
+#     actiontuner = ActionTunerRunner(org_pos.squeeze().numpy().tolist())
+#     import numpy as np
+#     while not actiontuner.app:
+#         time.sleep(0.1)
+#
+#     while not hasattr(actiontuner.app, "v"):
+#         time.sleep(0.1)
+#
+#    # print(""env.agent.robot.qpos.cpu().flatten())
+#     while True:
+#         if args.random_actions:
+#             env.step(env.action_space.sample())
+#         elif args.none_actions:
+#             env.step(None)
+#         elif args.zero_actions:
+#             env.step(env.action_space.sample() * 0)
+#         elif args.keyframe_actions:
+#             assert kf is not None, "this robot has no keyframes, cannot use it to set actions"
+#             if isinstance(env.agent.controller, DictController):
+#                 env.step(env.agent.controller.from_qpos(kf.qpos))
+#             else:
+#                 env.step(kf.qpos)
+#
+#         action = np.array(actiontuner.app.v)
+#         env.step(action)
+#         env.render()
+#         print("org_pos", org_pos, "new pos", env.agent.robot.qpos.cpu().flatten())
+import matplotlib.pyplot as plt
+from collections import deque
+import numpy as np
+
+BUFFER_LEN = 1000  # 滚动窗口长度
+NUM_JOINTS = 6     # 关节数
+class RealtimeQposPlotter:
+    """实时绘制 6 维关节 qpos。
+
+    典型使用::
+
+        plotter = RealtimeQposPlotter()
+        plotter.show(block=False)  # 提前弹窗且不阻塞
+        for step in range(N):
+            plotter.feed(real_qpos, sim_qpos)  # 动态刷新
+        plotter.show()  # (可选) 结束后阻塞，直到用户关闭窗口
+
+    - **实线**：真实机械臂 qpos
+    - **虚线**：仿真机械臂 qpos
+    - 仅保存最近 ``BUFFER_LEN`` 步
+    """
+
+    def __init__(self):
+        # 启用交互模式
+        plt.ion()
+
+        # 为真机 / 仿真各准备 6 个队列
+        self.real_buf = [deque(maxlen=BUFFER_LEN) for _ in range(NUM_JOINTS)]
+        self.sim_buf  = [deque(maxlen=BUFFER_LEN) for _ in range(NUM_JOINTS)]
+        self.step_counter = 0
+
+        # 画布与 6 行子图
+        self.fig, self.axes = plt.subplots(NUM_JOINTS, 1, figsize=(8, 2 * NUM_JOINTS), sharex=True)
+        self.real_lines, self.sim_lines = [], []
+        for i, ax in enumerate(self.axes):
+            real_line, = ax.plot([], [], label=f"Joint {i+1} Real", lw=1.5)
+            sim_line,  = ax.plot([], [], ls="--", label=f"Joint {i+1} Sim", lw=1)
+            self.real_lines.append(real_line)
+            self.sim_lines.append(sim_line)
+            ax.set_ylabel("qpos")
+            ax.legend(loc="upper right", fontsize="small")
+        self.axes[-1].set_xlabel("Step")
+        plt.tight_layout()
+
+    # ---------------------- 对外接口 ----------------------
+    def feed(self, real_qpos, sim_qpos):
+        """追加一帧数据并刷新窗口。"""
+        if len(real_qpos) != NUM_JOINTS or len(sim_qpos) != NUM_JOINTS:
+            raise ValueError(f"Each qpos list must have {NUM_JOINTS} elements.")
+        self._append(self.real_buf, real_qpos)
+        self._append(self.sim_buf,  sim_qpos)
+        self.step_counter += 1
+        self._draw()
+
+    # -------------------- 内部辅助方法 --------------------
+    @staticmethod
+    def _append(buf_list, qpos):
+        for i in range(NUM_JOINTS):
+            buf_list[i].append(qpos[i])
+
+    def _draw(self):
+        x_range = range(max(0, self.step_counter - BUFFER_LEN), self.step_counter)
+        for i in range(NUM_JOINTS):
+            self.real_lines[i].set_data(x_range, list(self.real_buf[i]))
+            self.sim_lines[i].set_data(x_range, list(self.sim_buf[i]))
+            ax = self.axes[i]
+            ax.relim()
+            ax.autoscale_view()
+        plt.pause(0.001)
+
+    # ---------------------- 公共方法 ----------------------
+    def show(self, block: bool = True):
+        """显示窗口；``block=False`` 时非阻塞。"""
+        plt.ioff()  # 切换到 show 模式
+        plt.show(block=block)
+
+
+
+
+def main(args: Args):
+    real_robot = create_real_robot(uid="so101")
+    real_robot.connect()
+    #real_robot.bus.disable_torque()
+    #real_robot.calibrate()
+    #real_robot.disconnect()
+    #assert 1 == 2
+ #    real_robot.connect(calibrate=False)
+ #    real_robot.calibrate()
+ #    real_robot.disconnect()
+    agent = LeRobotRealAgentWithQposTracking(real_robot)
+    real_robot = LeRobotRealAgent(real_robot)
+
+    args = parse_args()
+    env = gym.make(
+        "RM75GraspCube_two_cameras-v1",
+        obs_mode="none",
+        reward_mode="none",
+        enable_shadow=True,
+        control_mode=args.control_mode,
+        robot_uids=args.robot_uid,
+        sensor_configs=dict(shader_pack=args.shader),
+        human_render_camera_configs=dict(shader_pack=args.shader),
+        viewer_camera_configs=dict(shader_pack=args.shader),
+        render_mode="human",
+        sim_config=dict(sim_freq=args.sim_freq, control_freq=args.control_freq),
+        sim_backend=args.sim_backend,
+    )
+    env.reset(seed=0)
+    env: BaseEnv = env.unwrapped
+    print(f"Selected robot {args.robot_uid}. Control mode: {args.control_mode}")
+    print("Selected Robot has the following keyframes to view: ")
+    print(env.agent.keyframes.keys())
+    #env.agent.robot.set_qpos(env.agent.robot.qpos * 0)
+
+    import cv2
+
+    # ---------- 参数 ----------
+    camera_index = 0  # 0 = 第一台摄像头；1 = 第二台……
+    window_name = "LiveCam"  # 窗口标题
+    width, height = 1280, 720  # 期望分辨率，可按需修改
+
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)  # 不设置分辨率
+
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开摄像头 {camera_index}")
+
+    # # 读一次实际分辨率
+    # default_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    # default_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    real_env = Sim2RealEnv(sim_env=env, agent=real_robot, control_freq=15)
+    setup_safe_exit(env, real_env, real_robot)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)  # 设置期望宽度
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)  # 设置期望高度
+
+    sim_obs, _ = env.reset()
+    # TODO,这个地方需要注意！！！！！！！！！！！！！！
+    #real_robot.reset( env.agent.robot.get_qpos().cpu().flatten())
+    real_env.reset()
+    #real_obs, _ = real_env.reset()
+    # TODO: delete
+    #print("Start !!!", env.agent.robot.get_qpos().cpu().flatten())
+    #real_robot.reset(env.agent.robot.get_qpos().cpu().flatten())
+
+    print("????", real_env.agent.robot.qpos)
+    actiontuner = ActionTunerRunner(real_env.agent.robot.qpos.detach().cpu().numpy().squeeze().tolist())
+
+    while not actiontuner.app:
+        time.sleep(0.1)
+
+    while not hasattr(actiontuner.app, "v"):
+        time.sleep(0.1)
+
+    plotter = RealtimeQposPlotter()
+
+
+
+
+    while True:
+        # ret, frame = cap.read()
+        # if not ret:
+        #     print("⚠️  读帧失败，退出循环")
+        #     break
+        #
+        # cv2.imshow(window_name, frame)
+
+        # 按 q 或 Esc 退出
+        # key = cv2.waitKey(1) & 0xFF
+        # if key in (ord('q'), 27):
+        #     break
+
+        #sim_qpos = env.agent.robot.get_qpos().cpu().flatten()
+        action = np.array(actiontuner.app.v)
+        #real_robot.set_target_qpos(sim_qpos)
+        #current_qpos = real_robot.robot.get_qpos()
+
+
+        real_env.step(action)
+
+
+
+        delta = real_env.agent.robot.get_qpos().detach().cpu().squeeze().numpy() - real_env.base_sim_env.agent.robot.qpos.cpu().flatten().numpy()
+
+        # plotter.feed(real_env.agent.robot.get_qpos().detach().cpu().squeeze().numpy(),
+        #              real_env.base_sim_env.agent.robot.qpos.cpu().flatten().numpy())
+        plotter.feed(delta, np.zeros([6]))
+        #env.step(current_qpos)
+        env.render()
+
+        print("target qpos",action,"Real qpos", real_env.agent.robot.get_qpos(), "Sim qpos", real_env.base_sim_env.agent.robot.qpos.cpu().flatten())
+
+
+
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    main(args)

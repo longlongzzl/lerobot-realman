@@ -1,0 +1,10 @@
+# ninja log v7
+0	63361	1768627984455442966	/home/zhangzhao/桌面/lerobot/GraspGen/pointnet2_ops/build/temp.linux-x86_64-cpython-310/pointnet2_ops/_ext-src/src/ball_query.o	d4ce7550d13b67f
+1	63493	1768627984456442963	/home/zhangzhao/桌面/lerobot/GraspGen/pointnet2_ops/build/temp.linux-x86_64-cpython-310/pointnet2_ops/_ext-src/src/interpolate.o	d084f21e2adb9407
+2	63499	1768627984457442960	/home/zhangzhao/桌面/lerobot/GraspGen/pointnet2_ops/build/temp.linux-x86_64-cpython-310/pointnet2_ops/_ext-src/src/sampling.o	946d005610dcc75d
+1	63505	1768627984456442963	/home/zhangzhao/桌面/lerobot/GraspGen/pointnet2_ops/build/temp.linux-x86_64-cpython-310/pointnet2_ops/_ext-src/src/bindings.o	7b06a19df0ecc8f7
+1	63511	1768627984456442963	/home/zhangzhao/桌面/lerobot/GraspGen/pointnet2_ops/build/temp.linux-x86_64-cpython-310/pointnet2_ops/_ext-src/src/group_points.o	4c4d5e1c41d802a8
+1	102797	1768627984456442963	/home/zhangzhao/桌面/lerobot/GraspGen/pointnet2_ops/build/temp.linux-x86_64-cpython-310/pointnet2_ops/_ext-src/src/ball_query_gpu.o	9fed9a33f6f253c8
+2	102797	1768627984457442960	/home/zhangzhao/桌面/lerobot/GraspGen/pointnet2_ops/build/temp.linux-x86_64-cpython-310/pointnet2_ops/_ext-src/src/sampling_gpu.o	d9fe098c413c58a5
+1	102797	1768627984456442963	/home/zhangzhao/桌面/lerobot/GraspGen/pointnet2_ops/build/temp.linux-x86_64-cpython-310/pointnet2_ops/_ext-src/src/group_points_gpu.o	fea79e7c9f58c21a
+1	102797	1768627984456442963	/home/zhangzhao/桌面/lerobot/GraspGen/pointnet2_ops/build/temp.linux-x86_64-cpython-310/pointnet2_ops/_ext-src/src/interpolate_gpu.o	581d5ce7df9ea22e

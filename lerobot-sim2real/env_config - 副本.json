@@ -1,0 +1,26 @@
+{
+  "base_camera_settings": {
+       "pos": [0.6418, 0.3458, 0.3208],
+      "fov": 0.9186890058517458,
+      "target": [0.1530, -0.0650, -0.0025]
+  },
+  "greenscreen_overlay_path": "D:/Project/Scaling/lerobot-sim2real-main/lerobot-sim2real/greenscreen.png",
+  "spawn_box_pos": [0.3, 0.05],
+  "spawn_box_half_size": 0.1,
+  "domain_randomization_config": {
+    "robot_color": null
+  }
+}
+
+
+
+home/zhangzhao/桌面/lerobot/hand_eye_calibration/result_to_pos_target.py
+    "pos": [
+        -0.170446, -0.831830, 0.396502
+    ],
+    "quat": [
+        0.835818, -0.040531, 0.035860, -0.546333
+    ],
+    "target": [
+        -0.066214, 0.078533, -0.003966
+    ],

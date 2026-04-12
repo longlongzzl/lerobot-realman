@@ -1,0 +1,24 @@
+{
+  "base_camera_settings": {
+    "pos": [
+      0.8664736414525883,
+      -0.4048423434401883,
+      0.6967787713072111
+    ],
+    "target": [
+      1.2301846360886595,
+      -0.6982857209891181,
+      1.2179364216909654
+    ],
+    "fov": 0.8207013506928524
+  },
+  "greenscreen_overlay_path": "/home/zhangzhao/Desktop/lerobot/lerobot-sim2real/greenscreen.png",
+  "spawn_box_pos": [
+    0.3,
+    0.05
+  ],
+  "spawn_box_half_size": 0.1,
+  "domain_randomization_config": {
+    "robot_color": null
+  }
+}

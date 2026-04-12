@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "GraspNet Demo (kn checkpoint)",
+      "type": "python",
+      "request": "launch",
+      "program": "/home/zhangzhao/桌面/lerobot/hand_eye_calibration/graspnet-baseline/demo.py",
+      "cwd": "/home/zhangzhao/桌面/lerobot/hand_eye_calibration/graspnet-baseline",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "--checkpoint_path",
+        "logs/log_kn/checkpoint.tar"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

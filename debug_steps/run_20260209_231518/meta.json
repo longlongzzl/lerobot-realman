@@ -1,0 +1,15 @@
+{
+  "checkpoint": "/home/zhangzhao/Desktop/lerobot/lerobot-sim2real/runs/pushT/more_texture_10_20000_samller_ckpt_701_success1.000.pt",
+  "env_kwargs_json_path": "/home/zhangzhao/Desktop/lerobot/lerobot-sim2real/so101_env_config.json",
+  "debug": false,
+  "save_step_debug": true,
+  "debug_save_dir": null,
+  "continuous_eval": false,
+  "max_episode_steps": 100,
+  "num_episodes": null,
+  "env_id": "RM75GraspCube_two_cameras-v1",
+  "seed": 1,
+  "record_dir": null,
+  "control_freq": 15,
+  "use_real_robot": true
+}

@@ -1,0 +1,72 @@
+{
+  "base_camera_settings": {
+    "pos": [
+      0.8074999999999999,
+      -0.4,
+      0.1999999999999999
+    ],
+    "target": [
+      0.1924999999999999,
+      0.01000000000000012,
+      0.004999999999999838
+    ],
+    "fov": 0.8453977353545329
+  },
+  "base_camera_2_settings": {
+    "pos": [
+      0.18,
+      -0.4193,
+      0.3243
+    ],
+    "fov": 0.8006890058517458,
+    "target": [
+      0.212,
+      -0.115,
+      0.1095
+    ]
+  },
+  "greenscreen_overlay_path_2": "/home/zhangzhao/Desktop/lerobot/lerobot-sim2real/greenscreen.png",
+  "greenscreen_overlay_path": "/home/zhangzhao/Desktop/lerobot/lerobot-sim2real/greenscreen.png",
+  "spawn_box_pos": [
+    0.3,
+    0.05
+  ],
+  "spawn_box_half_size": 0.1,
+  "domain_randomization_config": {
+    "robot_color": null
+  },
+  "world_T_base": {
+    "matrix4x4": [
+      [
+        0.8758442666045507,
+        0.3264207521623121,
+        -0.3554522657315988,
+        1.6081378122677212
+      ],
+      [
+        0.44138328223865564,
+        -0.8396415697932463,
+        0.3165167174658622,
+        -1.1272879859464149
+      ],
+      [
+        -0.1951348733982931,
+        -0.4341100400047478,
+        -0.8794719178864716,
+        0.11111459384417963
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  },
+  "camera_forward_axis": "-Z",
+  "world_up": [
+    0.0,
+    0.0,
+    1.0
+  ]
+}

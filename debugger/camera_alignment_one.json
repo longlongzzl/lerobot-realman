@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "camera_alignment_one.py",
+      "type": "python",
+      "request": "launch",
+      "program": "/home/zhangzhao/Desktop/lerobot/lerobot-sim2real/lerobot_sim2real/scripts/camera_alignment_one.py",
+      "cwd": "/home/zhangzhao/Desktop/lerobot/lerobot-sim2real",
+      "args": [
+        "--env-id=RM75GraspCube_two_cameras-v1",
+        "--env-kwargs-json-path=env_config.json"
+      ],
+      "env": {
+        "PYTHONPATH": "/home/zhangzhao/Desktop/lerobot/mani_skill:/home/zhangzhao/Desktop/lerobot/lerobot-sim2real:/home/zhangzhao/Desktop/lerobot",
+        "DISPLAY": "zhangzhao-HP-Pavilion-Gaming-Desktop-TG01-1xxx:11.0"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
