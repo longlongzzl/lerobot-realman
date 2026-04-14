@@ -91,6 +91,7 @@ class RM75CuRoboPlannerConfig:
     use_cuda_graph: bool = False
     self_collision_check: bool = False
     self_collision_opt: bool = False
+    collision_activation_distance: float = 0.02
 
 
 class RM75CuRoboPlanner:
@@ -313,6 +314,60 @@ class RM75CuRoboPlanner:
                         "ik_success_count": int(self.mods["torch"].count_nonzero(result.success).item()),
                     },
                 )
+            )
+        return outputs
+
+    def estimate_batch_start_goal_ik_errors(
+        self,
+        start_qs: Sequence[Sequence[float]],
+        goal_poses: Sequence[Any],
+        *,
+        num_seeds: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Return per-candidate IK error estimates for diagnostics."""
+        start_qs = list(start_qs or [])
+        goal_poses = list(goal_poses or [])
+        if len(start_qs) == 0 or len(goal_poses) == 0:
+            return []
+        if len(start_qs) != len(goal_poses):
+            raise ValueError(
+                f"start_qs and goal_poses must have the same length, got {len(start_qs)} and {len(goal_poses)}"
+            )
+        if len(goal_poses) == 1:
+            single = self.solve_ik(start_qs[0], goal_poses[0], num_seeds=num_seeds)
+            return [
+                {
+                    "success": bool(single.success),
+                    "status": str(single.status),
+                    "position_error": float(single.debug.get("position_error", np.nan)),
+                    "rotation_error": float(single.debug.get("rotation_error", np.nan)),
+                }
+            ]
+
+        start_state = self._make_multi_start_state(start_qs)
+        goal = self._make_batch_pose(goal_poses)
+        use_num_seeds = self.config.num_ik_seeds if num_seeds is None else int(num_seeds)
+        self.ik_solver.reset_seed()
+        result = self.ik_solver.solve_batch(
+            goal,
+            retract_config=start_state.position.clone(),
+            seed_config=start_state.position.unsqueeze(1).clone(),
+            return_seeds=1,
+            num_seeds=use_num_seeds,
+            use_nn_seed=False,
+        )
+        success_arr = self._to_numpy(result.success).reshape(-1).astype(bool)
+        pos_err = None if getattr(result, "position_error", None) is None else self._to_numpy(result.position_error).reshape(-1)
+        rot_err = None if getattr(result, "rotation_error", None) is None else self._to_numpy(result.rotation_error).reshape(-1)
+        outputs: list[dict[str, Any]] = []
+        for idx, success in enumerate(success_arr.tolist()):
+            outputs.append(
+                {
+                    "success": bool(success),
+                    "status": "Success" if bool(success) else "IK_FAIL",
+                    "position_error": float(np.nan if pos_err is None or idx >= pos_err.shape[0] else pos_err[idx]),
+                    "rotation_error": float(np.nan if rot_err is None or idx >= rot_err.shape[0] else rot_err[idx]),
+                }
             )
         return outputs
 
@@ -787,6 +842,71 @@ class RM75CuRoboPlanner:
         self.ik_solver.update_world(self._empty_world)
         self._world = self._empty_world
 
+    def attach_object_box_to_robot(
+        self,
+        q: Sequence[float],
+        box_dims: Sequence[float],
+        *,
+        link_name: str = "attached_object",
+        surface_sphere_radius: float = 0.002,
+    ) -> bool:
+        """Attach a box-shaped object to the robot in cuRobo collision checking.
+
+        Uses cuRobo's Cuboid obstacle type and attach_external_objects_to_robot.
+        """
+        if not self.collision_enabled:
+            return False
+        torch = self.mods["torch"]
+        q_np = self._normalize_q(q)
+        joint_state = self._make_start_state(q_np)
+        dims = np.asarray(box_dims, dtype=np.float32).reshape(3)
+        cuboid_obstacle = self.mods["WorldConfig"].create_collision_support_world().cuboid[0]
+        try:
+            from curobo.geom.types import Cuboid as CuRoboCuboid
+        except ImportError:
+            print("[curobo] could not import Cuboid from curobo.geom.types; attach skipped")
+            return False
+        box_obstacle = CuRoboCuboid(
+            name="attached_payload",
+            pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            dims=dims.tolist(),
+        )
+        try:
+            ok = self.motion_gen.attach_external_objects_to_robot(
+                joint_state=joint_state,
+                external_objects=[box_obstacle],
+                surface_sphere_radius=float(surface_sphere_radius),
+                link_name=str(link_name),
+            )
+            self._attached_object_active = bool(ok)
+            if ok:
+                print(
+                    f"[curobo] attached object box {np.round(dims, 4).tolist()} "
+                    f"to link={link_name} with {self.motion_gen.robot_cfg.kinematics.kinematics_config.get_number_of_spheres(link_name)} spheres"
+                )
+            else:
+                print("[curobo] attach_external_objects_to_robot returned False")
+            return bool(ok)
+        except Exception as exc:
+            print(f"[curobo] attach_external_objects_to_robot failed: {exc}")
+            self._attached_object_active = False
+            return False
+
+    def detach_object_from_robot(self, *, link_name: str = "attached_object") -> None:
+        """Detach any attached object from the robot in cuRobo collision checking."""
+        if not self.collision_enabled:
+            return
+        try:
+            self.motion_gen.detach_object_from_robot(link_name=str(link_name))
+            self._attached_object_active = False
+            print(f"[curobo] detached object from link={link_name}")
+        except Exception as exc:
+            print(f"[curobo] detach_object_from_robot failed: {exc}")
+
+    @property
+    def attached_object_active(self) -> bool:
+        return bool(getattr(self, "_attached_object_active", False))
+
     def build_world_from_cuboids(self, cuboids: Sequence[Mapping[str, Any]]):
         return self.build_world_from_obstacles(cuboids=cuboids, meshes=())
 
@@ -861,6 +981,7 @@ class RM75CuRoboPlanner:
             interpolation_dt=float(self.config.interpolation_dt),
             position_threshold=float(self.config.position_threshold),
             rotation_threshold=float(self.config.rotation_threshold),
+            collision_activation_distance=float(self.config.collision_activation_distance),
             use_cuda_graph=bool(self.config.use_cuda_graph),
             self_collision_check=bool(self.config.self_collision_check),
             self_collision_opt=bool(self.config.self_collision_opt),

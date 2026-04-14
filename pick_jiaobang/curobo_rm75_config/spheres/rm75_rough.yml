@@ -47,11 +47,7 @@ collision_spheres:
     - "center": [0.0, -0.13, 0.0]
       "radius": 0.04
 
-  link_7:
-    - "center": [0.0, -0.03, 0.0]
-      "radius": 0.04
-    - "center": [0.0, -0.08, 0.0]
-      "radius": 0.04
+  link_7: []
 
   gripper_base_link:
     - "center": [0.0, 0.0, 0.05]
@@ -61,9 +57,9 @@ collision_spheres:
 
   gripper_Left_1_Link:
     - "center": [0.008, 0.008, 0.0]
-      "radius": 0.014
+      "radius": 0.012
     - "center": [0.032, 0.029, 0.0]
-      "radius": 0.014
+      "radius": 0.012
 
   gripper_Left_Support_Link:
     - "center": [-0.012, 0.03, 0.0]
@@ -71,15 +67,15 @@ collision_spheres:
 
   gripper_Left_2_Link:
     - "center": [0.008, 0.008, 0.0]
-      "radius": 0.014
+      "radius": 0.012
     - "center": [0.032, 0.029, 0.0]
-      "radius": 0.014
+      "radius": 0.012
 
   gripper_Right_1_Link:
     - "center": [0.008, 0.008, 0.0]
-      "radius": 0.014
+      "radius": 0.012
     - "center": [0.032, 0.029, 0.0]
-      "radius": 0.014
+      "radius": 0.012
 
   gripper_Right_Support_Link:
     - "center": [-0.012, 0.03, 0.0]
@@ -87,14 +83,14 @@ collision_spheres:
 
   gripper_Right_2_Link:
     - "center": [0.008, 0.008, 0.0]
-      "radius": 0.014
+      "radius": 0.012
     - "center": [0.032, 0.029, 0.0]
-      "radius": 0.014
+      "radius": 0.012
 
   left_pad:
     - "center": [0.0, 0.0, 0.0]
-      "radius": 0.008
+      "radius": 0.006
 
   right_pad:
     - "center": [0.0, 0.0, 0.0]
-      "radius": 0.008
+      "radius": 0.006

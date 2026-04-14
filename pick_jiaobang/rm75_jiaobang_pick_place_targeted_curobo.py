@@ -133,6 +133,25 @@ def build_arg_parser():
         help="Number of graph-planning seeds for intercepted cuRobo stages.",
     )
     parser.add_argument(
+        "--curobo-ik-position-threshold",
+        type=float,
+        default=0.005,
+        help="IK position threshold in meters. Increase to relax IK acceptance during screening.",
+    )
+    parser.add_argument(
+        "--curobo-ik-rotation-threshold",
+        type=float,
+        default=0.05,
+        help="IK rotation threshold in radians. Increase to relax IK acceptance during screening.",
+    )
+    parser.add_argument(
+        "--curobo-collision-activation-distance",
+        type=float,
+        default=0.02,
+        help="Distance in meters at which cuRobo activates collision cost during trajectory optimization. "
+        "Larger values make the robot stay further from obstacles (default 0.02 = 2cm clearance).",
+    )
+    parser.add_argument(
         "--curobo-debug",
         action="store_true",
         help="Print extra cuRobo interception diagnostics.",
@@ -175,6 +194,9 @@ def _planner_cache_key(args) -> tuple[Any, ...]:
         int(args.curobo_num_ik_seeds),
         int(args.curobo_num_trajopt_seeds),
         int(args.curobo_num_graph_seeds),
+        float(args.curobo_ik_position_threshold),
+        float(args.curobo_ik_rotation_threshold),
+        float(args.curobo_collision_activation_distance),
     )
 
 
@@ -195,6 +217,9 @@ def _get_or_create_curobo_planner(args) -> RM75CuRoboPlanner:
             num_ik_seeds=int(args.curobo_num_ik_seeds),
             num_trajopt_seeds=int(args.curobo_num_trajopt_seeds),
             num_graph_seeds=int(args.curobo_num_graph_seeds),
+            position_threshold=float(args.curobo_ik_position_threshold),
+            rotation_threshold=float(args.curobo_ik_rotation_threshold),
+            collision_activation_distance=float(args.curobo_collision_activation_distance),
         )
     )
     _PLANNER_CACHE[key] = planner

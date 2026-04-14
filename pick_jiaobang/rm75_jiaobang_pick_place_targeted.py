@@ -1400,6 +1400,7 @@ def main():
     scene_capture_cache: dict | None = {} if bool(getattr(args, "reuse_foundationpose_scene_across_cycles", True)) else None
     place_state_cache: dict = {"used_slots_by_target": {}}
     previous_cycle_final_q: np.ndarray | None = None
+    force_prompt_target_selection = False
     try:
         if args.execute_real:
             real_exec = base.RealmanJointExecutor(args)
@@ -1416,10 +1417,10 @@ def main():
             ok = False
             cached_scene_names = base.list_cached_scene_object_names(scene_capture_cache)
             available_rule_names = _list_cached_unplaced_rule_names(scene_capture_cache)
-            if cycle_idx <= len(cycle_object_sequence):
+            if not force_prompt_target_selection and cycle_idx <= len(cycle_object_sequence):
                 selected_name = cycle_object_sequence[cycle_idx - 1]
                 print(f"\n[cycle {cycle_idx}] using CLI target object: {selected_name}")
-            elif cycle_idx == 1 and base_args.object_name is not None:
+            elif not force_prompt_target_selection and cycle_idx == 1 and base_args.object_name is not None:
                 selected_name = base_args.object_name
                 print(f"\n[cycle {cycle_idx}] using CLI target object: {selected_name}")
             elif cycle_idx > 1 and available_rule_names:
@@ -1437,6 +1438,7 @@ def main():
                     available_names=list_place_rule_sources(),
                     default_name=(base_args.object_name or (list_place_rule_sources()[0] if list_place_rule_sources() else None)),
                 )
+            force_prompt_target_selection = False
             if selected_name is None:
                 final_ok = False
                 print(f"[abort] user cancelled object selection for cycle {cycle_idx}")
@@ -1483,6 +1485,14 @@ def main():
                 gc.collect()
             print(f"\ncycle {cycle_idx} success = {ok}")
             if not ok:
+                if bool(getattr(base_args, "reselect_target_on_planning_failure", True)):
+                    print(
+                        f"[cycle {cycle_idx}] planning/execution failed; "
+                        "keeping the current cached scene and returning to target selection."
+                    )
+                    force_prompt_target_selection = True
+                    cycle_idx -= 1
+                    continue
                 final_ok = False
                 break
             if final_sim_arm_q is not None:

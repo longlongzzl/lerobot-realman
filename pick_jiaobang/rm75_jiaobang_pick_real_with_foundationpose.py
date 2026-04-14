@@ -1044,7 +1044,7 @@ def build_arg_parser():
     parser.add_argument(
         "--planner-virtual-side-wall-x",
         type=float,
-        default=-0.50,
+        default=-0.90,
         help="World-frame x position of the front face of the planner-only virtual side wall.",
     )
     parser.add_argument(
@@ -1147,6 +1147,19 @@ def build_arg_parser():
     parser.add_argument("--disable-linear-joint-fallback", action="store_true", help="Disable the collision-checked linear joint-path fallback after RRT transport planning fails.")
     parser.add_argument("--repeat-count", type=int, default=1, help="Number of pick cycles to run. Each completed cycle recreates the vision+simulation state and, when executing on hardware, resets the robot before the next cycle.")
     parser.add_argument("--repeat-forever", action="store_true", help="Repeat pick cycles until a planning failure or user cancellation occurs.")
+    parser.add_argument(
+        "--reselect-target-on-planning-failure",
+        dest="reselect_target_on_planning_failure",
+        action="store_true",
+        default=True,
+        help="When the current target fails to plan or execute, return to target selection instead of exiting the whole program. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-reselect-target-on-planning-failure",
+        dest="reselect_target_on_planning_failure",
+        action="store_false",
+        help="Exit immediately when the current target fails instead of returning to target selection.",
+    )
     parser.add_argument(
         "--reuse-foundationpose-scene-across-cycles",
         dest="reuse_foundationpose_scene_across_cycles",
@@ -5346,6 +5359,7 @@ def main():
     final_ok = True
     cycle_idx = 0
     scene_capture_cache: dict | None = {} if bool(getattr(args, "reuse_foundationpose_scene_across_cycles", True)) else None
+    force_prompt_target_selection = False
     try:
         if args.execute_real:
             real_exec = RealmanJointExecutor(args)
@@ -5361,10 +5375,10 @@ def main():
             env = None
             ok = False
             cached_scene_names = list_cached_scene_object_names(scene_capture_cache)
-            if cycle_idx <= len(cycle_object_sequence):
+            if not force_prompt_target_selection and cycle_idx <= len(cycle_object_sequence):
                 selected_name = cycle_object_sequence[cycle_idx - 1]
                 print(f"\n[cycle {cycle_idx}] using CLI target object: {selected_name}")
-            elif cycle_idx == 1 and base_args.object_name is not None:
+            elif not force_prompt_target_selection and cycle_idx == 1 and base_args.object_name is not None:
                 selected_name = base_args.object_name
                 print(f"\n[cycle {cycle_idx}] using CLI target object: {selected_name}")
             elif cycle_idx > 1 and cached_scene_names:
@@ -5372,6 +5386,7 @@ def main():
                 selected_name = prompt_cycle_object_name(base_args, cycle_idx, available_names=cached_scene_names, default_name=cached_scene_names[0])
             else:
                 selected_name = prompt_cycle_object_name(base_args, cycle_idx)
+            force_prompt_target_selection = False
             if selected_name is None:
                 final_ok = False
                 print(f"[abort] user cancelled object selection for cycle {cycle_idx}")
@@ -5405,6 +5420,14 @@ def main():
                 gc.collect()
             print(f"\ncycle {cycle_idx} success = {ok}")
             if not ok:
+                if bool(getattr(base_args, "reselect_target_on_planning_failure", True)):
+                    print(
+                        f"[cycle {cycle_idx}] planning/execution failed; "
+                        "keeping the current cached scene and returning to target selection."
+                    )
+                    force_prompt_target_selection = True
+                    cycle_idx -= 1
+                    continue
                 final_ok = False
                 break
             remove_picked_object_from_scene_cache(scene_capture_cache, cycle_args.object_name)
