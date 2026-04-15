@@ -268,6 +268,8 @@ def _curobo_world_mesh_name_set(args) -> set[str]:
 def _scene_obstacles_to_curobo_world(
     demo,
     args,
+    *,
+    exclude_object_names: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     cuboids: list[dict[str, Any]] = []
     meshes: list[dict[str, Any]] = []
@@ -275,6 +277,10 @@ def _scene_obstacles_to_curobo_world(
     for item in list(getattr(demo, "scene_obstacles", []) or []):
         if not bool(item.get("planner_collision", False)):
             continue
+        if exclude_object_names:
+            obj_name = normalize_object_name(item.get("object_name"))
+            if obj_name in exclude_object_names:
+                continue
         T_world_obj = item.get("T_world_obj")
         if T_world_obj is None:
             continue

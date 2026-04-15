@@ -27,6 +27,8 @@ def build_arg_parser():
         tabletop_place_tilt_toward_robot_deg=[0.0, 15.0],
         tabletop_place_axial_spin_deg=[0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0],
         topdown_grasp_yaw_variant_deg=[0.0, -30.0, 30.0, -60.0, 60.0, -90.0, 90.0, 180.0],
+        topdown_tilt_toward_robot_deg=[12.0, 20.0, 30.0, 45.0],
+        topdown_tilt_toward_robot_shift_m=[0.0, 0.02],
     )
     parser.add_argument(
         "--direct-release-approach-distance",
@@ -93,6 +95,14 @@ def build_arg_parser():
         type=float,
         default=0.08,
         help="Additional score penalty per 1cm grasp TCP lift. Larger values prefer lower-lift grasps.",
+    )
+    parser.add_argument(
+        "--direct-grasp-max-axis-shift-ratio",
+        type=float,
+        default=0.35,
+        help="Max |axis_shift| as a fraction of the object's half-length along its longest axis. "
+        "E.g. 0.35 on a 60mm object = max 10.5mm shift. Prevents grasp candidates that would "
+        "overshoot the object edge.",
     )
     parser.add_argument(
         "--direct-min-place-tcp-z",
@@ -349,14 +359,68 @@ def _build_virtual_table_cuboid(args) -> dict:
     }
 
 
-def _refresh_curobo_world(planner, demo, args, *, label: str, include_active_object: bool = False) -> None:
+def _visualize_attached_spheres(planner, demo, args):
+    """Print and optionally visualize the attached object collision spheres."""
+    current_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+    spheres = planner.get_attached_spheres_world(current_q)
+    if not spheres:
+        print("[curobo] no attached spheres to visualize")
+        return
+    base_p = targeted.base.flatten_np(demo.robot.pose.p)[:3].astype(np.float32)
+    print(f"[curobo] attached object collision spheres ({len(spheres)} total):")
+    for i, s in enumerate(spheres):
+        world_center = np.asarray(s["center"], dtype=np.float32) + base_p
+        print(
+            f"  sphere[{i}]: world_center=[{world_center[0]:.4f}, {world_center[1]:.4f}, {world_center[2]:.4f}], "
+            f"radius={s['radius']*1000:.1f}mm"
+        )
+    if not bool(getattr(args, "curobo_show_attached_spheres", True)):
+        return
+    try:
+        from sapien.core import Pose
+        env = demo.env
+        sphere_actors = list(getattr(env.unwrapped, "_attached_sphere_actors", []) or [])
+        for actor in sphere_actors:
+            try:
+                actor.remove_from_scene()
+            except Exception:
+                pass
+        sphere_actors = []
+        for i, s in enumerate(spheres):
+            world_center = np.asarray(s["center"], dtype=np.float32) + base_p
+            radius = float(s["radius"])
+            builder = env.unwrapped.scene.create_actor_builder()
+            builder.add_sphere_visual(radius=radius, material=None)
+            actor = builder.build_static(name=f"attached_sphere_{i}")
+            actor.set_pose(Pose(p=world_center.tolist()))
+            try:
+                for body in actor.get_visual_bodies():
+                    for shape in body.get_render_shapes():
+                        mat = shape.material
+                        mat.set_base_color([1.0, 0.2, 0.2, 0.4])
+                        shape.set_material(mat)
+            except Exception:
+                pass
+            sphere_actors.append(actor)
+        env.unwrapped._attached_sphere_actors = sphere_actors
+        print(f"[curobo] visualized {len(sphere_actors)} attached collision spheres (red, semi-transparent)")
+    except Exception as exc:
+        print(f"[curobo] sphere visualization failed (non-critical): {exc}")
+
+
+def _refresh_curobo_world(
+    planner, demo, args, *, label: str, include_active_object: bool = False, include_table: bool = False,
+    exclude_object_names: set[str] | None = None,
+) -> None:
     if planner.collision_enabled:
-        cuboids, meshes = curobo_wrapper._scene_obstacles_to_curobo_world(demo, args)
+        cuboids, meshes = curobo_wrapper._scene_obstacles_to_curobo_world(
+            demo, args, exclude_object_names=exclude_object_names,
+        )
         if include_active_object:
             active_cuboids, active_meshes = _build_active_object_curobo_world(demo, args)
             cuboids.extend(active_cuboids)
             meshes.extend(active_meshes)
-        if bool(getattr(args, "curobo_table_collision", True)):
+        if include_table and bool(getattr(args, "curobo_table_collision", True)):
             cuboids.append(_build_virtual_table_cuboid(args))
         cuboids_in_base, meshes_in_base = curobo_wrapper._transform_curobo_world_to_robot_base(
             cuboids,
@@ -364,6 +428,10 @@ def _refresh_curobo_world(planner, demo, args, *, label: str, include_active_obj
             demo,
         )
         planner.set_world_from_obstacles(cuboids=cuboids_in_base, meshes=meshes_in_base)
+        if exclude_object_names:
+            print(
+                f"[curobo] {label} world: excluded scene obstacle(s): {sorted(exclude_object_names)}"
+            )
         if bool(getattr(args, "curobo_debug", False)):
             print(
                 f"[curobo] updated world with {len(cuboids_in_base)} cuboid and "
@@ -850,14 +918,42 @@ def _plan_and_execute_return_to_cycle_start(
     start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
     q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     target_pose = _get_demo_tcp_pose_for_joint_q(demo, start_q)
-    q_path = targeted.base.plan_joint_path(
-        demo,
-        start_q,
-        use_attach=use_attach,
-        label=label,
-        start_q=q_current,
-        allow_reverse_rrt_fallback=True,
-    )
+
+    planner = curobo_wrapper._get_or_create_curobo_planner(args)
+    q_path = None
+    if planner is not None:
+        _refresh_curobo_world(planner, demo, args, label=label)
+        goal_pose = _get_demo_tcp_pose_for_joint_q(demo, start_q)
+        planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
+            demo,
+            goal_pose,
+            ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
+        )
+        result = planner.plan_to_pose(
+            q_current,
+            planner_pose,
+            enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+            max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
+            timeout=float(getattr(args, "curobo_timeout", 5.0)),
+            num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
+            num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+            num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
+        )
+        if result.success and result.joint_path is not None:
+            q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in result.joint_path]
+            print(f"[curobo] {label} planned successfully ({len(q_path)} waypoints)")
+        else:
+            print(f"[curobo] {label} cuRobo failed (status={result.status}), falling back to MPLib (no RRT)")
+
+    if q_path is None:
+        q_path = targeted.base.plan_joint_path(
+            demo,
+            start_q,
+            use_attach=use_attach,
+            label=label,
+            start_q=q_current,
+            allow_reverse_rrt_fallback=False,
+        )
     if q_path is None:
         print(f"[FAIL] {label} planning failed")
         targeted.base.print_failure_diagnostics(
@@ -925,10 +1021,12 @@ def _evaluate_curobo_pose_candidates(
     num_trajopt_seeds: int | None = None,
     num_graph_seeds: int | None = None,
     include_active_object: bool = False,
+    include_table: bool = False,
+    exclude_object_names: set[str] | None = None,
     disabled_world_collision_links: list[str] | None = None,
 ):
     start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
-    _refresh_curobo_world(planner, demo, args, label=label, include_active_object=include_active_object)
+    _refresh_curobo_world(planner, demo, args, label=label, include_active_object=include_active_object, include_table=include_table, exclude_object_names=exclude_object_names)
     ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
     if bool(getattr(args, "curobo_debug", False)):
         ee_link = _get_robot_link_by_name(demo, ee_link_name)
@@ -1094,10 +1192,12 @@ def _evaluate_curobo_pose_candidates_goalset(
     num_graph_seeds: int | None = None,
     max_winners: int | None = None,
     include_active_object: bool = False,
+    include_table: bool = False,
+    exclude_object_names: set[str] | None = None,
     disabled_world_collision_links: list[str] | None = None,
 ):
     start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
-    _refresh_curobo_world(planner, demo, args, label=label, include_active_object=include_active_object)
+    _refresh_curobo_world(planner, demo, args, label=label, include_active_object=include_active_object, include_table=include_table, exclude_object_names=exclude_object_names)
     remaining = list(candidates or [])
     if not remaining:
         return []
@@ -1138,93 +1238,93 @@ def _evaluate_curobo_pose_candidates_goalset(
     chunk_size = int(getattr(args, "curobo_batch_chunk_size", 64))
     if chunk_size <= 0:
         chunk_size = len(remaining)
-    ik_screened = []
-    ik_error_records = []
-    ik_status_counts = {}
-    ik_screen_total = len(remaining)
-    ranked_failed_candidates = []
-    for start_idx in range(0, len(remaining), chunk_size):
-        chunk = remaining[start_idx : start_idx + chunk_size]
-        planner_poses = [
-            _convert_demo_tcp_pose_to_curobo_ee_pose(
-                demo,
-                item["pose"],
-                ee_link_name=ee_link_name,
-            )
-            for item in chunk
-        ]
-        start_qs = [start_q for _ in chunk]
-        ik_results = planner.solve_batch_start_goal_ik(
-            start_qs,
-            planner_poses,
-            num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if num_ik_seeds is None else num_ik_seeds),
-        )
-        ik_details = planner.estimate_batch_start_goal_ik_errors(
-            start_qs,
-            planner_poses,
-            num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if num_ik_seeds is None else num_ik_seeds),
-        )
-        for candidate, planner_pose, ik_result, ik_detail in zip(chunk, planner_poses, ik_results, ik_details):
-            status_key = str(ik_result.status)
-            ik_status_counts[status_key] = int(ik_status_counts.get(status_key, 0)) + 1
-            pos_err = float(ik_detail.get("position_error", np.nan))
-            rot_err = float(ik_detail.get("rotation_error", np.nan))
-            ik_error_records.append(
-                {
-                    "label": str(candidate["label"]),
-                    "position_error": pos_err,
-                    "rotation_error": rot_err,
-                    "success": bool(ik_result.success),
-                }
-            )
-            if ik_result.success:
-                ik_screened.append(candidate)
-                continue
-            rank_key = (
-                pos_err if np.isfinite(pos_err) else np.inf,
-                rot_err if np.isfinite(rot_err) else np.inf,
-                str(candidate["label"]),
-            )
-            ranked_failed_candidates.append(
-                {
-                    "candidate": candidate,
-                    "planner_pose": planner_pose,
-                    "rank_key": rank_key,
-                }
-            )
-    remaining = ik_screened
-    status_summary = ", ".join(f"{k}={v}" for k, v in sorted(ik_status_counts.items()))
-    print(
-        f"[curobo][diag] {label} IK prefilter kept {len(remaining)}/{ik_screen_total} candidate(s); "
-        f"statuses: {status_summary or 'none'}"
-    )
-    _print_ik_error_summary(label, ik_error_records)
-    if not remaining:
-        ranked_failed_candidates.sort(key=lambda x: x["rank_key"])
-        _diagnose_failed_ik_candidates(
-            planner,
-            demo,
-            args,
-            label,
-            start_q,
-            ranked_failed_candidates,
-            topk=int(getattr(args, "direct_grasp_diagnose_topk", 3)),
-        )
-        return []
-    num_chunks = max(1, (len(remaining) + chunk_size - 1) // chunk_size)
-    print(
-        f"[curobo] {label} evaluating {len(remaining)} candidate(s) "
-        f"in {num_chunks} batch chunk(s) of size <= {chunk_size}"
-    )
-    ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
 
     disabled_world_collision_links = _set_world_collision_for_links(
         planner,
         disabled_world_collision_links,
         enabled=False,
-        label=label,
+        label=f"{label}_ik+plan",
     )
     try:
+        ik_screened = []
+        ik_error_records = []
+        ik_status_counts = {}
+        ik_screen_total = len(remaining)
+        ranked_failed_candidates = []
+        for start_idx in range(0, len(remaining), chunk_size):
+            chunk = remaining[start_idx : start_idx + chunk_size]
+            planner_poses = [
+                _convert_demo_tcp_pose_to_curobo_ee_pose(
+                    demo,
+                    item["pose"],
+                    ee_link_name=ee_link_name,
+                )
+                for item in chunk
+            ]
+            start_qs = [start_q for _ in chunk]
+            ik_results = planner.solve_batch_start_goal_ik(
+                start_qs,
+                planner_poses,
+                num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if num_ik_seeds is None else num_ik_seeds),
+            )
+            ik_details = planner.estimate_batch_start_goal_ik_errors(
+                start_qs,
+                planner_poses,
+                num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if num_ik_seeds is None else num_ik_seeds),
+            )
+            for candidate, planner_pose, ik_result, ik_detail in zip(chunk, planner_poses, ik_results, ik_details):
+                status_key = str(ik_result.status)
+                ik_status_counts[status_key] = int(ik_status_counts.get(status_key, 0)) + 1
+                pos_err = float(ik_detail.get("position_error", np.nan))
+                rot_err = float(ik_detail.get("rotation_error", np.nan))
+                ik_error_records.append(
+                    {
+                        "label": str(candidate["label"]),
+                        "position_error": pos_err,
+                        "rotation_error": rot_err,
+                        "success": bool(ik_result.success),
+                    }
+                )
+                if ik_result.success:
+                    ik_screened.append(candidate)
+                    continue
+                rank_key = (
+                    pos_err if np.isfinite(pos_err) else np.inf,
+                    rot_err if np.isfinite(rot_err) else np.inf,
+                    str(candidate["label"]),
+                )
+                ranked_failed_candidates.append(
+                    {
+                        "candidate": candidate,
+                        "planner_pose": planner_pose,
+                        "rank_key": rank_key,
+                    }
+                )
+        remaining = ik_screened
+        status_summary = ", ".join(f"{k}={v}" for k, v in sorted(ik_status_counts.items()))
+        print(
+            f"[curobo][diag] {label} IK prefilter kept {len(remaining)}/{ik_screen_total} candidate(s); "
+            f"statuses: {status_summary or 'none'}"
+        )
+        _print_ik_error_summary(label, ik_error_records)
+        if not remaining:
+            ranked_failed_candidates.sort(key=lambda x: x["rank_key"])
+            _diagnose_failed_ik_candidates(
+                planner,
+                demo,
+                args,
+                label,
+                start_q,
+                ranked_failed_candidates,
+                topk=int(getattr(args, "direct_grasp_diagnose_topk", 3)),
+            )
+            return []
+        num_chunks = max(1, (len(remaining) + chunk_size - 1) // chunk_size)
+        print(
+            f"[curobo] {label} evaluating {len(remaining)} candidate(s) "
+            f"in {num_chunks} batch chunk(s) of size <= {chunk_size}"
+        )
+        ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
         for chunk_idx, start_idx in enumerate(range(0, len(remaining), chunk_size), start=1):
             chunk = remaining[start_idx : start_idx + chunk_size]
             planner_poses = [
@@ -1366,9 +1466,11 @@ def _evaluate_curobo_pose_candidates_multi_start(
     num_graph_seeds: int | None = None,
     max_winners: int | None = None,
     include_active_object: bool = False,
+    include_table: bool = False,
+    exclude_object_names: set[str] | None = None,
     disabled_world_collision_links: list[str] | None = None,
 ):
-    _refresh_curobo_world(planner, demo, args, label=label, include_active_object=include_active_object)
+    _refresh_curobo_world(planner, demo, args, label=label, include_active_object=include_active_object, include_table=include_table, exclude_object_names=exclude_object_names)
     remaining = list(candidates or [])
     if not remaining:
         return []
@@ -1461,6 +1563,14 @@ def _evaluate_curobo_pose_candidates_multi_start(
         f"[curobo] {label} evaluating {len(remaining)} start-goal pair(s) "
         f"in {num_chunks} batch chunk(s) of size <= {chunk_size}"
     )
+
+    if include_table and bool(getattr(args, "curobo_table_collision", True)):
+        _refresh_curobo_world(
+            planner, demo, args, label=f"{label}_trajopt",
+            include_active_object=include_active_object,
+            include_table=True,
+            exclude_object_names=exclude_object_names,
+        )
 
     disabled_world_collision_links = _set_world_collision_for_links(
         planner,
@@ -1579,12 +1689,14 @@ def _build_direct_grasp_candidates(demo, args):
     grasp_variant_args = SimpleNamespace(**vars(args))
     grasp_variant_args.topdown_grasp_yaw_variant_deg = [0.0]
     object_axis_world = None
+    object_long_axis_half = None
     try:
         extents = np.asarray(
             targeted.base.get_asset_box_size(args.sim_asset_file, args.sim_asset_scale),
             dtype=np.float32,
         ).reshape(3)
         axis_idx = int(np.argmax(extents))
+        object_long_axis_half = float(extents[axis_idx]) * 0.5
         if float(np.max(extents)) >= 1.5 * float(max(np.sort(extents)[1], 1e-6)):
             T_world_obj = targeted.base.pose_to_matrix(*demo.get_obj_pose())
             axis_local = np.zeros(3, dtype=np.float32)
@@ -1592,11 +1704,25 @@ def _build_direct_grasp_candidates(demo, args):
             object_axis_world = _normalize(T_world_obj[:3, :3] @ axis_local)
     except Exception:
         object_axis_world = None
+
     grasp_axis_shifts = _unique_finite_float_list(
         getattr(args, "direct_grasp_object_axis_shifts_m", [0.0]),
     )
     if not grasp_axis_shifts:
         grasp_axis_shifts = [0.0]
+    max_axis_shift_ratio = float(max(getattr(args, "direct_grasp_max_axis_shift_ratio", 0.35), 0.0))
+    if object_long_axis_half is not None and max_axis_shift_ratio > 0:
+        max_abs_shift = object_long_axis_half * max_axis_shift_ratio
+        before_count = len(grasp_axis_shifts)
+        grasp_axis_shifts = [s for s in grasp_axis_shifts if abs(float(s)) <= max_abs_shift + 1e-6]
+        if not grasp_axis_shifts:
+            grasp_axis_shifts = [0.0]
+        if len(grasp_axis_shifts) < before_count:
+            print(
+                f"[direct_grasp] axis_shift filter: object half-length={object_long_axis_half * 1000:.1f}mm, "
+                f"max_ratio={max_axis_shift_ratio:.2f} -> max_shift={max_abs_shift * 1000:.1f}mm, "
+                f"kept {len(grasp_axis_shifts)}/{before_count} shift value(s)"
+            )
     grasp_z_lifts = _unique_finite_float_list(
         getattr(args, "direct_grasp_z_lifts_m", [0.0]),
         min_value=0.0,
@@ -1628,12 +1754,9 @@ def _build_direct_grasp_candidates(demo, args):
         for label, pose in targeted.base.build_grasp_pose_variants(demo, raw_grasp_pose, grasp_variant_args):
             _append(label, pose)
 
-        if grasp_mode not in elongated_modes:
-            return variants
-
-        tilt_degs = _unique_finite_float_list(getattr(args, "direct_elongated_grasp_tilt_toward_robot_deg", [0.0]))
+        tilt_degs = _unique_finite_float_list(getattr(args, "direct_grasp_tilt_toward_robot_deg", [12.0, 20.0, 30.0, 45.0]))
         shift_ds = _unique_finite_float_list(
-            getattr(args, "direct_elongated_grasp_tilt_toward_robot_shift_m", [0.0]),
+            getattr(args, "direct_grasp_tilt_toward_robot_shift_m", [0.0, 0.02]),
             min_value=0.0,
         )
         if not shift_ds:
@@ -1653,7 +1776,7 @@ def _build_direct_grasp_candidates(demo, args):
                 )
                 if shifted_pose is None:
                     continue
-                base_label = f"grasp_elong_tilt_{int(round(abs(float(tilt_deg))))}deg"
+                base_label = f"grasp_tilt_{int(round(abs(float(tilt_deg))))}deg"
                 if float(shift_d) > 1e-6:
                     base_label += f"_shift_{int(round(1000.0 * float(shift_d)))}mm"
                 _append(base_label, shifted_pose)
@@ -1984,6 +2107,10 @@ def _evaluate_joint_grasp_place_chains(
                 f"[joint_search] direct-place pair candidate count: {len(direct_pair_candidates)} "
                 f"from {len(grasp_candidates)} grasp winner(s)"
             )
+            target_obj_name = curobo_wrapper.normalize_object_name(
+                getattr(rule, "target_object_name", None)
+            )
+            exclude_names = {target_obj_name} if target_obj_name else None
             direct_place_successes = _evaluate_curobo_pose_candidates_multi_start(
                 planner,
                 demo,
@@ -1995,6 +2122,8 @@ def _evaluate_joint_grasp_place_chains(
                 max_attempts=screen_max_attempts_arg,
                 num_ik_seeds=screen_num_ik_seeds_arg,
                 num_trajopt_seeds=screen_num_trajopt_seeds_arg,
+                include_table=True,
+                exclude_object_names=exclude_names,
             )
             for candidate in direct_place_successes:
                 grasp_choice = candidate["grasp_choice"]
@@ -2183,6 +2312,8 @@ def run_targeted_place_episode_curobo_direct(
             attach_box_dims = np.maximum(np.asarray(attach_box_dims, dtype=np.float32) * attach_box_scale, 1e-4)
             current_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
             planner.attach_object_box_to_robot(current_q, attach_box_dims)
+            if planner.attached_object_active:
+                _visualize_attached_spheres(planner, demo, args)
         except Exception as exc:
             print(f"[curobo] failed to attach object for transport collision: {exc}")
 
@@ -2235,6 +2366,10 @@ def run_targeted_place_episode_curobo_direct(
             print("[FAIL] direct place candidates became empty after filtering")
             return False
 
+        target_obj_name_place = curobo_wrapper.normalize_object_name(
+            getattr(rule, "target_object_name", None)
+        )
+        exclude_names_place = {target_obj_name_place} if target_obj_name_place else None
         direct_place_successes = _evaluate_curobo_pose_candidates(
             planner,
             demo,
@@ -2244,6 +2379,8 @@ def run_targeted_place_episode_curobo_direct(
             label="direct_place",
             prefer_verticality=(rule.primitive == "insert_vertical"),
             use_attach=True,
+            include_table=bool(planner.attached_object_active),
+            exclude_object_names=exclude_names_place,
         )
         if not direct_place_successes:
             print("[FAIL] cuRobo direct-place planning failed and pre-place fallback is disabled")

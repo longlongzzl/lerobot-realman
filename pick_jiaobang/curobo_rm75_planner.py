@@ -848,11 +848,13 @@ class RM75CuRoboPlanner:
         box_dims: Sequence[float],
         *,
         link_name: str = "attached_object",
-        surface_sphere_radius: float = 0.002,
+        surface_sphere_radius: float | None = None,
     ) -> bool:
         """Attach a box-shaped object to the robot in cuRobo collision checking.
 
         Uses cuRobo's Cuboid obstacle type and attach_external_objects_to_robot.
+        If surface_sphere_radius is None, it is auto-computed as half of the object's
+        smallest dimension so the spheres actually cover the cross-section.
         """
         if not self.collision_enabled:
             return False
@@ -860,7 +862,9 @@ class RM75CuRoboPlanner:
         q_np = self._normalize_q(q)
         joint_state = self._make_start_state(q_np)
         dims = np.asarray(box_dims, dtype=np.float32).reshape(3)
-        cuboid_obstacle = self.mods["WorldConfig"].create_collision_support_world().cuboid[0]
+        if surface_sphere_radius is None:
+            surface_sphere_radius = float(dims.min()) * 0.5
+            surface_sphere_radius = max(surface_sphere_radius, 0.003)
         try:
             from curobo.geom.types import Cuboid as CuRoboCuboid
         except ImportError:
@@ -880,9 +884,11 @@ class RM75CuRoboPlanner:
             )
             self._attached_object_active = bool(ok)
             if ok:
+                n_spheres = self.motion_gen.robot_cfg.kinematics.kinematics_config.get_number_of_spheres(link_name)
                 print(
                     f"[curobo] attached object box {np.round(dims, 4).tolist()} "
-                    f"to link={link_name} with {self.motion_gen.robot_cfg.kinematics.kinematics_config.get_number_of_spheres(link_name)} spheres"
+                    f"to link={link_name} with {n_spheres} spheres, "
+                    f"surface_sphere_radius={float(surface_sphere_radius)*1000:.1f}mm"
                 )
             else:
                 print("[curobo] attach_external_objects_to_robot returned False")
@@ -906,6 +912,34 @@ class RM75CuRoboPlanner:
     @property
     def attached_object_active(self) -> bool:
         return bool(getattr(self, "_attached_object_active", False))
+
+    def get_attached_spheres_world(self, q: Sequence[float], *, link_name: str = "attached_object") -> list[dict]:
+        """Return the world-frame positions and radii of attached object collision spheres."""
+        if not self.attached_object_active:
+            return []
+        try:
+            q_np = self._normalize_q(q)
+            joint_state = self._make_start_state(q_np)
+            kin_state = self.motion_gen.compute_kinematics(joint_state)
+            link_spheres = kin_state.link_spheres_tensor
+            kin_cfg = self.motion_gen.robot_cfg.kinematics.kinematics_config
+            link_names = kin_cfg.link_names
+            if link_name not in link_names:
+                return []
+            link_idx = link_names.index(link_name)
+            sphere_offsets = kin_cfg.link_sphere_idx_map[link_idx]
+            start_idx, end_idx = int(sphere_offsets[0]), int(sphere_offsets[1])
+            spheres_tensor = link_spheres[0, start_idx:end_idx, :].detach().cpu().numpy()
+            result = []
+            for i in range(spheres_tensor.shape[0]):
+                result.append({
+                    "center": spheres_tensor[i, :3].tolist(),
+                    "radius": float(spheres_tensor[i, 3]),
+                })
+            return result
+        except Exception as exc:
+            print(f"[curobo] get_attached_spheres_world failed: {exc}")
+            return []
 
     def build_world_from_cuboids(self, cuboids: Sequence[Mapping[str, Any]]):
         return self.build_world_from_obstacles(cuboids=cuboids, meshes=())
