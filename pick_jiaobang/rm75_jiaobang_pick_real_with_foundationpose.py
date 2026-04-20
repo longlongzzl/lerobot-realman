@@ -3953,6 +3953,13 @@ def _get_robot_base_world_position(demo) -> np.ndarray | None:
 
 
 def tilt_pose_toward_robot(demo, pose, angle_deg: float):
+    """Tilt the TCP so the approach axis leans toward the robot base in the horizontal plane.
+
+    Rotation is applied about **TCP +Y** (pad opening axis in this stack: pads span left/right along Y).
+    That keeps both pads at the same height relative to the table — only a "pitch" style tilt in the
+    sagittal plane. Using ``cross(approach, to_robot)`` as the tilt axis would add roll for non-topdown
+    grasps and make one pad closer to the tabletop (unsafe).
+    """
     from transforms3d.quaternions import quat2mat
 
     angle_deg = float(angle_deg)
@@ -3971,11 +3978,8 @@ def tilt_pose_toward_robot(demo, pose, angle_deg: float):
         return None
 
     R_tcp = quat2mat(q_wxyz).astype(np.float32)
-    approaching = _normalize_vec(R_tcp[:, 2])
-    if approaching is None:
-        return None
-
-    tilt_axis = _normalize_vec(np.cross(approaching, to_robot_xy))
+    # Tilt about pad-opening axis: R_new[:, 1] == R_tcp[:, 1]; no left/right roll vs. the table.
+    tilt_axis = _normalize_vec(R_tcp[:, 1])
     if tilt_axis is None:
         return None
 

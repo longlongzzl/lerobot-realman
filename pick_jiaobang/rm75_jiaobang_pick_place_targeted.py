@@ -491,6 +491,7 @@ def _make_tabletop_place_world_pose_variants(
         tilt_degs = [0.0]
     if not yaw_degs:
         yaw_degs = [0.0]
+    yaw_degs = sorted(yaw_degs, key=lambda d: (abs(float(d)), float(d)))
 
     up_axis = _normalize(T_world_target[:3, 1])
     robot_base_T = bridge_mod.get_robot_base_transform(demo.env)

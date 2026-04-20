@@ -47,7 +47,7 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
     ),
     "bitong": ObjectSpec(
         name="bitong",
-        grounding_prompt="bamboo pen holder.",
+        grounding_prompt="yellow pen holder.",
         mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/holder.glb",
         sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/holder_sim.glb",
         real_longest_axis_m=0.095,
@@ -96,7 +96,7 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
     ),
     "hongshupian": ObjectSpec(
         name="hongshupian",
-        grounding_prompt="red jar of potato chips.",
+        grounding_prompt="a red cylindrical can of potato chips",
         mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/hongshupian.glb",
         sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/hongshupian.glb",
         real_longest_axis_m=0.15,
@@ -165,7 +165,7 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
     ),
     "gluestick": ObjectSpec(
         name="gluestick",
-        grounding_prompt="glue stick.",
+        grounding_prompt="a small glue stick.",
         mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/gluestick.glb",
         sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/gluestick_sim.glb",
         real_longest_axis_m=0.11,
