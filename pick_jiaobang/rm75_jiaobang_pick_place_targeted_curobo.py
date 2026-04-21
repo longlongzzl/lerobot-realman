@@ -398,6 +398,13 @@ def _make_curobo_pose_planner_wrapper(original_plan_pose_path, planner: RM75CuRo
 
         if planner.collision_enabled:
             cuboids, meshes = _scene_obstacles_to_curobo_world(demo, args)
+            targeted.base.sync_curobo_collision_world_visuals(
+                demo.env,
+                args,
+                cuboids=cuboids,
+                meshes=meshes,
+                label=label,
+            )
             cuboids_in_base, meshes_in_base = _transform_curobo_world_to_robot_base(cuboids, meshes, demo)
             planner.set_world_from_obstacles(cuboids=cuboids_in_base, meshes=meshes_in_base)
             if bool(getattr(args, "curobo_debug", False)):

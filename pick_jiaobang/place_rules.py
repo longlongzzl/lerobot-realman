@@ -21,6 +21,16 @@ class PlaceSlotSpec:
 
 
 @dataclass(frozen=True)
+class GraspBiasVariant:
+    axis_shift_m: float = 0.0
+    tilt_toward_robot_deg: float = 0.0
+    tilt_direction: str = "toward_robot"
+    tilt_shift_m: float = 0.0
+    z_lift_m: float = 0.0
+    label: str | None = None
+
+
+@dataclass(frozen=True)
 class PlaceRule:
     source_object_name: str
     target_object_name: str
@@ -29,9 +39,12 @@ class PlaceRule:
     release_retreat_height: float = 0.08
     preserve_long_axis_vertical: bool = False
     orientation_invariant: bool = False
+    allow_tabletop_yaw_variants: bool = False
     allow_long_axis_flip: bool = False
+    face_robot_axis_local: tuple[float, float, float] | None = None
     object_pose_local: LocalPoseSpec | None = None
     slots: tuple[PlaceSlotSpec, ...] = ()
+    grasp_bias_variants: tuple[GraspBiasVariant, ...] = ()
 
 
 def _normalize_vec(vec: np.ndarray, eps: float = 1e-8) -> np.ndarray | None:
@@ -180,6 +193,34 @@ def make_tabletop_slot_rule(
     )
 
 
+def make_vertical_long_axis_grasp_bias_variants() -> tuple[GraspBiasVariant, ...]:
+    return (
+        GraspBiasVariant(axis_shift_m=-0.014, tilt_toward_robot_deg=15.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg14_tilt15_away"),
+        GraspBiasVariant(axis_shift_m=-0.010, tilt_toward_robot_deg=15.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg10_tilt15_away"),
+        GraspBiasVariant(axis_shift_m=-0.006, tilt_toward_robot_deg=15.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg6_tilt15_away"),
+        GraspBiasVariant(axis_shift_m=-0.002, tilt_toward_robot_deg=15.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg2_tilt15_away"),
+        GraspBiasVariant(axis_shift_m=-0.014, tilt_toward_robot_deg=25.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg14_tilt25_away"),
+        GraspBiasVariant(axis_shift_m=-0.010, tilt_toward_robot_deg=25.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg10_tilt25_away"),
+        GraspBiasVariant(axis_shift_m=-0.006, tilt_toward_robot_deg=25.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg6_tilt25_away"),
+        GraspBiasVariant(axis_shift_m=-0.002, tilt_toward_robot_deg=25.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg2_tilt25_away"),
+    )
+
+
+def apply_vertical_long_axis_rule_overrides(
+    rule: PlaceRule,
+    *,
+    face_robot_axis_local: tuple[float, float, float] = (0.0, 0.0, 1.0),
+) -> PlaceRule:
+    return PlaceRule(
+        **{
+            **rule.__dict__,
+            "allow_tabletop_yaw_variants": True,
+            "face_robot_axis_local": face_robot_axis_local,
+            "grasp_bias_variants": make_vertical_long_axis_grasp_bias_variants(),
+        }
+    )
+
+
 PLACE_RULES: Dict[str, PlaceRule] = {
     "bi": PlaceRule(
         source_object_name="bi",
@@ -199,7 +240,7 @@ PLACE_RULES: Dict[str, PlaceRule] = {
     "shuazi": make_tabletop_slot_rule(
         "shuazi",
         center_y=0.074,
-        rpy_deg=(-90.0, 0.0, 0.0),
+        rpy_deg=(-90.0, 90.0, 0.0),
         hover_height=0.08,
         release_retreat_height=0.10,
     ),
@@ -214,7 +255,7 @@ PLACE_RULES: Dict[str, PlaceRule] = {
     "lvmukuai": make_tabletop_slot_rule(
         "lvmukuai",
         center_y=0.07,
-        rpy_deg=(0.0, 0.0, 0.0),
+        rpy_deg=(0.0, 90.0, -90.0),
         hover_height=0.08,
         release_retreat_height=0.10,
     ),
@@ -242,6 +283,22 @@ PLACE_RULES: Dict[str, PlaceRule] = {
         orientation_invariant=True,
     ),
 }
+
+PLACE_RULES["gluestick"] = apply_vertical_long_axis_rule_overrides(
+    PLACE_RULES["gluestick"],
+    face_robot_axis_local=(0.0, 0.0, -1.0),
+)
+PLACE_RULES["hongshupian"] = apply_vertical_long_axis_rule_overrides(
+    PLACE_RULES["hongshupian"],
+    face_robot_axis_local=(0.0, 0.0, 1.0),
+)
+
+PLACE_RULES["tennis"] = PlaceRule(
+    **{
+        **PLACE_RULES["tennis"].__dict__,
+        "allow_tabletop_yaw_variants": True,
+    }
+)
 
 
 def get_place_rule(source_object_name: str | None) -> PlaceRule | None:

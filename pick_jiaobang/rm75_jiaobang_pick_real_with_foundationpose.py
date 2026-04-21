@@ -5,6 +5,7 @@ import argparse
 import copy
 import gc
 import importlib.util
+import json
 import socket
 import sys
 import time
@@ -179,8 +180,34 @@ def get_asset_local_points(asset_file: str, asset_scale: float) -> np.ndarray:
     return points.copy()
 
 
-def build_visual_obstacle_actor(env, mesh_file: str, mesh_scale: float, actor_name: str, *, box_size: np.ndarray | None = None):
+def _set_actor_visual_base_color(actor, color) -> None:
+    if color is None:
+        return
+    rgba = [float(v) for v in color]
+    try:
+        for body in actor.get_visual_bodies():
+            for shape in body.get_render_shapes():
+                mat = shape.material
+                mat.set_base_color(rgba)
+                shape.set_material(mat)
+    except Exception:
+        pass
+
+
+def build_visual_obstacle_actor(
+    env,
+    mesh_file: str,
+    mesh_scale: float,
+    actor_name: str,
+    *,
+    box_size: np.ndarray | None = None,
+    color=None,
+):
     builder = env.unwrapped.scene.create_actor_builder()
+    try:
+        builder.set_initial_pose(sapien.Pose())
+    except Exception:
+        pass
     scale = [float(mesh_scale), float(mesh_scale), float(mesh_scale)]
     builder.add_visual_from_file(str(Path(mesh_file).expanduser()), scale=scale)
     if box_size is not None:
@@ -189,7 +216,9 @@ def build_visual_obstacle_actor(env, mesh_file: str, mesh_scale: float, actor_na
             builder.add_box_collision(half_size=half_size)
         except Exception as exc:
             print(f"[scene obstacle] {actor_name}: failed to add sim collision shape: {exc}")
-    return builder.build_kinematic(name=actor_name)
+    actor = builder.build_kinematic(name=actor_name)
+    _set_actor_visual_base_color(actor, color)
+    return actor
 
 
 def build_attached_box_visual_actor(env, box_size: np.ndarray, actor_name: str = "transport_attached_box_visual"):
@@ -245,6 +274,40 @@ def build_visual_sphere_actor(
     return builder.build_kinematic(name=actor_name)
 
 
+def build_pose_candidate_visual_actor(
+    env,
+    actor_name: str,
+    *,
+    color=(0.9, 0.2, 1.0, 0.22),
+):
+    builder = env.unwrapped.scene.create_actor_builder()
+    try:
+        builder.set_initial_pose(sapien.Pose())
+    except Exception:
+        pass
+    builder.add_sphere_visual(
+        pose=sapien.Pose(p=[0.0, 0.0, 0.0]),
+        radius=0.008,
+        material=sapien.render.RenderMaterial(base_color=list(color)),
+    )
+    builder.add_box_visual(
+        pose=sapien.Pose(p=[0.0, 0.0, -0.06]),
+        half_size=[0.008, 0.008, 0.015],
+        material=sapien.render.RenderMaterial(base_color=list(color)),
+    )
+    builder.add_box_visual(
+        pose=sapien.Pose(p=[0.0, 0.04, -0.035]),
+        half_size=[0.006, 0.012, 0.006],
+        material=sapien.render.RenderMaterial(base_color=list(color)),
+    )
+    builder.add_box_visual(
+        pose=sapien.Pose(p=[0.0, -0.04, -0.035]),
+        half_size=[0.006, 0.012, 0.006],
+        material=sapien.render.RenderMaterial(base_color=list(color)),
+    )
+    return builder.build_kinematic(name=actor_name)
+
+
 def should_render_scene_obstacle_planner_boxes(args) -> bool:
     return bool(
         getattr(args, "render_scene_obstacle_planner_boxes", False)
@@ -261,6 +324,29 @@ def get_scene_obstacle_planner_box_color(object_name: str):
     return (0.15, 0.75, 1.0, 0.18)
 
 
+def should_render_curobo_collision_world(args) -> bool:
+    return bool(
+        getattr(args, "render_curobo_collision_world", False)
+        or getattr(args, "curobo_debug", False)
+    )
+
+
+def _curobo_collision_world_cuboid_color(name: str):
+    normalized = normalize_object_name(name) or str(name or "")
+    if "virtual_table" in normalized or normalized == "virtual_table":
+        return (1.0, 0.55, 0.15, 0.16)
+    if "wall" in normalized:
+        return (1.0, 0.2, 0.2, 0.14)
+    return (0.2, 0.9, 1.0, 0.16)
+
+
+def _curobo_collision_world_mesh_color(name: str):
+    normalized = normalize_object_name(name) or str(name or "")
+    if normalized == "active_target_object":
+        return (1.0, 0.85, 0.2, 0.24)
+    return (0.6, 0.35, 1.0, 0.20)
+
+
 def find_named_actor(actors, actor_name: str):
     target = str(actor_name or "")
     if not target:
@@ -273,6 +359,179 @@ def find_named_actor(actors, actor_name: str):
         if candidate_name == target:
             return actor
     return None
+
+
+def find_named_scene_actor(env, actor_name: str):
+    scene = getattr(getattr(env, "unwrapped", env), "scene", None)
+    if scene is None:
+        return None
+    actors = getattr(scene, "actors", None)
+    if actors is None:
+        return None
+    try:
+        if isinstance(actors, dict):
+            return actors.get(actor_name)
+        return actors[actor_name]
+    except Exception:
+        pass
+    if isinstance(actors, dict):
+        return find_named_actor(list(actors.values()), actor_name)
+    return find_named_actor(list(actors), actor_name)
+
+
+def ensure_failed_pose_candidate_visuals(demo, count: int) -> list:
+    env = demo.env
+    actors = list(getattr(env.unwrapped, "_failed_pose_candidate_actors", []) or [])
+    existing_names = {str(getattr(actor, "name", "") or "") for actor in actors}
+    while len(actors) < int(max(count, 0)):
+        actor_name = f"failed_pose_candidate_visual_{len(actors)}"
+        if actor_name in existing_names:
+            actor = find_named_scene_actor(env, actor_name)
+            if actor is not None:
+                actors.append(actor)
+                continue
+        actor = build_pose_candidate_visual_actor(env, actor_name)
+        actors.append(actor)
+        existing_names.add(actor_name)
+    env.unwrapped._failed_pose_candidate_actors = actors
+    return actors
+
+
+def update_failed_pose_candidate_visuals(demo, poses=None) -> None:
+    env = demo.env
+    hidden_pose = Pose.create_from_pq(
+        p=np.asarray([0.0, 0.0, -5.0], dtype=np.float32),
+        q=np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+    pose_list = list(poses or [])
+    actors = ensure_failed_pose_candidate_visuals(demo, len(pose_list))
+    for idx, actor in enumerate(actors):
+        if idx >= len(pose_list):
+            actor.set_pose(hidden_pose)
+            continue
+        pose = pose_list[idx]
+        actor.set_pose(Pose.create_from_pq(p=flatten_np(pose.p)[:3], q=flatten_np(pose.q)[:4]))
+
+
+def clear_curobo_collision_world_visuals(env) -> None:
+    actor_map = dict(getattr(env.unwrapped, "_curobo_collision_world_actor_map", {}) or {})
+    for actor in actor_map.values():
+        try:
+            actor.remove_from_scene()
+        except Exception:
+            pass
+    env.unwrapped._curobo_collision_world_actor_map = {}
+    env.unwrapped._curobo_collision_world_actor_specs = {}
+
+
+def sync_curobo_collision_world_visuals(
+    env,
+    args,
+    *,
+    cuboids: list[dict] | tuple[dict, ...],
+    meshes: list[dict] | tuple[dict, ...],
+    label: str = "",
+) -> None:
+    if not should_render_curobo_collision_world(args):
+        clear_curobo_collision_world_visuals(env)
+        return
+
+    actor_map = dict(getattr(env.unwrapped, "_curobo_collision_world_actor_map", {}) or {})
+    actor_specs = dict(getattr(env.unwrapped, "_curobo_collision_world_actor_specs", {}) or {})
+    next_actor_map = {}
+    next_actor_specs = {}
+
+    def _remove_stale_named_actor(actor_name: str) -> None:
+        actor = find_named_scene_actor(env, actor_name)
+        if actor is None:
+            return
+        try:
+            actor.remove_from_scene()
+        except Exception:
+            pass
+
+    def _sync_box(item: dict) -> None:
+        name = str(item.get("name") or f"cuboid_{len(next_actor_map):02d}")
+        actor_name = f"curobo_world__cuboid__{name}"
+        dims = np.asarray(item.get("dims"), dtype=np.float32).reshape(3)
+        pose = np.asarray(item.get("pose"), dtype=np.float32).reshape(7)
+        spec = ("cuboid", tuple(np.round(dims.astype(np.float64), 6).tolist()))
+        actor = actor_map.get(actor_name)
+        if actor is None:
+            actor = find_named_scene_actor(env, actor_name)
+        if actor is None or actor_specs.get(actor_name) != spec:
+            if actor is not None:
+                next_actor_map[actor_name] = actor
+                next_actor_specs[actor_name] = spec
+            else:
+                actor = build_visual_box_actor(
+                    env,
+                    dims,
+                    actor_name,
+                    color=_curobo_collision_world_cuboid_color(name),
+                )
+        actor.set_pose(Pose.create_from_pq(p=pose[:3], q=pose[3:]))
+        next_actor_map[actor_name] = actor
+        next_actor_specs[actor_name] = spec
+
+    def _sync_mesh(item: dict) -> None:
+        name = str(item.get("name") or f"mesh_{len(next_actor_map):02d}")
+        actor_name = f"curobo_world__mesh__{name}"
+        pose = np.asarray(item.get("pose"), dtype=np.float32).reshape(7)
+        file_path = str(item.get("file_path") or item.get("asset_file") or item.get("mesh_file") or "")
+        scale = np.asarray(item.get("scale", item.get("asset_scale", [1.0, 1.0, 1.0])), dtype=np.float32).reshape(-1)
+        uniform_scale = float(scale[0]) if scale.size > 0 else 1.0
+        debug_box_dims = None
+        if file_path:
+            try:
+                debug_box_dims = get_asset_box_size(file_path, uniform_scale)
+            except Exception:
+                debug_box_dims = None
+        spec = (
+            "mesh",
+            file_path,
+            tuple(np.round(scale.astype(np.float64), 6).tolist()),
+            None if debug_box_dims is None else tuple(np.round(np.asarray(debug_box_dims, dtype=np.float64), 6).tolist()),
+        )
+        actor = actor_map.get(actor_name)
+        if actor is None:
+            actor = find_named_scene_actor(env, actor_name)
+        if actor is None or actor_specs.get(actor_name) != spec:
+            if actor is not None:
+                next_actor_map[actor_name] = actor
+                next_actor_specs[actor_name] = spec
+            else:
+                actor = build_visual_obstacle_actor(
+                    env,
+                    file_path,
+                    uniform_scale,
+                    actor_name,
+                    color=_curobo_collision_world_mesh_color(name),
+                    box_size=debug_box_dims if normalize_object_name(name) == "active_target_object" else None,
+                )
+        actor.set_pose(Pose.create_from_pq(p=pose[:3], q=pose[3:]))
+        next_actor_map[actor_name] = actor
+        next_actor_specs[actor_name] = spec
+
+    for item in list(cuboids or []):
+        if isinstance(item, dict):
+            _sync_box(item)
+    for item in list(meshes or []):
+        if isinstance(item, dict) and (item.get("file_path") or item.get("asset_file") or item.get("mesh_file")):
+            _sync_mesh(item)
+
+    stale_names = set(actor_map) - set(next_actor_map)
+    for actor_name in stale_names:
+        actor = actor_map.get(actor_name)
+        if actor is None:
+            continue
+        try:
+            actor.remove_from_scene()
+        except Exception:
+            pass
+
+    env.unwrapped._curobo_collision_world_actor_map = next_actor_map
+    env.unwrapped._curobo_collision_world_actor_specs = next_actor_specs
 
 
 def sync_scene_obstacle_planner_box_actor(env, item, pos: np.ndarray, quat: np.ndarray) -> None:
@@ -687,6 +946,17 @@ def register_scene_obstacles(env, demo, bridge_mod, T_base_cam: np.ndarray, scen
     actors = []
     planner_box_actors = []
     applied = []
+    fixed_scene_obstacle_names = {
+        normalized
+        for normalized in (
+            normalize_object_name(name)
+            for name in (
+                list(getattr(args, "selected_obstacle_object_names", []) or [])
+                + list(getattr(args, "tracked_scene_object_names", []) or [])
+            )
+        )
+        if normalized is not None
+    }
     for item in scene_obstacles:
         object_name = str(item["object_name"])
         object_args = item["object_args"]
@@ -717,12 +987,17 @@ def register_scene_obstacles(env, demo, bridge_mod, T_base_cam: np.ndarray, scen
             print(f"[scene obstacle] {object_name}: failed to compute box size for sim collision: {exc}")
         global_box_scale = float(max(getattr(args, "scene_obstacle_box_scale", 1.0), 1e-3))
         object_box_scale = float(max(getattr(object_spec, "scene_obstacle_box_scale", 1.0) or 1.0, 1e-3))
+        non_fixed_object_box_scale = (
+            1.2
+            if normalize_object_name(object_name) not in fixed_scene_obstacle_names
+            else 1.0
+        )
         placed_box_scale = (
             float(max(getattr(args, "placed_scene_obstacle_box_scale", 1.0), 1e-3))
             if is_placed_obstacle
             else 1.0
         )
-        box_scale = float(global_box_scale * object_box_scale * placed_box_scale)
+        box_scale = float(global_box_scale * object_box_scale * non_fixed_object_box_scale * placed_box_scale)
         scaled_box_size = None if box_size is None else (np.asarray(box_size, dtype=np.float32) * box_scale).astype(np.float32)
 
         actor = build_visual_obstacle_actor(env, asset_file, asset_scale, actor_name, box_size=scaled_box_size)
@@ -775,7 +1050,7 @@ def register_scene_obstacles(env, demo, bridge_mod, T_base_cam: np.ndarray, scen
         print(
             f"[scene obstacle] applied {object_name}: world translation={np.round(T_world_obj[:3, 3], 6).tolist()}, "
             f"planner_collision={'yes' if planner_collision else 'no'}, "
-            f"box_scale={box_scale:.3f} (global={global_box_scale:.3f}, object={object_box_scale:.3f}, placed={placed_box_scale:.3f}), "
+            f"box_scale={box_scale:.3f} (global={global_box_scale:.3f}, object={object_box_scale:.3f}, non_fixed={non_fixed_object_box_scale:.3f}, placed={placed_box_scale:.3f}), "
             f"box_size={None if scaled_box_size is None else np.round(scaled_box_size, 6).tolist()}"
         )
         if planner_box_actor_name:
@@ -803,6 +1078,22 @@ def build_arg_parser():
     parser.add_argument("--bridge-script-path", type=str, default=DEFAULT_BRIDGE_SCRIPT)
     parser.add_argument("--pick-script-path", type=str, default=DEFAULT_PICK_SCRIPT)
     parser.add_argument("--foundationpose-root", type=str, default=DEFAULT_FOUNDATIONPOSE_ROOT)
+    parser.add_argument(
+        "--skip-foundationpose",
+        action="store_true",
+        help="Skip live FoundationPose capture and initialize the target/scene directly from --fixed-scene-pose-file.",
+    )
+    parser.add_argument(
+        "--fixed-scene-pose-file",
+        type=Path,
+        default=None,
+        help="Path to a fixed scene json file that stores per-object world poses. Used together with --skip-foundationpose.",
+    )
+    parser.add_argument(
+        "--fixed-scene-strict",
+        action="store_true",
+        help="When using --fixed-scene-pose-file, fail immediately if the target or any requested obstacle is missing from the file.",
+    )
     parser.add_argument("--lerobot-root", type=str, default=DEFAULT_LEROBOT_ROOT)
     parser.add_argument("--lerobot-sim2real-root", type=str, default=DEFAULT_LEROBOT_SIM2REAL_ROOT)
     parser.add_argument("--extra-maniskill-package-root", type=str, default=DEFAULT_EXTRA_MANISKILL_PACKAGE_ROOT)
@@ -1027,6 +1318,11 @@ def build_arg_parser():
         "--render-robot-collision-spheres",
         action="store_true",
         help="Render the RM75 collision spheres used by cuRobo. This is also enabled automatically by --curobo-debug.",
+    )
+    parser.add_argument(
+        "--render-curobo-collision-world",
+        action="store_true",
+        help="Render translucent overlays for the exact cuboid/mesh obstacle world currently sent to cuRobo. This is also enabled automatically by --curobo-debug.",
     )
     parser.add_argument(
         "--planner-virtual-side-wall",
@@ -3952,8 +4248,8 @@ def _get_robot_base_world_position(demo) -> np.ndarray | None:
         return None
 
 
-def tilt_pose_toward_robot(demo, pose, angle_deg: float):
-    """Tilt the TCP so the approach axis leans toward the robot base in the horizontal plane.
+def tilt_pose_toward_robot(demo, pose, angle_deg: float, *, direction: str = "toward_robot"):
+    """Tilt the TCP so the approach axis leans toward or away from the robot base in the horizontal plane.
 
     Rotation is applied about **TCP +Y** (pad opening axis in this stack: pads span left/right along Y).
     That keeps both pads at the same height relative to the table — only a "pitch" style tilt in the
@@ -3983,8 +4279,9 @@ def tilt_pose_toward_robot(demo, pose, angle_deg: float):
     if tilt_axis is None:
         return None
 
+    prefer_away = str(direction or "toward_robot").strip().lower() in {"away", "away_robot", "away_from_robot"}
     best_pose = None
-    best_score = -np.inf
+    best_score = np.inf if prefer_away else -np.inf
     angle_rad = np.deg2rad(abs(angle_deg))
     for sign in (1.0, -1.0):
         R_delta = _rotation_matrix_from_axis_angle(tilt_axis, sign * angle_rad)
@@ -3996,7 +4293,7 @@ def tilt_pose_toward_robot(demo, pose, angle_deg: float):
         approaching_xy[2] = 0.0
         approaching_xy = _normalize_vec(approaching_xy)
         score = -np.inf if approaching_xy is None else float(np.dot(approaching_xy, to_robot_xy))
-        if score > best_score:
+        if (prefer_away and score < best_score) or ((not prefer_away) and score > best_score):
             best_score = score
             best_pose = Pose.create_from_pq(p=tcp_p, q=bridge_mod_mat2quat(R_new))
     return best_pose
@@ -4181,8 +4478,11 @@ def recapture_active_object_pose_from_foundationpose(demo, bridge_mod, args) -> 
 
 
 def build_foundationpose_scene_cache_key(args):
+    fixed_scene_pose_file = getattr(args, "fixed_scene_pose_file", None)
     return (
         str(Path(getattr(args, "foundationpose_root", DEFAULT_FOUNDATIONPOSE_ROOT)).expanduser()),
+        None if fixed_scene_pose_file is None else str(Path(fixed_scene_pose_file).expanduser().resolve()),
+        bool(getattr(args, "skip_foundationpose", False)),
         str(Path(getattr(args, "camera_extrinsic_opencv_path", DEFAULT_CAMERA_EXTRINSIC)).expanduser()),
         bool(getattr(args, "use_direct_camera_extrinsic", False)),
         bool(getattr(args, "disable_object_spec_obstacles", False)),
@@ -4196,6 +4496,77 @@ def build_foundationpose_scene_cache_key(args):
         int(getattr(args, "track_refine_iter", 2)),
         str(getattr(args, "camera_serial", None) or ""),
     )
+
+
+def _load_fixed_scene_capture(args, bridge_mod):
+    scene_file = getattr(args, "fixed_scene_pose_file", None)
+    if scene_file is None:
+        raise ValueError("--fixed-scene-pose-file is required when --skip-foundationpose is enabled")
+
+    scene_file = Path(scene_file).expanduser().resolve()
+    data = json.loads(scene_file.read_text())
+    objects = data.get("objects", {})
+    if not isinstance(objects, dict):
+        raise ValueError(f"Invalid fixed scene file {scene_file}: missing top-level 'objects' dictionary")
+
+    target_name = normalize_object_name(getattr(args, "object_name", None))
+    if target_name is None:
+        raise ValueError("--object-name is required when --skip-foundationpose is enabled")
+
+    selected_obstacle_names = [
+        normalize_object_name(name)
+        for name in (getattr(args, "selected_obstacle_object_names", []) or [])
+        if normalize_object_name(name) is not None and normalize_object_name(name) != target_name
+    ]
+    strict = bool(getattr(args, "fixed_scene_strict", False))
+
+    normalized_objects = {
+        normalize_object_name(name): entry
+        for name, entry in objects.items()
+        if normalize_object_name(name) is not None and isinstance(entry, dict)
+    }
+
+    target_entry = normalized_objects.get(target_name)
+    if target_entry is None:
+        raise ValueError(f"Fixed scene file {scene_file} does not contain target object {target_name!r}")
+    if "T_world_obj" not in target_entry:
+        raise ValueError(f"Fixed scene entry for target {target_name!r} is missing T_world_obj")
+
+    scene_obstacles = []
+    missing_obstacles = []
+    for object_name in selected_obstacle_names:
+        item = normalized_objects.get(object_name)
+        if item is None or "T_world_obj" not in item:
+            missing_obstacles.append(object_name)
+            continue
+        scene_obstacles.append(
+            {
+                "object_name": object_name,
+                "label": str(item.get("label", object_name)),
+                "score": float(item.get("score", 1.0)),
+                "placed": bool(item.get("placed", False)),
+                "T_world_obj": np.asarray(item["T_world_obj"], dtype=np.float32).reshape(4, 4),
+                "object_args": bridge_mod._make_object_specific_args(args, object_name),
+            }
+        )
+
+    if missing_obstacles and strict:
+        raise ValueError(
+            f"Fixed scene file {scene_file} is missing obstacle pose(s): {', '.join(missing_obstacles)}"
+        )
+
+    print(f"[foundationpose] skipped; using fixed scene file: {scene_file}")
+    print(
+        "[foundationpose] using fixed target world pose:",
+        np.round(np.asarray(target_entry["T_world_obj"], dtype=np.float32)[:3, 3], 6).tolist(),
+    )
+    return {
+        "fp_rt": None,
+        "T_base_cam": np.eye(4, dtype=np.float32),
+        "T_world_obj": np.asarray(target_entry["T_world_obj"], dtype=np.float32).reshape(4, 4),
+        "scene_obstacles": scene_obstacles,
+        "objects": normalized_objects,
+    }
 
 
 def capture_or_reuse_foundationpose_scene(args, bridge_mod, scene_capture_cache=None):
@@ -4223,9 +4594,46 @@ def capture_or_reuse_foundationpose_scene(args, bridge_mod, scene_capture_cache=
             return (
                 scene_capture_cache["fp_rt"],
                 np.asarray(scene_capture_cache["T_base_cam"], dtype=np.float32),
-                np.asarray(target_entry["T_cam_obj"], dtype=np.float32),
+                np.asarray(target_entry.get("T_cam_obj", target_entry.get("T_world_obj")), dtype=np.float32),
                 scene_obstacles,
             )
+
+    if bool(getattr(args, "skip_foundationpose", False)):
+        fixed_scene = _load_fixed_scene_capture(args, bridge_mod)
+        if isinstance(scene_capture_cache, dict):
+            cached_objects = {}
+            for object_name, item in fixed_scene["objects"].items():
+                cached_entry = {
+                    "object_name": object_name,
+                    "label": str(item.get("label", object_name)),
+                    "score": float(item.get("score", 1.0)),
+                    "box": np.zeros(4, dtype=np.float32),
+                    "T_world_obj": np.asarray(item["T_world_obj"], dtype=np.float32).reshape(4, 4),
+                    "placed": bool(item.get("placed", False)),
+                }
+                if object_name == target_name:
+                    cached_entry["object_args"] = argparse.Namespace(**vars(args).copy())
+                else:
+                    try:
+                        cached_entry["object_args"] = bridge_mod._make_object_specific_args(args, object_name)
+                    except Exception:
+                        cached_entry["object_args"] = argparse.Namespace(**vars(args).copy())
+                cached_objects[object_name] = cached_entry
+            scene_capture_cache.clear()
+            scene_capture_cache.update(
+                {
+                    "key": cache_key,
+                    "fp_rt": None,
+                    "T_base_cam": np.eye(4, dtype=np.float32),
+                    "objects": cached_objects,
+                }
+            )
+        return (
+            fixed_scene["fp_rt"],
+            fixed_scene["T_base_cam"],
+            fixed_scene["T_world_obj"],
+            fixed_scene["scene_obstacles"],
+        )
 
     foundationpose_root = bridge_mod.resolve_foundationpose_root(args.foundationpose_root)
     fp_rt = bridge_mod.load_foundationpose_module(foundationpose_root)
@@ -4460,7 +4868,7 @@ def maybe_refine_foundationpose_scene_after_render(demo, bridge_mod, args) -> bo
 
 def create_demo(args, bridge_mod, planner_mod, scene_capture_cache=None):
     args.env_id = bridge_mod.ensure_pick_jiaobang_env_registered(args.env_id, args.extra_maniskill_package_root)
-    fp_rt, T_base_cam, T_cam_obj, scene_obstacles = capture_or_reuse_foundationpose_scene(
+    fp_rt, T_base_cam, target_pose_source, scene_obstacles = capture_or_reuse_foundationpose_scene(
         args,
         bridge_mod,
         scene_capture_cache=scene_capture_cache,
@@ -4480,9 +4888,13 @@ def create_demo(args, bridge_mod, planner_mod, scene_capture_cache=None):
     initial_obs, initial_info = env.reset(seed=args.seed)
     bridge_mod.apply_pick_object_physics_profile(env, args)
     hide_env_goal_visual(env)
-    bridge_mod.print_foundationpose_mapping_diagnostics(T_cam_obj, T_base_cam, env, args, label="target")
-    T_world_obj = bridge_mod.map_camera_pose_to_pick_world(T_cam_obj, T_base_cam, env, args)
-    print("Mapped sim object translation:", np.round(T_world_obj[:3, 3], 6).tolist())
+    if bool(getattr(args, "skip_foundationpose", False)):
+        T_world_obj = np.asarray(target_pose_source, dtype=np.float32).reshape(4, 4)
+    else:
+        T_cam_obj = np.asarray(target_pose_source, dtype=np.float32)
+        bridge_mod.print_foundationpose_mapping_diagnostics(T_cam_obj, T_base_cam, env, args, label="target")
+        T_world_obj = bridge_mod.map_camera_pose_to_pick_world(T_cam_obj, T_base_cam, env, args)
+        print("Mapped sim object translation:", np.round(T_world_obj[:3, 3], 6).tolist())
     bridge_mod.apply_pose_to_pick_object(env, T_world_obj)
     if args.render_mode == "human":
         bridge_mod.render_preview(env, repeats=5)
@@ -4640,11 +5052,23 @@ def execute_joint_stage(demo, bridge_mod, real_exec: RealmanJointExecutor | None
     return True, q_target
 
 
-def inspect_failed_pose(demo, bridge_mod, label: str, args, *, pose=None, q_target=None, gripper_closed=None, use_attach: bool = False):
+def inspect_failed_pose(
+    demo,
+    bridge_mod,
+    label: str,
+    args,
+    *,
+    pose=None,
+    q_target=None,
+    gripper_closed=None,
+    use_attach: bool = False,
+    candidate_poses=None,
+):
     if q_target is not None:
         sync_demo_arm_qpos(demo, q_target)
     if gripper_closed is not None:
         sync_demo_gripper_state(demo, bool(gripper_closed), steps=8)
+    update_failed_pose_candidate_visuals(demo, candidate_poses)
     if pose is not None:
         try:
             demo.preview_target_pose(pose)

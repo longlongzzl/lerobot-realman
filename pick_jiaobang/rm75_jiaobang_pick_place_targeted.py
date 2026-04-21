@@ -29,6 +29,7 @@ class TargetedPlacePlan:
     target_name: str
     slot_name: str | None
     variant_label: str | None
+    T_world_obj_desired: np.ndarray | None
     staging_pose: Pose | None
     pre_place_pose: Pose
     place_pose: Pose
@@ -57,8 +58,15 @@ def build_arg_parser():
         "--insert-vertical-axial-spin-deg",
         type=float,
         nargs="*",
-        default=[0.0, 90.0, 180.0, 270.0],
-        help="For insert-style place rules, also try these equivalent rotations around the source object's long axis when solving pre_place/place IK.",
+        default=[0.0],
+        help="For insert-style place rules, also try these equivalent rotations around the source object's long axis when solving pre_place/place IK. Default keeps the final object pose fixed.",
+    )
+    parser.add_argument(
+        "--targeted-place-allow-insert-axis-flip",
+        dest="targeted_place_allow_insert_axis_flip",
+        action="store_true",
+        default=False,
+        help="Also try the 180-degree long-axis flip family for insert-style place rules. Disabled by default to keep the final object pose fixed.",
     )
     parser.add_argument(
         "--targeted-place-staging",
@@ -83,22 +91,29 @@ def build_arg_parser():
         "--tabletop-place-tilt-toward-robot-deg",
         type=float,
         nargs="*",
-        default=[0.0, 15.0, 35.0],
-        help="For place_on_slots rules, also try these tabletop place tilt angles toward the robot. 0 keeps the original upright/rule pose. Nonzero angles automatically compensate the object height to keep it above the tabletop.",
+        default=[0.0],
+        help="For place_on_slots rules, also try these tabletop place tilt angles toward the robot. Default keeps the final object pose fixed.",
     )
     parser.add_argument(
         "--tabletop-place-yaw-variant-deg",
         type=float,
         nargs="*",
-        default=[0.0, -30.0, 30.0, -60.0, 60.0, -90.0, 90.0, 180.0],
-        help="For place_on_slots rules, also try these extra in-plane yaw rotations around the destination tabletop normal. This is useful when the object may be placed slightly skewed and a different xy heading makes pre_place IK reachable.",
+        default=[0.0],
+        help="For place_on_slots rules, also try these extra in-plane yaw rotations around the destination tabletop normal. Default keeps the final object pose fixed.",
     )
     parser.add_argument(
         "--tabletop-place-axial-spin-deg",
         type=float,
         nargs="*",
-        default=[0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0],
-        help="For elongated place_on_slots objects, also try these equivalent rotations around the object's own longest axis before solving pre_place/place IK. This helps keep the gripper from scraping the tabletop while preserving the same final tabletop placement.",
+        default=[0.0],
+        help="For elongated place_on_slots objects, also try these equivalent rotations around the object's own longest axis before solving pre_place/place IK. Default keeps the final object pose fixed.",
+    )
+    parser.add_argument(
+        "--targeted-place-expand-orientation-invariant",
+        dest="targeted_place_expand_orientation_invariant",
+        action="store_true",
+        default=False,
+        help="Expand orientation-invariant rules into multiple equivalent final object orientations. Disabled by default to keep the final object pose fixed.",
     )
     parser.add_argument(
         "--tabletop-place-min-tcp-verticality",
@@ -110,7 +125,7 @@ def build_arg_parser():
         "--targeted-place-hover-extra-height-m",
         type=float,
         nargs="*",
-        default=[0.0, 0.02, 0.04],
+        default=[0.0, 0.01],
         help="Additional world-z hover heights to try on top of each rule's base hover_height when building pre_place candidates.",
     )
     parser.add_argument(
@@ -336,6 +351,8 @@ def _make_insert_vertical_local_pose_variants(
     rule: PlaceRule,
     object_pose_local: LocalPoseSpec,
     spin_degs,
+    *,
+    allow_axis_flip: bool = False,
 ) -> list[tuple[str | None, np.ndarray]]:
     T_base = _local_pose_spec_to_matrix(object_pose_local)
     variants: list[tuple[str | None, np.ndarray]] = [(None, T_base)]
@@ -343,7 +360,7 @@ def _make_insert_vertical_local_pose_variants(
         return variants
     spin_degs = [float(v) for v in list(spin_degs or []) if np.isfinite(float(v))]
     base_families: list[tuple[str | None, np.ndarray]] = [(None, T_base)]
-    if bool(getattr(rule, "allow_long_axis_flip", False)):
+    if bool(getattr(rule, "allow_long_axis_flip", False)) and bool(allow_axis_flip):
         T_flip = np.eye(4, dtype=np.float32)
         T_flip[:3, :3] = euler2mat(np.deg2rad(180.0), 0.0, 0.0, axes="sxyz").astype(np.float32)
         T_flipped = T_base.copy()
@@ -423,12 +440,15 @@ def _make_tabletop_axial_spin_local_pose_variants(
 
 
 def _make_orientation_invariant_local_pose_variants(
+    args,
     rule: PlaceRule,
     object_pose_local: LocalPoseSpec,
 ) -> list[tuple[str | None, np.ndarray]]:
     T_base = _local_pose_spec_to_matrix(object_pose_local)
     variants: list[tuple[str | None, np.ndarray]] = [(None, T_base)]
     if not bool(getattr(rule, "orientation_invariant", False)):
+        return variants
+    if not bool(getattr(args, "targeted_place_expand_orientation_invariant", False)):
         return variants
 
     seen = {tuple(np.round(T_base.reshape(-1), 6).tolist())}
@@ -478,13 +498,16 @@ def _make_tabletop_place_world_pose_variants(
 ) -> list[tuple[str | None, np.ndarray]]:
     if rule.primitive != "place_on_slots":
         return [(None, np.asarray(T_world_obj_desired, dtype=np.float32).reshape(4, 4))]
-    if bool(getattr(rule, "orientation_invariant", False)):
+    if bool(getattr(rule, "orientation_invariant", False)) and not bool(getattr(rule, "allow_tabletop_yaw_variants", False)):
         return [(None, np.asarray(T_world_obj_desired, dtype=np.float32).reshape(4, 4))]
 
     T_world_target = np.asarray(T_world_target, dtype=np.float32).reshape(4, 4)
     T_world_obj_desired = np.asarray(T_world_obj_desired, dtype=np.float32).reshape(4, 4)
     tilt_degs = [float(v) for v in list(getattr(args, "tabletop_place_tilt_toward_robot_deg", []) or []) if np.isfinite(float(v))]
-    yaw_degs = [float(v) for v in list(getattr(args, "tabletop_place_yaw_variant_deg", []) or []) if np.isfinite(float(v))]
+    if bool(getattr(rule, "allow_tabletop_yaw_variants", False)):
+        yaw_degs = [float(v) for v in list(getattr(args, "tabletop_place_yaw_variant_deg", []) or []) if np.isfinite(float(v))]
+    else:
+        yaw_degs = [0.0]
     if bool(getattr(rule, "preserve_long_axis_vertical", False)):
         tilt_degs = [0.0]
     if not tilt_degs:
@@ -506,20 +529,50 @@ def _make_tabletop_place_world_pose_variants(
     if toward_robot is None:
         return [(None, T_world_obj_desired)]
 
+    T_world_obj_base = T_world_obj_desired.copy()
+    if bool(getattr(rule, "allow_tabletop_yaw_variants", False)):
+        ref_axis = None
+        face_axis_local = getattr(rule, "face_robot_axis_local", None)
+        if face_axis_local is not None:
+            face_axis_local = np.asarray(face_axis_local, dtype=np.float32).reshape(3)
+            ref_axis = (T_world_obj_desired[:3, :3] @ face_axis_local).astype(np.float32)
+            ref_axis = ref_axis - float(np.dot(ref_axis, up_axis)) * up_axis
+            ref_axis = _normalize(ref_axis)
+        else:
+            best_dot = -float("inf")
+            for axis_idx in (0, 2):
+                axis_world = T_world_obj_desired[:3, axis_idx].astype(np.float32)
+                axis_world = axis_world - float(np.dot(axis_world, up_axis)) * up_axis
+                axis_world = _normalize(axis_world)
+                if axis_world is None:
+                    continue
+                for sign in (1.0, -1.0):
+                    signed_axis = (axis_world * float(sign)).astype(np.float32)
+                    dot_score = float(np.dot(signed_axis, toward_robot))
+                    if dot_score > best_dot:
+                        best_dot = dot_score
+                        ref_axis = signed_axis
+        if ref_axis is not None:
+            cross_val = float(np.dot(up_axis, np.cross(ref_axis, toward_robot)))
+            dot_val = float(np.clip(np.dot(ref_axis, toward_robot), -1.0, 1.0))
+            align_yaw_rad = float(np.arctan2(cross_val, dot_val))
+            R_align = _axis_angle_to_matrix(up_axis, align_yaw_rad)
+            T_world_obj_base[:3, :3] = (R_align @ T_world_obj_desired[:3, :3]).astype(np.float32)
+
     tilt_axis = _normalize(np.cross(up_axis, toward_robot))
     if tilt_axis is None:
-        return [(None, T_world_obj_desired)]
+        return [(None, T_world_obj_base)]
 
     local_points = base.get_asset_local_points(args.sim_asset_file, args.sim_asset_scale)
     plane_origin = np.asarray(T_world_target[:3, 3], dtype=np.float32).reshape(3)
     variants: list[tuple[str | None, np.ndarray]] = []
     seen = set()
     for yaw_deg in yaw_degs:
-        yaw_label = None if abs(yaw_deg) <= 1e-6 else f"yaw_{int(round(yaw_deg))}deg"
-        T_yaw = T_world_obj_desired.copy()
+        yaw_label = "face_robot" if abs(yaw_deg) <= 1e-6 else f"face_robot_yaw_{int(round(yaw_deg))}deg"
+        T_yaw = T_world_obj_base.copy()
         if abs(yaw_deg) > 1e-6:
             R_yaw = _axis_angle_to_matrix(up_axis, np.deg2rad(float(yaw_deg)))
-            T_yaw[:3, :3] = (R_yaw @ T_world_obj_desired[:3, :3]).astype(np.float32)
+            T_yaw[:3, :3] = (R_yaw @ T_world_obj_base[:3, :3]).astype(np.float32)
         yaw_world_points = (T_yaw[:3, :3] @ local_points.T).T + T_yaw[:3, 3]
         yaw_bottom_along_up = float(np.min((yaw_world_points - plane_origin) @ up_axis))
 
@@ -540,10 +593,19 @@ def _make_tabletop_place_world_pose_variants(
                 continue
             seen.add(key)
             variants.append((label, T_variant))
-    return variants or [(None, T_world_obj_desired)]
+    return variants or [("face_robot", T_world_obj_base)]
 
 
-def build_targeted_place_plan_variants(demo, bridge_mod, scene_capture_cache, rule: PlaceRule, place_state_cache, args) -> list[TargetedPlacePlan]:
+def build_targeted_place_plan_variants(
+    demo,
+    bridge_mod,
+    scene_capture_cache,
+    rule: PlaceRule,
+    place_state_cache,
+    args,
+    *,
+    T_tcp_obj_override: np.ndarray | None = None,
+) -> list[TargetedPlacePlan]:
     target_name = normalize_object_name(rule.target_object_name)
     if target_name is None:
         raise RuntimeError(f"Invalid target object name in place rule: {rule.target_object_name!r}")
@@ -555,7 +617,10 @@ def build_targeted_place_plan_variants(demo, bridge_mod, scene_capture_cache, ru
         )
     target_up_axis = _normalize(np.asarray(T_world_target[:3, 1], dtype=np.float32).reshape(3))
 
-    T_tcp_obj = _current_tcp_to_object_transform(demo)
+    if T_tcp_obj_override is None:
+        T_tcp_obj = _current_tcp_to_object_transform(demo)
+    else:
+        T_tcp_obj = np.asarray(T_tcp_obj_override, dtype=np.float32).reshape(4, 4)
     if rule.primitive == "place_on_slots":
         ordered_slots = _ordered_rule_slots(rule, T_world_target, bridge_mod, demo)
         if not ordered_slots:
@@ -580,13 +645,16 @@ def build_targeted_place_plan_variants(demo, bridge_mod, scene_capture_cache, ru
             raise RuntimeError(f"Rule for {rule.source_object_name} does not define object_pose_local")
         slot_specs = [(rule.object_pose_local, None)]
 
-    hover_extra_values = [
-        float(v)
-        for v in list(getattr(args, "targeted_place_hover_extra_height_m", []) or [])
-        if np.isfinite(float(v)) and float(v) >= -1e-6
-    ]
-    if not hover_extra_values:
+    if rule.primitive == "insert_vertical":
         hover_extra_values = [0.0]
+    else:
+        hover_extra_values = [
+            float(v)
+            for v in list(getattr(args, "targeted_place_hover_extra_height_m", []) or [])
+            if np.isfinite(float(v)) and float(v) >= -1e-6
+        ]
+        if not hover_extra_values:
+            hover_extra_values = [0.0]
 
     plans: list[TargetedPlacePlan] = []
     for object_pose_local, slot_name in slot_specs:
@@ -594,9 +662,10 @@ def build_targeted_place_plan_variants(demo, bridge_mod, scene_capture_cache, ru
             rule,
             object_pose_local,
             getattr(args, "insert_vertical_axial_spin_deg", None),
+            allow_axis_flip=bool(getattr(args, "targeted_place_allow_insert_axis_flip", False)),
         )
         if rule.primitive == "place_on_slots":
-            local_variants = _make_orientation_invariant_local_pose_variants(rule, object_pose_local)
+            local_variants = _make_orientation_invariant_local_pose_variants(args, rule, object_pose_local)
             if len(local_variants) <= 1:
                 local_variants = _make_tabletop_axial_spin_local_pose_variants(args, rule, object_pose_local)
 
@@ -642,6 +711,7 @@ def build_targeted_place_plan_variants(demo, bridge_mod, scene_capture_cache, ru
                             target_name=target_name,
                             slot_name=slot_name,
                             variant_label=plan_variant_label,
+                            T_world_obj_desired=np.asarray(T_world_obj_desired, dtype=np.float32).reshape(4, 4),
                             staging_pose=staging_pose,
                             pre_place_pose=pre_place_pose,
                             place_pose=place_pose,

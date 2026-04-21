@@ -24,10 +24,13 @@ def build_arg_parser():
         curobo_ee_link="gripper_tcp",
         curobo_rm75_robot_cfg=Path(__file__).resolve().parent / "curobo_rm75_config" / "rm75.yml",
         carry_sim_arm_across_cycles=False,
-        insert_vertical_axial_spin_deg=[0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0],
-        tabletop_place_yaw_variant_deg=[0.0, -30.0, 30.0],
-        tabletop_place_tilt_toward_robot_deg=[0.0, 15.0],
-        tabletop_place_axial_spin_deg=[0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0],
+        insert_vertical_axial_spin_deg=[0.0, -15.0, 15.0, -35.0, 35.0, -55.0, 55.0, -75.0],
+        targeted_place_allow_insert_axis_flip=False,
+        tabletop_place_yaw_variant_deg=[0.0, -15.0, 15.0, -35.0, 35.0, -55.0, 55.0, -75.0],
+        tabletop_place_tilt_toward_robot_deg=[0.0],
+        tabletop_place_axial_spin_deg=[0.0],
+        targeted_place_expand_orientation_invariant=False,
+        targeted_place_hover_extra_height_m=[0.0, 0.01],
         topdown_grasp_yaw_variant_deg=[0.0, -30.0, 30.0, -60.0, 60.0, -90.0, 90.0, 180.0],
         topdown_tilt_toward_robot_deg=[12.0, 20.0, 30.0, 45.0],
         topdown_tilt_toward_robot_shift_m=[0.0, 0.02],
@@ -42,14 +45,14 @@ def build_arg_parser():
         "--direct-release-approach-distances",
         type=float,
         nargs="*",
-        default=[0.03, 0.04, 0.05, 0.06],
+        default=[0.04, 0.05],
         help="For insert_vertical rules, also try these short pre-place approach distances along the target long axis.",
     )
     parser.add_argument(
         "--direct-pre-place-z-offsets",
         type=float,
         nargs="*",
-        default=[0.0, 0.015],
+        default=[0.0, 0.01],
         help="Also lift the short pre-place by these extra world-z offsets. This helps avoid under-table or desk-edge sweeps without changing the final release pose.",
     )
     parser.add_argument(
@@ -124,16 +127,21 @@ def build_arg_parser():
     parser.add_argument(
         "--direct-place-max-abs-yaw-deg",
         type=float,
-        default=45.0,
-        help="Skip direct place candidates whose tabletop yaw variant has |yaw| above this (degrees). "
-        "±60° often causes MotionGen IK_FAIL on RM75; default 45 excludes them unless you raise this "
-        "and pass e.g. --tabletop-place-yaw-variant-deg 0 -30 30 -60 60.",
+        default=0.0,
+        help="Optional absolute-yaw filter for direct place candidates. "
+        "Set <= 0 to disable and keep the full tabletop yaw variant set.",
     )
     parser.add_argument(
         "--direct-pre-place-verticality-band",
         type=float,
         default=0.08,
         help="Among successful insert_vertical pre-place candidates, keep only those within this tcp_verticality band from the best vertical candidate before selecting the lowest-cost cuRobo path.",
+    )
+    parser.add_argument(
+        "--place-orientation-preference-weight",
+        type=float,
+        default=0.25,
+        help="Additional penalty weight used to prefer place candidates whose object facing direction is oriented toward the robot. Set <=0 to disable this preference.",
     )
     parser.add_argument(
         "--direct-terminal-max-realized-pos-error",
@@ -299,6 +307,20 @@ def build_arg_parser():
         help="Optional Z-only scale for the cuRobo attached-object collision box during transport. "
         "Useful when the grasped object is scraping tabletop clutter even though the XY footprint is covered.",
     )
+    parser.add_argument(
+        "--curobo-demo-path-validation",
+        dest="curobo_demo_path_validation",
+        action="store_true",
+        default=False,
+        help="Run the extra demo-planner dense collision validation after a cuRobo plan succeeds. "
+        "Disabled by default so candidate acceptance follows cuRobo directly.",
+    )
+    parser.add_argument(
+        "--no-curobo-demo-path-validation",
+        dest="curobo_demo_path_validation",
+        action="store_false",
+        help="Disable the extra demo-planner dense collision validation after cuRobo success.",
+    )
     return parser
 
 
@@ -454,6 +476,19 @@ def _visualize_attached_spheres(planner, demo, args):
         print(f"[curobo] sphere visualization failed (non-critical): {exc}")
 
 
+def _clear_visualized_attached_spheres(demo) -> None:
+    env = getattr(demo, "env", None)
+    if env is None:
+        return
+    sphere_actors = list(getattr(env.unwrapped, "_attached_sphere_actors", []) or [])
+    for actor in sphere_actors:
+        try:
+            actor.remove_from_scene()
+        except Exception:
+            pass
+    env.unwrapped._attached_sphere_actors = []
+
+
 def _refresh_curobo_world(
     planner, demo, args, *, label: str, include_active_object: bool = False, include_table: bool = False,
     exclude_object_names: set[str] | None = None,
@@ -468,6 +503,17 @@ def _refresh_curobo_world(
             meshes.extend(active_meshes)
         if include_table and bool(getattr(args, "curobo_table_collision", True)):
             cuboids.append(_build_virtual_table_cuboid(args))
+        targeted.base.sync_curobo_collision_world_visuals(
+            demo.env,
+            args,
+            cuboids=cuboids,
+            meshes=meshes,
+            label=label,
+        )
+        if planner.attached_object_active:
+            _visualize_attached_spheres(planner, demo, args)
+        else:
+            _clear_visualized_attached_spheres(demo)
         cuboids_in_base, meshes_in_base = curobo_wrapper._transform_curobo_world_to_robot_base(
             cuboids,
             meshes,
@@ -485,6 +531,8 @@ def _refresh_curobo_world(
             )
     elif bool(getattr(args, "curobo_debug", False)):
         print(f"[curobo] planner is in embedded free-space mode for {label}")
+    else:
+        _clear_visualized_attached_spheres(demo)
 
 
 def _direct_grasp_target_contact_only_disabled_links(planner) -> list[str]:
@@ -560,6 +608,68 @@ def _candidate_selection_penalty(candidate, args) -> float:
     axis_cm = abs(axis_shift_m) * 100.0
     z_lift_cm = max(z_lift_m, 0.0) * 100.0
     return float(axis_penalty_per_cm * axis_cm + z_lift_penalty_per_cm * z_lift_cm)
+
+
+def _candidate_target_up_axis_world(candidate, demo) -> np.ndarray | None:
+    place_plan = candidate.get("place_plan")
+    target_name = None if place_plan is None else getattr(place_plan, "target_name", None)
+    if target_name:
+        scene_entry = targeted._find_scene_object_entry(demo, target_name)
+        if scene_entry is not None and scene_entry.get("T_world_obj") is not None:
+            T_world_target = np.asarray(scene_entry["T_world_obj"], dtype=np.float32).reshape(4, 4)
+            return _normalize(T_world_target[:3, 1])
+    return np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+
+
+def _candidate_place_orientation_penalty(candidate, demo, args) -> float:
+    weight = float(max(getattr(args, "place_orientation_preference_weight", 0.25), 0.0))
+    if weight <= 0.0:
+        return 0.0
+    place_plan = candidate.get("place_plan")
+    if place_plan is None:
+        return 0.0
+    T_world_obj_desired = getattr(place_plan, "T_world_obj_desired", None)
+    if T_world_obj_desired is None:
+        return 0.0
+    rule = getattr(place_plan, "rule", None)
+    T_world_obj_desired = np.asarray(T_world_obj_desired, dtype=np.float32).reshape(4, 4)
+    robot_pos = targeted.base.flatten_np(demo.robot.pose.p)[:3].astype(np.float32)
+    obj_pos = T_world_obj_desired[:3, 3].astype(np.float32)
+    up_axis = _candidate_target_up_axis_world(candidate, demo)
+    if up_axis is None:
+        up_axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    toward_robot = robot_pos - obj_pos
+    toward_robot = toward_robot - float(np.dot(toward_robot, up_axis)) * up_axis
+    toward_robot = _normalize(toward_robot)
+    if toward_robot is None:
+        return 0.0
+
+    R_world_obj = T_world_obj_desired[:3, :3].astype(np.float32)
+    face_axis_local = None if rule is None else getattr(rule, "face_robot_axis_local", None)
+    if face_axis_local is not None:
+        face_axis_world = (R_world_obj @ np.asarray(face_axis_local, dtype=np.float32).reshape(3)).astype(np.float32)
+        face_axis_world = face_axis_world - float(np.dot(face_axis_world, up_axis)) * up_axis
+        face_axis_world = _normalize(face_axis_world)
+        if face_axis_world is None:
+            return 0.0
+        alignment = float(np.clip(np.dot(face_axis_world, toward_robot), -1.0, 1.0))
+    else:
+        alignment = -1.0
+        for axis_local in (
+            np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            np.asarray([-1.0, 0.0, 0.0], dtype=np.float32),
+            np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+            np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
+        ):
+            axis_world = (R_world_obj @ axis_local).astype(np.float32)
+            axis_world = axis_world - float(np.dot(axis_world, up_axis)) * up_axis
+            axis_world = _normalize(axis_world)
+            if axis_world is None:
+                continue
+            alignment = max(alignment, float(np.clip(np.dot(axis_world, toward_robot), -1.0, 1.0)))
+        if alignment < -0.5:
+            return 0.0
+    return float((1.0 - alignment) * 0.5 * weight)
 
 
 def _candidate_sort_key(item):
@@ -961,6 +1071,8 @@ def _plan_short_curobo_cartesian_descent(
 
 
 def _validate_candidate_joint_path_with_demo_planner(demo, start_q, q_path, *, use_attach: bool, label: str) -> bool:
+    if not bool(getattr(demo.args, "curobo_demo_path_validation", False)):
+        return True
     dense_validate_delta = 0.01 if use_attach else 0.03
     ok = targeted.base.validate_joint_path_segments(
         demo,
@@ -1215,18 +1327,21 @@ def _evaluate_curobo_pose_candidates(
                 continue
             metrics, score = _path_metrics_and_score(start_q, q_path)
             selection_penalty = _candidate_selection_penalty(candidate, args)
-            score = float(score) + float(selection_penalty)
+            place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
+            score = float(score) + float(selection_penalty) + float(place_pref_penalty)
             item = dict(candidate)
             item["result"] = result
             item["q_path"] = q_path
             item["metrics"] = metrics
             item["score"] = score
             item["selection_penalty"] = selection_penalty
+            item["place_preference_penalty"] = place_pref_penalty
             item["terminal_align"] = terminal_align
             item["planner_pose"] = planner_pose
             print(
                 f"[curobo] {candidate_label} success: score={score:.3f}, "
                 f"selection_penalty={selection_penalty:.3f}, "
+                f"place_pref_penalty={place_pref_penalty:.3f}, "
                 f"total_motion={metrics['total_motion']:.3f} rad, "
                 f"joint7_total={metrics['joint7_total_motion']:.3f} rad, "
                 f"joint7_excursion={metrics['joint7_max_excursion']:.3f} rad, "
@@ -1367,7 +1482,7 @@ def _evaluate_two_step_grasp_candidates(
 
                 # 使用前一个点作为IK的seed
                 seed_q = pregrasp_q if i == 0 else final_approach_path[-1]
-                ik_result = planner.solve_single_ik(
+                ik_result = planner.solve_ik(
                     seed_q,
                     planner_pose,
                     num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
@@ -1619,18 +1734,21 @@ def _evaluate_curobo_pose_candidates_goalset(
                     continue
                 metrics, score = _path_metrics_and_score(start_q, q_path)
                 selection_penalty = _candidate_selection_penalty(candidate, args)
-                score = float(score) + float(selection_penalty)
+                place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
+                score = float(score) + float(selection_penalty) + float(place_pref_penalty)
                 item = dict(candidate)
                 item["result"] = result
                 item["q_path"] = q_path
                 item["metrics"] = metrics
                 item["score"] = score
                 item["selection_penalty"] = selection_penalty
+                item["place_preference_penalty"] = place_pref_penalty
                 item["terminal_align"] = terminal_align
                 item["planner_pose"] = planner_pose
                 print(
                     f"[curobo] {candidate_label} success: score={score:.3f}, "
                     f"selection_penalty={selection_penalty:.3f}, "
+                    f"place_pref_penalty={place_pref_penalty:.3f}, "
                     f"total_motion={metrics['total_motion']:.3f} rad, "
                     f"joint7_total={metrics['joint7_total_motion']:.3f} rad, "
                     f"joint7_excursion={metrics['joint7_max_excursion']:.3f} rad, "
@@ -1893,18 +2011,21 @@ def _evaluate_curobo_pose_candidates_multi_start(
                     continue
                 metrics, score = _path_metrics_and_score(start_q, q_path)
                 selection_penalty = _candidate_selection_penalty(candidate, args)
-                score = float(score) + float(selection_penalty)
+                place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
+                score = float(score) + float(selection_penalty) + float(place_pref_penalty)
                 item = dict(candidate)
                 item["result"] = result
                 item["q_path"] = q_path
                 item["metrics"] = metrics
                 item["score"] = score
                 item["selection_penalty"] = selection_penalty
+                item["place_preference_penalty"] = place_pref_penalty
                 item["terminal_align"] = terminal_align
                 item["planner_pose"] = planner_pose
                 print(
                     f"[curobo] {candidate_label} success: score={score:.3f}, "
                     f"selection_penalty={selection_penalty:.3f}, "
+                    f"place_pref_penalty={place_pref_penalty:.3f}, "
                     f"total_motion={metrics['total_motion']:.3f} rad, "
                     f"joint7_total={metrics['joint7_total_motion']:.3f} rad, "
                     f"joint7_excursion={metrics['joint7_max_excursion']:.3f} rad, "
@@ -1948,7 +2069,10 @@ def _evaluate_curobo_pose_candidates_multi_start(
 
 def _build_direct_grasp_candidates(demo, args):
     raw_grasp_pose = demo.build_topdown_grasp_pose()
+    obj_p0, obj_q0 = demo.get_obj_pose()
+    T_world_obj0 = targeted.base.pose_to_matrix(obj_p0, obj_q0)
     grasp_mode = str(getattr(args, "grasp_mode", "object_normal") or "object_normal").strip().lower()
+    place_rule = targeted.get_place_rule(getattr(args, "object_name", None))
     grasp_variant_args = SimpleNamespace(**vars(args))
     grasp_variant_args.topdown_grasp_yaw_variant_deg = [0.0]
     object_axis_world = None
@@ -1980,9 +2104,15 @@ def _build_direct_grasp_candidates(demo, args):
         object_axis_world = None
         is_spherical = False
 
-    grasp_axis_shifts = _unique_finite_float_list(
-        getattr(args, "direct_grasp_object_axis_shifts_m", [0.0]),
-    )
+    rule_grasp_bias_variants = list(getattr(place_rule, "grasp_bias_variants", ()) or []) if place_rule is not None else []
+    use_rule_bias_variants = bool(rule_grasp_bias_variants) and object_axis_world is not None
+
+    if use_rule_bias_variants:
+        grasp_axis_shifts = [float(v.axis_shift_m) for v in rule_grasp_bias_variants]
+    else:
+        grasp_axis_shifts = _unique_finite_float_list(
+            getattr(args, "direct_grasp_object_axis_shifts_m", [0.0]),
+        )
     if not grasp_axis_shifts:
         grasp_axis_shifts = [0.0]
 
@@ -2002,10 +2132,13 @@ def _build_direct_grasp_candidates(demo, args):
                 f"max_ratio={max_axis_shift_ratio:.2f} -> max_shift={max_abs_shift * 1000:.1f}mm, "
                 f"kept {len(grasp_axis_shifts)}/{before_count} shift value(s)"
             )
-    grasp_z_lifts = _unique_finite_float_list(
-        getattr(args, "direct_grasp_z_lifts_m", [0.0]),
-        min_value=0.0,
-    )
+    if use_rule_bias_variants:
+        grasp_z_lifts = [float(v.z_lift_m) for v in rule_grasp_bias_variants]
+    else:
+        grasp_z_lifts = _unique_finite_float_list(
+            getattr(args, "direct_grasp_z_lifts_m", [0.0]),
+            min_value=0.0,
+        )
     if not grasp_z_lifts:
         grasp_z_lifts = [0.0]
 
@@ -2034,18 +2167,45 @@ def _build_direct_grasp_candidates(demo, args):
             seen.add(key)
             variants.append((str(label), pose))
 
-        for label, pose in targeted.base.build_grasp_pose_variants(demo, raw_grasp_pose, grasp_variant_args):
-            _append(label, pose)
+        if use_rule_bias_variants:
+            for bias in rule_grasp_bias_variants:
+                pose = raw_grasp_pose
+                tilt_deg = float(bias.tilt_toward_robot_deg)
+                if abs(tilt_deg) > 1e-6:
+                    pose = targeted.base.tilt_pose_toward_robot(
+                        demo,
+                        pose,
+                        tilt_deg,
+                        direction=str(getattr(bias, "tilt_direction", "toward_robot")),
+                    )
+                    if pose is None:
+                        continue
+                shift_d = float(bias.tilt_shift_m)
+                if abs(shift_d) > 1e-6:
+                    pose = targeted.base.shift_pose_toward_robot_xy(demo, pose, shift_d)
+                    if pose is None:
+                        continue
+                label = str(bias.label) if getattr(bias, "label", None) else "grasp"
+                _append(label, pose)
+        else:
+            for label, pose in targeted.base.build_grasp_pose_variants(demo, raw_grasp_pose, grasp_variant_args):
+                _append(label, pose)
 
-        tilt_degs = _unique_finite_float_list(getattr(args, "direct_grasp_tilt_toward_robot_deg", [12.0, 20.0, 30.0, 45.0]))
+        if use_rule_bias_variants:
+            tilt_degs = []
+        else:
+            tilt_degs = _unique_finite_float_list(getattr(args, "direct_grasp_tilt_toward_robot_deg", [12.0, 20.0, 30.0, 45.0]))
         # 球形物体：禁用tilt variants，因为倾斜抓取容易滑脱
         if is_spherical:
             tilt_degs = []
 
-        shift_ds = _unique_finite_float_list(
-            getattr(args, "direct_grasp_tilt_toward_robot_shift_m", [0.0, 0.02]),
-            min_value=0.0,
-        )
+        if use_rule_bias_variants:
+            shift_ds = [0.0]
+        else:
+            shift_ds = _unique_finite_float_list(
+                getattr(args, "direct_grasp_tilt_toward_robot_shift_m", [0.0, 0.02]),
+                min_value=0.0,
+            )
         if not shift_ds:
             shift_ds = [0.0]
 
@@ -2072,9 +2232,25 @@ def _build_direct_grasp_candidates(demo, args):
     grasp_variants = _build_pose_variants()
     candidates = []
     seen = set()
-    for grasp_variant_label, grasp_variant_pose in grasp_variants:
-        for axis_shift in grasp_axis_shifts:
-            for z_lift in grasp_z_lifts:
+    if use_rule_bias_variants:
+        bias_iter = []
+        for grasp_variant_label, grasp_variant_pose in grasp_variants:
+            matched_bias = next(
+                (bias for bias in rule_grasp_bias_variants if str(getattr(bias, "label", "")) == str(grasp_variant_label)),
+                None,
+            )
+            if matched_bias is None:
+                continue
+            bias_iter.append(((grasp_variant_label, grasp_variant_pose), matched_bias))
+    else:
+        bias_iter = [((grasp_variant_label, grasp_variant_pose), None) for grasp_variant_label, grasp_variant_pose in grasp_variants]
+
+    for grasp_variant_item, rule_bias in bias_iter:
+        grasp_variant_label, grasp_variant_pose = grasp_variant_item
+        axis_shift_values = [float(rule_bias.axis_shift_m)] if rule_bias is not None else grasp_axis_shifts
+        z_lift_values = [float(rule_bias.z_lift_m)] if rule_bias is not None else grasp_z_lifts
+        for axis_shift in axis_shift_values:
+            for z_lift in z_lift_values:
                 current_grasp_pose = grasp_variant_pose
                 if object_axis_world is not None and abs(float(axis_shift)) > 1e-6:
                     shifted_p = (_get_pose_position(current_grasp_pose) + object_axis_world * float(axis_shift)).astype(np.float32)
@@ -2123,6 +2299,12 @@ def _build_direct_grasp_candidates(demo, args):
                         "label": label,
                         "pose": current_grasp_pose,
                         "pregrasp_pose": current_pregrasp_pose,  # 保存pregrasp pose用于两步抓取
+                        "T_tcp_obj": np.linalg.inv(
+                            targeted.base.pose_to_matrix(
+                                targeted.base.flatten_np(current_grasp_pose.p)[:3],
+                                targeted.base.flatten_np(current_grasp_pose.q)[:4],
+                            )
+                        ) @ T_world_obj0,
                         "grasp_axis_shift_m": float(axis_shift),
                         "grasp_z_lift_m": float(z_lift),
                     }
@@ -2146,9 +2328,20 @@ def _build_direct_grasp_candidates(demo, args):
         candidates = interleaved
     print(
         f"[direct_grasp] built {len(candidates)} grasp candidate(s) "
-        f"from {len(grasp_variants)} pose variant(s) x {len(grasp_axis_shifts)} axis shift(s) x {len(grasp_z_lifts)} z lift(s); "
+        f"from {len(grasp_variants)} pose variant(s)"
+        f"{'' if not use_rule_bias_variants else ' (rule-paired bias variants)'}"
+        f"{'' if use_rule_bias_variants else f' x {len(grasp_axis_shifts)} axis shift(s) x {len(grasp_z_lifts)} z lift(s)'}; "
         f"grasp_mode={grasp_mode}, tilt={len(tilt_cands)}, non_tilt={len(non_tilt_cands)}"
     )
+    if use_rule_bias_variants:
+        print(
+            "[direct_grasp] place-rule grasp bias variants: "
+            + ", ".join(
+                f"{getattr(v, 'label', 'bias')}[axis={float(v.axis_shift_m):.3f}, tilt={float(v.tilt_toward_robot_deg):.1f}, tilt_shift={float(v.tilt_shift_m):.3f}, z_lift={float(v.z_lift_m):.3f}]"
+                f"/dir={getattr(v, 'tilt_direction', 'toward_robot')}"
+                for v in rule_grasp_bias_variants
+            )
+        )
     if tilt_variants:
         print(f"[direct_grasp] tilt variant labels: {tilt_variants[:8]}")
     return candidates
@@ -2223,7 +2416,7 @@ def _dedupe_place_candidates(candidates):
     return deduped
 
 
-def _build_direct_pre_place_candidates(demo, bridge_mod, scene_capture_cache, rule, place_state_cache, args):
+def _build_direct_pre_place_candidates(demo, bridge_mod, scene_capture_cache, rule, place_state_cache, args, *, T_tcp_obj_override=None):
     place_plan_candidates = targeted.build_targeted_place_plan_variants(
         demo,
         bridge_mod,
@@ -2231,6 +2424,7 @@ def _build_direct_pre_place_candidates(demo, bridge_mod, scene_capture_cache, ru
         rule,
         place_state_cache,
         args,
+        T_tcp_obj_override=T_tcp_obj_override,
     )
     if not place_plan_candidates:
         return []
@@ -2249,15 +2443,19 @@ def _build_direct_pre_place_candidates(demo, bridge_mod, scene_capture_cache, ru
             if target_axis is not None:
                 target_axis = (target_axis * sign).astype(np.float32)
 
-    approach_distances = _unique_finite_float_list(
-        getattr(args, "direct_release_approach_distances", []),
-        min_value=0.005,
-    )
-    if not approach_distances:
+    if rule.primitive == "insert_vertical":
         approach_distances = [float(max(getattr(args, "direct_release_approach_distance", 0.04), 0.005))]
-    z_offsets = _unique_finite_float_list(getattr(args, "direct_pre_place_z_offsets", [0.0]))
-    if not z_offsets:
         z_offsets = [0.0]
+    else:
+        approach_distances = _unique_finite_float_list(
+            getattr(args, "direct_release_approach_distances", []),
+            min_value=0.005,
+        )
+        if not approach_distances:
+            approach_distances = [float(max(getattr(args, "direct_release_approach_distance", 0.04), 0.005))]
+        z_offsets = _unique_finite_float_list(getattr(args, "direct_pre_place_z_offsets", [0.0]))
+        if not z_offsets:
+            z_offsets = [0.0]
     min_place_tcp_z = float(getattr(args, "direct_min_place_tcp_z", 0.005))
     max_pad_tilt = float(max(getattr(args, "direct_place_max_pad_tilt", 0.25), 0.0))
 
@@ -2342,7 +2540,7 @@ def _build_direct_pre_place_candidates(demo, bridge_mod, scene_capture_cache, ru
     return candidates
 
 
-def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, place_state_cache, args):
+def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, place_state_cache, args, *, T_tcp_obj_override=None):
     place_plan_candidates = targeted.build_targeted_place_plan_variants(
         demo,
         bridge_mod,
@@ -2350,13 +2548,14 @@ def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, 
         rule,
         place_state_cache,
         args,
+        T_tcp_obj_override=T_tcp_obj_override,
     )
     if not place_plan_candidates:
         return []
 
     min_place_tcp_z = float(getattr(args, "direct_min_place_tcp_z", 0.005))
     max_pad_tilt = float(max(getattr(args, "direct_place_max_pad_tilt", 0.25), 0.0))
-    max_abs_yaw = float(getattr(args, "direct_place_max_abs_yaw_deg", 45.0) or 0.0)
+    max_abs_yaw = float(getattr(args, "direct_place_max_abs_yaw_deg", 0.0) or 0.0)
     all_candidates = []
     level_candidates = []
     for candidate in place_plan_candidates:
@@ -2429,6 +2628,9 @@ def _evaluate_joint_grasp_place_chains(
     grasp_successes,
 ):
     saved_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+    demo._last_joint_chain_failed_pose = None
+    demo._last_joint_chain_failed_label = None
+    demo._last_joint_chain_failed_candidate_poses = []
     targeted._register_transport_attached_box(
         demo,
         args,
@@ -2482,17 +2684,22 @@ def _evaluate_joint_grasp_place_chains(
                 rule,
                 place_state_cache,
                 args,
+                T_tcp_obj_override=grasp_choice.get("T_tcp_obj"),
             )
             if rule.primitive == "insert_vertical":
                 direct_place_candidates = _filter_pre_place_candidates_by_verticality(direct_place_candidates, args)
             direct_place_candidates.sort(key=_pre_place_screen_sort_key)
             if max_place_candidates > 0:
                 direct_place_candidates = direct_place_candidates[:max_place_candidates]
+            if direct_place_candidates and demo._last_joint_chain_failed_pose is None:
+                demo._last_joint_chain_failed_pose = direct_place_candidates[0]["pose"]
+                demo._last_joint_chain_failed_label = str(direct_place_candidates[0]["label"])
             for candidate in direct_place_candidates:
                 pair_item = dict(candidate)
                 pair_item["start_q"] = grasp_terminal_q
                 pair_item["grasp_choice"] = grasp_choice
                 direct_pair_candidates.append(pair_item)
+                demo._last_joint_chain_failed_candidate_poses.append(candidate["pose"])
 
         if direct_pair_candidates:
             print(
@@ -2502,7 +2709,7 @@ def _evaluate_joint_grasp_place_chains(
             target_obj_name = curobo_wrapper.normalize_object_name(
                 getattr(rule, "target_object_name", None)
             )
-            exclude_names = {target_obj_name} if target_obj_name else None
+            exclude_names = {target_obj_name} if (rule.primitive == "insert_vertical" and target_obj_name) else None
             direct_place_disabled_links = _direct_place_contact_tolerant_disabled_links(planner)
             direct_place_successes = _evaluate_curobo_pose_candidates_multi_start(
                 planner,
@@ -2554,6 +2761,9 @@ def _evaluate_joint_grasp_place_chains(
     if not chains:
         return []
 
+    demo._last_joint_chain_failed_pose = None
+    demo._last_joint_chain_failed_label = None
+    demo._last_joint_chain_failed_candidate_poses = []
     chains.sort(key=_joint_chain_sort_key)
     best = chains[0]
     print(
@@ -2651,7 +2861,15 @@ def run_targeted_place_episode_curobo_direct(
     if not grasp_successes:
         selected_pose = grasp_candidates[0]["pose"] if grasp_candidates else demo.build_topdown_grasp_pose()
         print("[FAIL] direct cuRobo grasp planning failed")
-        targeted.base.inspect_failed_pose(demo, bridge_mod, "grasp", args, pose=selected_pose, gripper_closed=False)
+        targeted.base.inspect_failed_pose(
+            demo,
+            bridge_mod,
+            "grasp",
+            args,
+            pose=selected_pose,
+            gripper_closed=False,
+            candidate_poses=[item["pose"] for item in grasp_candidates],
+        )
         return False
 
     grasp_choice = grasp_successes[0]
@@ -2668,13 +2886,18 @@ def run_targeted_place_episode_curobo_direct(
         )
         if not joint_chains:
             print("[FAIL] no grasp candidate yielded a complete grasp->pre_place->release chain")
+            failed_place_pose = getattr(demo, "_last_joint_chain_failed_pose", None)
+            failed_place_label = str(getattr(demo, "_last_joint_chain_failed_label", "") or "place")
+            failed_place_candidates = list(getattr(demo, "_last_joint_chain_failed_candidate_poses", []) or [])
             targeted.base.inspect_failed_pose(
                 demo,
                 bridge_mod,
-                "grasp",
+                failed_place_label if failed_place_pose is not None else "grasp",
                 args,
-                pose=grasp_choice["pose"],
-                gripper_closed=False,
+                pose=failed_place_pose if failed_place_pose is not None else grasp_choice["pose"],
+                gripper_closed=True if failed_place_pose is not None else False,
+                use_attach=True if failed_place_pose is not None else False,
+                candidate_poses=failed_place_candidates if failed_place_pose is not None else [item["pose"] for item in grasp_candidates],
             )
             return False
         selected_joint_chain = joint_chains[0]
@@ -2817,7 +3040,11 @@ def run_targeted_place_episode_curobo_direct(
         target_obj_name_place = curobo_wrapper.normalize_object_name(
             getattr(rule, "target_object_name", None)
         )
-        exclude_names_place = {target_obj_name_place} if target_obj_name_place else None
+        exclude_names_place = (
+            {target_obj_name_place}
+            if (rule.primitive == "insert_vertical" and target_obj_name_place)
+            else None
+        )
         direct_place_disabled_links = _direct_place_contact_tolerant_disabled_links(planner)
         direct_place_successes = _evaluate_curobo_pose_candidates(
             planner,
@@ -2843,6 +3070,7 @@ def run_targeted_place_episode_curobo_direct(
                 pose=failed_pose,
                 gripper_closed=True,
                 use_attach=True,
+                candidate_poses=[item["pose"] for item in direct_place_candidates],
             )
             return False
 
