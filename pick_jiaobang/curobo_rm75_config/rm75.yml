@@ -80,27 +80,10 @@ robot_cfg:
         "link_3": ["link_4", "link_5"],
         "link_4": ["link_5", "link_6"],
         "link_5": ["link_6", "link_7", "gripper_base_link"],
-        "link_6":
-          [
-            "link_7",
-            "gripper_base_link",
-            "gripper_Left_1_Link",
-            "gripper_Left_2_Link",
-            "gripper_Right_1_Link",
-            "gripper_Right_2_Link",
-          ],
+        "link_6": ["link_7"],
         "link_7":
           [
             "gripper_base_link",
-            "gripper_Left_1_Link",
-            "gripper_Left_Support_Link",
-            "gripper_Left_2_Link",
-            "gripper_Right_1_Link",
-            "gripper_Right_Support_Link",
-            "gripper_Right_2_Link",
-            "left_pad",
-            "right_pad",
-            "attached_object",
           ],
         "gripper_base_link":
           [

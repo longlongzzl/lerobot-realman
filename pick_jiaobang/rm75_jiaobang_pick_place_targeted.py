@@ -771,6 +771,7 @@ def _register_transport_attached_box(
     *,
     show_visual: bool = True,
     activate_payload_visual: bool | None = None,
+    T_tcp_obj_override: np.ndarray | None = None,
 ) -> np.ndarray:
     target_box_size = base.get_asset_box_size(args.sim_asset_file, args.sim_asset_scale)
     attached_box_scale = float(np.clip(args.transport_attached_box_scale, 0.5, 2.0))
@@ -785,7 +786,11 @@ def _register_transport_attached_box(
         np.round(attached_box_size, 6),
         f"(scale={attached_box_scale:.3f})",
     )
-    attach_pose_local = base.make_attached_box_pose(demo, attached_box_size)
+    attach_pose_local = base.make_attached_box_pose(
+        demo,
+        attached_box_size,
+        T_tcp_obj_override=T_tcp_obj_override,
+    )
     try:
         demo.planner.update_attached_box(attached_box_size.tolist(), attach_pose_local.tolist())
         if show_visual:

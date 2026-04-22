@@ -336,6 +336,68 @@ def _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, label: str, *, us
     return True
 
 
+def _stabilize_post_grasp_attached_state(demo, args, grasp_choice) -> None:
+    q_path = list(grasp_choice.get("q_path") or [])
+    grasp_terminal_q = None
+    if q_path:
+        grasp_terminal_q = np.asarray(q_path[-1], dtype=np.float32).reshape(-1)[:7]
+        targeted.base.sync_demo_arm_qpos(demo, grasp_terminal_q)
+    T_tcp_obj = grasp_choice.get("T_tcp_obj")
+    if T_tcp_obj is None:
+        demo._transport_attached_T_tcp_obj = None
+        print("[direct_pre_place] grasp choice has no saved T_tcp_obj; attached-state stabilization skipped")
+        return
+    demo._transport_attached_T_tcp_obj = np.asarray(T_tcp_obj, dtype=np.float32).reshape(4, 4)
+    targeted._register_transport_attached_box(
+        demo,
+        args,
+        show_visual=False,
+        activate_payload_visual=False,
+        T_tcp_obj_override=demo._transport_attached_T_tcp_obj,
+    )
+    if targeted.base.force_active_object_to_attached_pose(demo):
+        print("[direct_pre_place] stabilized attached sim state from grasp-time TCP<->object transform")
+    else:
+        print("[direct_pre_place] failed to force active object to attached pose; continuing with current sim object state")
+
+
+def _apply_deferred_two_step_final_approach(planner, demo, args, grasp_choice, pregrasp_lookup) -> dict:
+    if not pregrasp_lookup:
+        return grasp_choice
+    pregrasp_success = pregrasp_lookup.get(str(grasp_choice.get("label", "")))
+    if pregrasp_success is None:
+        return grasp_choice
+    pregrasp_q = np.asarray(pregrasp_success.get("deferred_pregrasp_q"), dtype=np.float32).reshape(-1)[:7]
+    pregrasp_pose = pregrasp_success.get("deferred_pregrasp_pose")
+    grasp_pose = grasp_choice.get("pose")
+    if pregrasp_pose is None or grasp_pose is None:
+        return grasp_choice
+    final_approach_path = _plan_with_official_approach_metric(
+        planner,
+        demo,
+        args,
+        pregrasp_q,
+        pregrasp_pose,
+        grasp_pose,
+        label=f"{grasp_choice.get('label', '?')}_final_approach",
+    )
+    if not final_approach_path:
+        print(f"[two_step_grasp] deferred official final approach failed for {grasp_choice.get('label', '?')}; using single-step grasp path")
+        return grasp_choice
+    upgraded = dict(grasp_choice)
+    upgraded["q_path"] = list(pregrasp_success["q_path"]) + list(final_approach_path[1:])
+    upgraded["two_step_grasp"] = True
+    upgraded["pregrasp_waypoints"] = len(pregrasp_success["q_path"])
+    upgraded["approach_waypoints"] = len(final_approach_path)
+    upgraded["approach_distance_m"] = float(pregrasp_success.get("approach_distance_m", 0.0))
+    print(
+        f"[two_step_grasp] using deferred official final approach for {grasp_choice.get('label', '?')}: "
+        f"pregrasp={len(pregrasp_success['q_path'])} + approach={len(final_approach_path)} waypoints, "
+        f"distance={upgraded['approach_distance_m']*1000:.1f}mm"
+    )
+    return upgraded
+
+
 def _normalize(vec):
     arr = np.asarray(vec, dtype=np.float32).reshape(-1)
     norm = float(np.linalg.norm(arr))
@@ -427,6 +489,36 @@ def _build_virtual_table_cuboid(args) -> dict:
     }
 
 
+def _round_signature_values(values):
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    return tuple(float(np.round(v, 6)) for v in arr.tolist())
+
+
+def _world_obstacle_signature(cuboids, meshes):
+    cuboid_sig = []
+    for item in list(cuboids or []):
+        cuboid_sig.append(
+            (
+                str(item.get("name", "")),
+                _round_signature_values(item.get("dims", [])),
+                _round_signature_values(item.get("pose", item.get("xyz_quat", []))),
+            )
+        )
+    mesh_sig = []
+    for item in list(meshes or []):
+        mesh_sig.append(
+            (
+                str(item.get("name", "")),
+                str(item.get("file_path", item.get("asset_file", item.get("mesh_file", "")))),
+                _round_signature_values(item.get("scale", item.get("asset_scale", [1.0, 1.0, 1.0]))),
+                _round_signature_values(item.get("pose", item.get("xyz_quat", []))),
+            )
+        )
+    cuboid_sig.sort()
+    mesh_sig.sort()
+    return (tuple(cuboid_sig), tuple(mesh_sig))
+
+
 def _visualize_attached_spheres(planner, demo, args):
     """Print and optionally visualize the attached object collision spheres."""
     current_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
@@ -503,31 +595,45 @@ def _refresh_curobo_world(
             meshes.extend(active_meshes)
         if include_table and bool(getattr(args, "curobo_table_collision", True)):
             cuboids.append(_build_virtual_table_cuboid(args))
-        targeted.base.sync_curobo_collision_world_visuals(
-            demo.env,
-            args,
-            cuboids=cuboids,
-            meshes=meshes,
-            label=label,
-        )
+        world_signature = _world_obstacle_signature(cuboids, meshes)
+        world_changed = world_signature != getattr(planner, "_persistent_world_signature", None)
+        if world_changed:
+            targeted.base.sync_curobo_collision_world_visuals(
+                demo.env,
+                args,
+                cuboids=cuboids,
+                meshes=meshes,
+                label=label,
+            )
         if planner.attached_object_active:
             _visualize_attached_spheres(planner, demo, args)
         else:
             _clear_visualized_attached_spheres(demo)
-        cuboids_in_base, meshes_in_base = curobo_wrapper._transform_curobo_world_to_robot_base(
-            cuboids,
-            meshes,
-            demo,
-        )
-        planner.set_world_from_obstacles(cuboids=cuboids_in_base, meshes=meshes_in_base)
+        if world_changed:
+            cuboids_in_base, meshes_in_base = curobo_wrapper._transform_curobo_world_to_robot_base(
+                cuboids,
+                meshes,
+                demo,
+            )
+            planner.set_world_from_obstacles(cuboids=cuboids_in_base, meshes=meshes_in_base)
+            planner._persistent_world_signature = world_signature
         if exclude_object_names:
             print(
                 f"[curobo] {label} world: excluded scene obstacle(s): {sorted(exclude_object_names)}"
             )
         if bool(getattr(args, "curobo_debug", False)):
+            if world_changed:
+                print(
+                    f"[curobo] updated world with {len(cuboids_in_base)} cuboid and "
+                    f"{len(meshes_in_base)} mesh obstacles for {label}"
+                )
+            else:
+                print(f"[curobo] reused persistent world for {label}")
+            cuboid_names = [str(item.get("name", "")) for item in list(cuboids or [])]
+            mesh_names = [str(item.get("name", "")) for item in list(meshes or [])]
             print(
-                f"[curobo] updated world with {len(cuboids_in_base)} cuboid and "
-                f"{len(meshes_in_base)} mesh obstacles for {label}"
+                f"[curobo] {label} world members: "
+                f"cuboids={cuboid_names}, meshes={mesh_names}"
             )
     elif bool(getattr(args, "curobo_debug", False)):
         print(f"[curobo] planner is in embedded free-space mode for {label}")
@@ -928,7 +1034,28 @@ def _infer_goal_frame_free_linear_axis(pose_start, pose_goal):
     return free_axis, delta_goal, locked_delta, rot_err_deg
 
 
-def _plan_release_with_motiongen_constraint(
+def _build_official_approach_metric(planner, args, pose_start, pose_goal, *, label: str):
+    free_axis, delta_goal, locked_delta, rot_err_deg = _infer_goal_frame_free_linear_axis(pose_start, pose_goal)
+    if rot_err_deg > 5.0 or float(np.max(np.abs(locked_delta))) > 0.01:
+        print(
+            f"[curobo] {label} cannot use official approach metric cleanly "
+            f"(goal-frame rot_err={rot_err_deg:.2f} deg, locked_delta={np.round(locked_delta, 6)})"
+        )
+        return None
+    offset = float(abs(delta_goal[free_axis]))
+    if offset <= 1e-6:
+        return None
+    metric = planner.mods["PoseCostMetric"].create_grasp_approach_metric(
+        offset_position=offset,
+        linear_axis=free_axis,
+        tstep_fraction=float(getattr(args, "curobo_approach_metric_tstep_fraction", 0.8)),
+        tensor_args=planner.tensor_args,
+    )
+    metric.project_to_goal_frame = True
+    return metric, free_axis, delta_goal
+
+
+def _plan_with_official_approach_metric(
     planner,
     demo,
     args,
@@ -938,29 +1065,17 @@ def _plan_release_with_motiongen_constraint(
     *,
     label: str,
 ):
-    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
-    free_axis, delta_goal, locked_delta, rot_err_deg = _infer_goal_frame_free_linear_axis(pose_start, pose_goal)
-    if rot_err_deg > 5.0 or float(np.max(np.abs(locked_delta))) > 0.01:
-        print(
-            f"[curobo] {label} cannot use constrained MotionGen release cleanly "
-            f"(goal-frame rot_err={rot_err_deg:.2f} deg, locked_delta={np.round(locked_delta, 6)})"
-        )
+    metric_info = _build_official_approach_metric(planner, args, pose_start, pose_goal, label=label)
+    if metric_info is None:
         return None
-
-    hold_vec_weight = planner.tensor_args.to_device([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-    hold_vec_weight[3 + free_axis] = 0.0
-    metric = planner.mods["PoseCostMetric"](
-        hold_partial_pose=True,
-        hold_vec_weight=hold_vec_weight,
-        project_to_goal_frame=True,
-    )
+    metric, free_axis, delta_goal = metric_info
     planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
         demo,
         pose_goal,
         ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
     )
     print(
-        f"[curobo] {label} trying constrained MotionGen release "
+        f"[curobo] {label} trying official MotionGen approach metric "
         f"(free_goal_axis={free_axis}, goal_frame_delta={np.round(delta_goal, 6)})"
     )
     result = planner.plan_to_pose(
@@ -975,18 +1090,40 @@ def _plan_release_with_motiongen_constraint(
         pose_cost_metric=metric,
     )
     if not result.success or result.joint_path is None:
-        print(f"[curobo] {label} constrained MotionGen release failed with status={result.status}")
+        print(f"[curobo] {label} official MotionGen approach metric failed with status={result.status}")
         return None
     q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in result.joint_path]
     final_diag = _measure_realized_tcp_error(demo, q_path[-1], pose_goal)
     print(
-        f"[curobo] {label} constrained MotionGen realized tcp: "
+        f"[curobo] {label} official MotionGen realized tcp: "
         f"pos_err={final_diag['pos_err']:.4f} m, rot_err={final_diag['rot_err_deg']:.2f} deg"
     )
     if not _terminal_error_within_limits(final_diag, args):
-        print(f"[curobo] {label} constrained MotionGen misses the release pose too much")
+        print(f"[curobo] {label} official MotionGen misses the target pose too much")
         return None
     return q_path
+
+
+def _plan_release_with_motiongen_constraint(
+    planner,
+    demo,
+    args,
+    start_q,
+    pose_start,
+    pose_goal,
+    *,
+    label: str,
+):
+    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    return _plan_with_official_approach_metric(
+        planner,
+        demo,
+        args,
+        start_q,
+        pose_start,
+        pose_goal,
+        label=label,
+    )
 
 
 def _plan_short_curobo_cartesian_descent(
@@ -1439,92 +1576,23 @@ def _evaluate_two_step_grasp_candidates(
         print(f"[{label}] no pregrasp candidates succeeded")
         return []
 
-    print(f"[{label}] {len(pregrasp_successes)} pregrasp candidates succeeded, adding final approach")
-
-    # 第二步：为每个成功的pregrasp添加沿夹爪轴向的直线下降路径
-    final_successes = []
-    approach_steps = int(getattr(args, "grasp_final_approach_steps", 10))
-
     for pregrasp_success in pregrasp_successes:
-        try:
-            pregrasp_q = np.asarray(pregrasp_success["q_path"][-1], dtype=np.float32).reshape(-1)[:7]
-            pregrasp_pose = pregrasp_success["pose"]
-            grasp_pose = pregrasp_success["original_grasp_pose"]
+        pregrasp_q = np.asarray(pregrasp_success["q_path"][-1], dtype=np.float32).reshape(-1)[:7]
+        pregrasp_pose = pregrasp_success["pose"]
+        grasp_pose = pregrasp_success["original_grasp_pose"]
+        pregrasp_p = targeted.base.flatten_np(pregrasp_pose.p)[:3]
+        grasp_p = targeted.base.flatten_np(grasp_pose.p)[:3]
+        pregrasp_success["deferred_two_step_grasp"] = True
+        pregrasp_success["deferred_pregrasp_q"] = pregrasp_q
+        pregrasp_success["deferred_pregrasp_pose"] = pregrasp_pose
+        pregrasp_success["deferred_grasp_pose"] = grasp_pose
+        pregrasp_success["approach_distance_m"] = float(np.linalg.norm(grasp_p - pregrasp_p))
 
-            # 计算pregrasp到grasp的位置差（应该是沿夹爪轴向的）
-            pregrasp_p = targeted.base.flatten_np(pregrasp_pose.p)[:3]
-            grasp_p = targeted.base.flatten_np(grasp_pose.p)[:3]
-            approach_vector = grasp_p - pregrasp_p
-            approach_distance = float(np.linalg.norm(approach_vector))
-
-            if approach_distance < 1e-6:
-                print(f"[{label}] WARNING: pregrasp and grasp poses are identical, skipping")
-                continue
-
-            # 生成沿直线的中间pose
-            ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
-            final_approach_path = []
-
-            # 为每个中间点求解IK
-            for i in range(approach_steps + 1):
-                alpha = float(i) / float(approach_steps)
-                interp_p = pregrasp_p + alpha * approach_vector
-
-                # 保持姿态不变（使用grasp的姿态）
-                interp_pose = targeted.base.make_pose_with_position(grasp_pose, interp_p.astype(np.float32))
-
-                # 求解IK
-                planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
-                    demo,
-                    interp_pose,
-                    ee_link_name=ee_link_name,
-                )
-
-                # 使用前一个点作为IK的seed
-                seed_q = pregrasp_q if i == 0 else final_approach_path[-1]
-                ik_result = planner.solve_ik(
-                    seed_q,
-                    planner_pose,
-                    num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
-                )
-
-                if not ik_result.success:
-                    print(f"[{label}] IK failed at approach step {i}/{approach_steps}")
-                    break
-
-                q_interp = np.asarray(ik_result.joint_position, dtype=np.float32).reshape(-1)[:7]
-                final_approach_path.append(q_interp)
-
-            # 检查是否所有IK都成功
-            if len(final_approach_path) != approach_steps + 1:
-                print(f"[{label}] incomplete approach path for {pregrasp_success.get('label', '?')}, skipping")
-                continue
-
-            # 合并路径：pregrasp路径 + 最终接近路径
-            full_path = list(pregrasp_success["q_path"]) + final_approach_path[1:]  # 跳过第一个点避免重复
-
-            # 创建最终的成功记录
-            final_success = dict(pregrasp_success)
-            final_success["q_path"] = full_path
-            final_success["pose"] = grasp_pose  # 恢复为grasp pose
-            final_success["two_step_grasp"] = True
-            final_success["pregrasp_waypoints"] = len(pregrasp_success["q_path"])
-            final_success["approach_waypoints"] = len(final_approach_path)
-            final_success["approach_distance_m"] = approach_distance
-
-            final_successes.append(final_success)
-            print(
-                f"[{label}] generated two-step path for {pregrasp_success.get('label', '?')}: "
-                f"pregrasp={len(pregrasp_success['q_path'])} + approach={len(final_approach_path)} waypoints, "
-                f"distance={approach_distance*1000:.1f}mm"
-            )
-
-        except Exception as e:
-            print(f"[{label}] failed to add final approach for {pregrasp_success.get('label', '?')}: {e}")
-            continue
-
-    print(f"[{label}] {len(final_successes)} complete two-step grasp paths generated")
-    return final_successes
+    print(
+        f"[{label}] {len(pregrasp_successes)} pregrasp candidates succeeded; "
+        "official final approach will be attempted only for the selected grasp chain"
+    )
+    return pregrasp_successes
 
 
 def _evaluate_curobo_pose_candidates_goalset(
@@ -1676,6 +1744,72 @@ def _evaluate_curobo_pose_candidates_goalset(
             f"[curobo] {label} evaluating {len(remaining)} candidate(s) "
             f"in {num_chunks} batch chunk(s) of size <= {chunk_size}"
         )
+        if use_max_winners == 1 and len(remaining) > 1:
+            planner_poses = [
+                _convert_demo_tcp_pose_to_curobo_ee_pose(
+                    demo,
+                    item["pose"],
+                    ee_link_name=ee_link_name,
+                )
+                for item in remaining
+            ]
+            print(f"[curobo] {label} using official goalset fast-path for {len(remaining)} candidate(s)")
+            goalset_result = planner.plan_goalset_to_poses(
+                start_q,
+                planner_poses,
+                enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+                max_attempts=int(getattr(args, "curobo_max_attempts", 2) if max_attempts is None else max_attempts),
+                timeout=float(getattr(args, "curobo_timeout", 5.0) if timeout is None else timeout),
+                num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if num_ik_seeds is None else num_ik_seeds),
+                num_trajopt_seeds=int(
+                    getattr(args, "curobo_num_trajopt_seeds", 1) if num_trajopt_seeds is None else num_trajopt_seeds
+                ),
+                num_graph_seeds=int(
+                    getattr(args, "curobo_num_graph_seeds", 1) if num_graph_seeds is None else num_graph_seeds
+                ),
+            )
+            goal_idx = int((goalset_result.debug or {}).get("goalset_index", -1))
+            if goalset_result.success and goalset_result.joint_path is not None and 0 <= goal_idx < len(remaining):
+                candidate = remaining[goal_idx]
+                candidate_label = str(candidate["label"])
+                q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in goalset_result.joint_path]
+                terminal_align = _validate_curobo_terminal_pose(
+                    demo,
+                    args,
+                    q_path,
+                    candidate["pose"],
+                    label=candidate_label,
+                )
+                if terminal_align is not None:
+                    q_path = terminal_align["q_path"]
+                    if _validate_candidate_joint_path_with_demo_planner(
+                        demo,
+                        start_q,
+                        q_path,
+                        use_attach=use_attach,
+                        label=candidate_label,
+                    ):
+                        metrics, score = _path_metrics_and_score(start_q, q_path)
+                        selection_penalty = _candidate_selection_penalty(candidate, args)
+                        place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
+                        score = float(score) + float(selection_penalty) + float(place_pref_penalty)
+                        item = dict(candidate)
+                        item["result"] = goalset_result
+                        item["q_path"] = q_path
+                        item["metrics"] = metrics
+                        item["score"] = score
+                        item["selection_penalty"] = selection_penalty
+                        item["place_preference_penalty"] = place_pref_penalty
+                        item["terminal_align"] = terminal_align
+                        item["planner_pose"] = planner_poses[goal_idx]
+                        winners.append(item)
+                        print(
+                            f"[curobo] {candidate_label} goalset success: score={score:.3f}, "
+                            f"selection_penalty={selection_penalty:.3f}, "
+                            f"place_pref_penalty={place_pref_penalty:.3f}, "
+                            f"waypoints={metrics['waypoint_count']}"
+                        )
+                        return winners
         ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
         for chunk_idx, start_idx in enumerate(range(0, len(remaining), chunk_size), start=1):
             chunk = remaining[start_idx : start_idx + chunk_size]
@@ -2805,6 +2939,7 @@ def run_targeted_place_episode_curobo_direct(
 
     rule = None
     selected_joint_chain = None
+    two_step_pregrasp_lookup = {}
     if not args.skip_goal_motion:
         rule = targeted.get_place_rule(args.object_name)
         if rule is None:
@@ -2826,7 +2961,7 @@ def run_targeted_place_episode_curobo_direct(
     # 尝试两步抓取
     use_two_step_grasp = bool(getattr(args, "use_two_step_grasp", True))
     if use_two_step_grasp:
-        grasp_successes = _evaluate_two_step_grasp_candidates(
+        two_step_pregrasp_successes = _evaluate_two_step_grasp_candidates(
             planner,
             demo,
             args,
@@ -2837,27 +2972,28 @@ def run_targeted_place_episode_curobo_direct(
             include_active_object=True,
             disabled_world_collision_links=direct_grasp_disabled_links,
         )
-        if grasp_successes:
-            print(f"[grasp] using two-step grasp approach with {len(grasp_successes)} candidates")
+        if two_step_pregrasp_successes:
+            two_step_pregrasp_lookup = {
+                str(item.get("label", "")): item for item in list(two_step_pregrasp_successes or [])
+            }
+            print(f"[grasp] deferred two-step grasp is available for {len(two_step_pregrasp_lookup)} candidate(s)")
         else:
             print("[grasp] two-step grasp failed, falling back to single-step")
             use_two_step_grasp = False
 
-    # 如果两步抓取失败，回退到单步
-    if not use_two_step_grasp or not grasp_successes:
-        grasp_successes = _evaluate_curobo_pose_candidates_goalset(
-            planner,
-            demo,
-            args,
-            np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
-            grasp_candidates,
-            label="direct_grasp",
-            prefer_verticality=False,
-            use_attach=False,
-            max_winners=int(getattr(args, "direct_grasp_goalset_max_winners", 12)),
-            include_active_object=True,
-            disabled_world_collision_links=direct_grasp_disabled_links,
-        )
+    grasp_successes = _evaluate_curobo_pose_candidates_goalset(
+        planner,
+        demo,
+        args,
+        np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
+        grasp_candidates,
+        label="direct_grasp",
+        prefer_verticality=False,
+        use_attach=False,
+        max_winners=int(getattr(args, "direct_grasp_goalset_max_winners", 12)),
+        include_active_object=True,
+        disabled_world_collision_links=direct_grasp_disabled_links,
+    )
     if not grasp_successes:
         selected_pose = grasp_candidates[0]["pose"] if grasp_candidates else demo.build_topdown_grasp_pose()
         print("[FAIL] direct cuRobo grasp planning failed")
@@ -2903,6 +3039,14 @@ def run_targeted_place_episode_curobo_direct(
         selected_joint_chain = joint_chains[0]
         grasp_choice = selected_joint_chain["grasp_choice"]
 
+    grasp_choice = _apply_deferred_two_step_final_approach(
+        planner,
+        demo,
+        args,
+        grasp_choice,
+        two_step_pregrasp_lookup,
+    )
+
     ok, _ = targeted.base.execute_pose_path_stage(
         demo,
         bridge_mod,
@@ -2938,6 +3082,8 @@ def run_targeted_place_episode_curobo_direct(
         print("[dry-run] skipped real gripper close")
         targeted.base.sync_demo_gripper_state(demo, closed=True, steps=4)
         targeted.base.set_pregrasp_object_freeze(demo, False)
+
+    _stabilize_post_grasp_attached_state(demo, args, grasp_choice)
 
     targeted.base.lift_active_object_above_table_if_needed(
         demo,
@@ -2995,6 +3141,7 @@ def run_targeted_place_episode_curobo_direct(
             args,
             show_visual=False,
             activate_payload_visual=False,
+            T_tcp_obj_override=getattr(demo, "_transport_attached_T_tcp_obj", None),
         )
         return _plan_and_execute_return_to_cycle_start(
             demo,
@@ -3012,7 +3159,11 @@ def run_targeted_place_episode_curobo_direct(
     except Exception as exc:
         print(f"[FAIL] {exc}")
         return False
-    targeted._register_transport_attached_box(demo, args)
+    targeted._register_transport_attached_box(
+        demo,
+        args,
+        T_tcp_obj_override=getattr(demo, "_transport_attached_T_tcp_obj", None),
+    )
     _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, "post_grasp_escape", use_attach=True)
 
     direct_place_successes = None
@@ -3153,11 +3304,30 @@ def run_targeted_place_episode_curobo_direct(
     demo._attached_box_visual_visible = False
     demo._attached_object_visual_active = False
     targeted.base.update_attached_box_visual(demo, visible=False)
-    clearance_pose, q_clearance_path = targeted.base.plan_post_place_clearance_path(
+    clearance_pose = targeted.base.make_tcp_axis_retreat_pose(demo, 0.05)
+    _refresh_curobo_world(
+        planner,
         demo,
-        retreat_distance=0.05,
+        args,
+        label="post_place_clearance",
+        include_active_object=False,
+        include_table=bool(getattr(args, "curobo_table_collision", True)),
+    )
+    q_clearance_path = _plan_with_official_approach_metric(
+        planner,
+        demo,
+        args,
+        np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
+        demo.tcp.pose,
+        clearance_pose,
         label="post_place_clearance",
     )
+    if not q_clearance_path:
+        _, q_clearance_path = targeted.base.plan_post_place_clearance_path(
+            demo,
+            retreat_distance=0.05,
+            label="post_place_clearance",
+        )
     clearance_executed = False
     if q_clearance_path:
         ok, _ = targeted.base.execute_pose_path_stage(

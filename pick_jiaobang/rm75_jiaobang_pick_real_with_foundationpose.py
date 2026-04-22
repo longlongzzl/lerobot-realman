@@ -1746,6 +1746,32 @@ def update_attached_payload_pose(demo, active: bool | None = None):
 
 
 
+def force_active_object_to_attached_pose(demo) -> bool:
+    obj = getattr(getattr(demo, "base_env", None), "obj", None)
+    if obj is None or getattr(demo, "attached_box_pose_tcp", None) is None:
+        return False
+    T_world_obj = compute_world_attached_pose(demo)
+    if T_world_obj is None:
+        return False
+    pose = Pose.create_from_pq(
+        p=T_world_obj[:3, 3].astype(np.float32),
+        q=bridge_mod_mat2quat(T_world_obj[:3, :3]).astype(np.float32),
+    )
+    try:
+        obj.set_pose(pose)
+        zero_vel = np.zeros(3, dtype=np.float32)
+        for method_name in ("set_linear_velocity", "set_velocity"):
+            method = getattr(obj, method_name, None)
+            if callable(method):
+                method(zero_vel)
+        ang_method = getattr(obj, "set_angular_velocity", None)
+        if callable(ang_method):
+            ang_method(zero_vel)
+        return True
+    except Exception:
+        return False
+
+
 def update_attached_box_visual(demo, visible: bool | None = None):
     actor = getattr(demo, "attached_box_visual", None)
     attach_pose_tcp = getattr(demo, "attached_box_pose_tcp", None)
@@ -2619,14 +2645,22 @@ def pose_to_matrix(p_xyz, q_wxyz) -> np.ndarray:
     return T
 
 
-def make_attached_box_pose(demo, asset_box_size: np.ndarray) -> np.ndarray:
-    obj_p, obj_q = demo.get_obj_pose()
-    tcp_pose = demo.tcp.pose
-    tcp_p = flatten_np(tcp_pose.p)[:3]
-    tcp_q = flatten_np(tcp_pose.q)[:4]
-    T_world_obj = pose_to_matrix(obj_p, obj_q)
-    T_world_tcp = pose_to_matrix(tcp_p, tcp_q)
-    T_tcp_obj = np.linalg.inv(T_world_tcp) @ T_world_obj
+def make_attached_box_pose(
+    demo,
+    asset_box_size: np.ndarray,
+    *,
+    T_tcp_obj_override: np.ndarray | None = None,
+) -> np.ndarray:
+    if T_tcp_obj_override is None:
+        obj_p, obj_q = demo.get_obj_pose()
+        tcp_pose = demo.tcp.pose
+        tcp_p = flatten_np(tcp_pose.p)[:3]
+        tcp_q = flatten_np(tcp_pose.q)[:4]
+        T_world_obj = pose_to_matrix(obj_p, obj_q)
+        T_world_tcp = pose_to_matrix(tcp_p, tcp_q)
+        T_tcp_obj = np.linalg.inv(T_world_tcp) @ T_world_obj
+    else:
+        T_tcp_obj = np.asarray(T_tcp_obj_override, dtype=np.float32).reshape(4, 4)
     attach_pose = np.concatenate([T_tcp_obj[:3, 3], bridge_mod_mat2quat(T_tcp_obj[:3, :3])]).astype(np.float32)
     return attach_pose
 

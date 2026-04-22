@@ -89,8 +89,8 @@ class RM75CuRoboPlannerConfig:
     position_threshold: float = 0.005
     rotation_threshold: float = 0.05
     use_cuda_graph: bool = False
-    self_collision_check: bool = False
-    self_collision_opt: bool = False
+    self_collision_check: bool = True
+    self_collision_opt: bool = True
     collision_activation_distance: float = 0.02
 
 
@@ -884,6 +884,18 @@ class RM75CuRoboPlanner:
             )
             self._attached_object_active = bool(ok)
             if ok:
+                try:
+                    sphere_tensor = (
+                        self.motion_gen.robot_cfg.kinematics.kinematics_config.get_link_spheres(str(link_name))
+                        .clone()
+                    )
+                    self.ik_solver.attach_object_to_robot(
+                        sphere_radius=0.0,
+                        sphere_tensor=sphere_tensor,
+                        link_name=str(link_name),
+                    )
+                except Exception as exc:
+                    print(f"[curobo] failed to mirror attached object spheres to ik_solver: {exc}")
                 n_spheres = self.motion_gen.robot_cfg.kinematics.kinematics_config.get_number_of_spheres(link_name)
                 print(
                     f"[curobo] attached object box {np.round(dims, 4).tolist()} "
@@ -904,6 +916,10 @@ class RM75CuRoboPlanner:
             return
         try:
             self.motion_gen.detach_object_from_robot(link_name=str(link_name))
+            try:
+                self.ik_solver.detach_object_from_robot(link_name=str(link_name))
+            except Exception as exc:
+                print(f"[curobo] ik_solver detach_object_from_robot failed: {exc}")
             self._attached_object_active = False
             print(f"[curobo] detached object from link={link_name}")
         except Exception as exc:
