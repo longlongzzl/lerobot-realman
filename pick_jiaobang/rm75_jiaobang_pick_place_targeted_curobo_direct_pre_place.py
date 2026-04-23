@@ -282,7 +282,7 @@ def build_arg_parser():
     parser.add_argument(
         "--curobo-attach-world-z-offset-m",
         type=float,
-        default=0.003,
+        default=0.002,
         help="When attaching the grasped object into cuRobo, first apply this small world-frame +Z offset. "
         "Useful for objects that are still lightly touching the table at the instant of attach.",
     )
@@ -549,6 +549,8 @@ def _world_obstacle_signature(cuboids, meshes):
 
 def _visualize_attached_spheres(planner, demo, args):
     """Print and optionally visualize the attached object collision spheres."""
+    if not bool(getattr(args, "curobo_debug", False)):
+        return
     current_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     spheres = planner.get_attached_spheres_world(current_q)
     if not spheres:
@@ -633,7 +635,7 @@ def _refresh_curobo_world(
                 meshes=meshes,
                 label=label,
             )
-        if planner.attached_object_active:
+        if planner.attached_object_active and bool(getattr(args, "curobo_debug", False)):
             _visualize_attached_spheres(planner, demo, args)
         else:
             _clear_visualized_attached_spheres(demo)
@@ -1645,7 +1647,7 @@ def _evaluate_two_step_grasp_candidates(
 
     print(
         f"[{label}] {len(pregrasp_successes)} pregrasp candidates succeeded; "
-        "official final approach will be attempted only for the selected grasp chain"
+        "official final approach will be attempted only once for the final selected grasp"
     )
     return pregrasp_successes
 
@@ -3042,21 +3044,11 @@ def run_targeted_place_episode_curobo_direct(
         )
         return False
 
-    grasp_successes = []
-    for pregrasp_success in list(two_step_pregrasp_successes or []):
-        completed = _apply_deferred_two_step_final_approach(
-            planner,
-            demo,
-            args,
-            pregrasp_success,
-            two_step_pregrasp_lookup,
-        )
-        if bool(completed.get("two_step_grasp", False)):
-            grasp_successes.append(completed)
+    grasp_successes = list(two_step_pregrasp_successes or [])
     grasp_successes.sort(key=_candidate_sort_key)
     if not grasp_successes:
         selected_pose = grasp_candidates[0]["pose"] if grasp_candidates else demo.build_topdown_grasp_pose()
-        print("[FAIL] explicit two-step final approach failed for all grasp candidates")
+        print("[FAIL] two-step grasp pregrasp produced no selectable candidates")
         targeted.base.inspect_failed_pose(
             demo,
             bridge_mod,
@@ -3098,6 +3090,29 @@ def run_targeted_place_episode_curobo_direct(
             return False
         selected_joint_chain = joint_chains[0]
         grasp_choice = selected_joint_chain["grasp_choice"]
+
+    grasp_choice = _apply_deferred_two_step_final_approach(
+        planner,
+        demo,
+        args,
+        grasp_choice,
+        two_step_pregrasp_lookup,
+    )
+    if not bool(grasp_choice.get("two_step_grasp", False)):
+        failed_pose = grasp_choice.get("deferred_grasp_pose", grasp_choice.get("original_grasp_pose", grasp_choice.get("pose")))
+        print("[FAIL] explicit two-step final approach failed for the selected grasp candidate")
+        targeted.base.inspect_failed_pose(
+            demo,
+            bridge_mod,
+            "grasp",
+            args,
+            pose=failed_pose,
+            gripper_closed=False,
+            candidate_poses=[item.get("deferred_grasp_pose", item.get("original_grasp_pose", item["pose"])) for item in grasp_successes],
+        )
+        return False
+    if selected_joint_chain is not None:
+        selected_joint_chain["grasp_choice"] = grasp_choice
 
     pregrasp_waypoints = int(max(grasp_choice.get("pregrasp_waypoints", 0), 0))
     if pregrasp_waypoints > 0:
@@ -3216,7 +3231,7 @@ def run_targeted_place_episode_curobo_direct(
                 current_q,
                 attach_box_dims,
                 object_pose_world=(obj_p_attach, obj_q_attach),
-                world_z_offset=float(getattr(args, "curobo_attach_world_z_offset_m", 0.003)),
+                world_z_offset=float(getattr(args, "curobo_attach_world_z_offset_m", 0.002)),
             )
             if planner.attached_object_active:
                 _visualize_attached_spheres(planner, demo, args)

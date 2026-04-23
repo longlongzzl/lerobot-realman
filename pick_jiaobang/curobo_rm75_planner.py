@@ -605,7 +605,6 @@ class RM75CuRoboPlanner:
         goal_poses = list(goal_poses or [])
         if len(goal_poses) == 0:
             return CuRoboPlanResult(success=False, status="EMPTY_GOALSET")
-
         start_q_np = self._normalize_q(start_q)
         start_state = self._make_start_state(start_q_np)
         goal = self._make_goalset_pose(goal_poses)
@@ -1311,7 +1310,11 @@ class RM75CuRoboPlanner:
             num_seeds=int(self.config.num_ik_seeds),
             position_threshold=float(self.config.position_threshold),
             rotation_threshold=float(self.config.rotation_threshold),
-            use_cuda_graph=bool(self.config.use_cuda_graph),
+            # IKSolver in this local cuRobo build cannot safely switch between
+            # solve_single/solve_batch goal types under cuda graph capture on
+            # CUDA < 12 graph reset support. Keep MotionGen graph-enabled, but
+            # leave IK in eager mode to avoid "changing goal type" crashes.
+            use_cuda_graph=False,
             self_collision_check=bool(self.config.self_collision_check),
             self_collision_opt=bool(self.config.self_collision_opt),
         )
@@ -1334,6 +1337,7 @@ class RM75CuRoboPlanner:
             self_collision_opt=bool(self.config.self_collision_opt),
         )
         return self.mods["MotionGen"](motion_gen_config)
+
 
     def _world_without_obstacles(self, world, *, excluded_names: set[str]):
         excluded_names = {str(x) for x in excluded_names}
