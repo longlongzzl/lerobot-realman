@@ -963,11 +963,18 @@ class RM75JiaobangPickMove:
     def build_pregrasp_pose(self, grasp_pose):
         p = flatten(grasp_pose.p)[:3].copy()
         q = flatten(grasp_pose.q)[:4].copy()
-        # For top-down grasping, retreating strictly along world +Z is more
-        # stable than following the local approach axis, which can introduce a
-        # lateral offset and place the nominal pregrasp pose into the target or
-        # nearby clutter.
-        p[2] = p[2] + float(self.args.pregrasp_height)
+        R_tcp = quat2mat_np(q)
+        approach_axis = np.asarray(R_tcp[:, 2], dtype=np.float64).reshape(3)
+        retreat = -approach_axis * float(self.args.pregrasp_height)
+        # For nearly vertical top-down grasps, keeping the historical world +Z
+        # retreat remains the most stable behavior. Once the chosen grasp is
+        # meaningfully tilted, however, the pregrasp must be backed off along
+        # the grasp's local approach axis so the final segment stays a clean
+        # straight-line approach in the goal frame.
+        if float(np.linalg.norm(retreat[:2])) <= 0.002:
+            p[2] = p[2] + float(self.args.pregrasp_height)
+        else:
+            p = p + retreat
         return sapien.Pose(p, q)
 
     def build_goal_tcp_pose(self, grasp_pose=None):
@@ -1159,7 +1166,8 @@ class RM75JiaobangPickMove:
         print("\n[test_pose_build]")
         assert len(flatten(grasp_pose.p)) == 3
         assert len(flatten(grasp_pose.q)) == 4
-        assert abs(flatten(pregrasp_pose.p)[2] - flatten(grasp_pose.p)[2] - self.args.pregrasp_height) < 1e-8
+        pregrasp_delta = flatten(pregrasp_pose.p)[:3] - flatten(grasp_pose.p)[:3]
+        assert abs(np.linalg.norm(pregrasp_delta) - self.args.pregrasp_height) < 1e-8
         assert len(flatten(goal_tcp_pose.p)) == 3
         print("pass")
 

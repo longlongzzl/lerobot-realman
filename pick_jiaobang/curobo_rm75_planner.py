@@ -212,6 +212,146 @@ class RM75CuRoboPlanner:
             self._world = original_world
         return diagnosis
 
+    def _compute_world_link_spheres(self, q: Sequence[float]) -> np.ndarray:
+        q_np = self._normalize_q(q)
+        joint_state = self._make_start_state(q_np)
+        kin_state = self.motion_gen.compute_kinematics(joint_state)
+        link_spheres = getattr(kin_state, "link_spheres_tensor", None)
+        if link_spheres is None and hasattr(kin_state, "get_link_spheres"):
+            link_spheres = kin_state.get_link_spheres()
+        if link_spheres is None:
+            q_tensor = getattr(joint_state, "position", None)
+            if q_tensor is None:
+                raise RuntimeError("joint state does not expose position tensor")
+            kin_state = self.motion_gen.kinematics.get_state(q_tensor)
+            link_spheres = getattr(kin_state, "link_spheres_tensor", None)
+            if link_spheres is None and hasattr(kin_state, "get_link_spheres"):
+                link_spheres = kin_state.get_link_spheres()
+        if link_spheres is None:
+            raise RuntimeError("kinematics state does not expose link spheres")
+        if hasattr(link_spheres, "detach"):
+            link_spheres = link_spheres.detach().cpu().numpy()
+        link_spheres = np.asarray(link_spheres, dtype=np.float32)
+        if link_spheres.ndim == 3:
+            link_spheres = link_spheres[0]
+        return link_spheres.reshape(-1, 4)
+
+    def _collision_sphere_link_names(self) -> list[str]:
+        kin_cfg = self.motion_gen.robot_cfg.kinematics.kinematics_config
+        link_idx_map = getattr(kin_cfg, "link_name_to_idx_map", {}) or {}
+        idx_to_name = {int(v): str(k) for k, v in link_idx_map.items()}
+        sphere_link_idx = getattr(kin_cfg, "link_sphere_idx_map", None)
+        if sphere_link_idx is None:
+            return []
+        if hasattr(sphere_link_idx, "detach"):
+            sphere_link_idx = sphere_link_idx.detach().cpu().numpy()
+        sphere_link_idx = np.asarray(sphere_link_idx).reshape(-1)
+        return [idx_to_name.get(int(idx), f"link_idx_{int(idx)}") for idx in sphere_link_idx.tolist()]
+
+    def _self_collision_ignore_pairs(self) -> set[tuple[str, str]]:
+        robot_cfg_dict: Mapping[str, Any] = self.robot_cfg_dict
+        if "robot_cfg" in robot_cfg_dict:
+            robot_cfg_dict = robot_cfg_dict["robot_cfg"]
+        ignore_cfg = (robot_cfg_dict.get("kinematics", {}) or {}).get("self_collision_ignore") or {}
+        ignore_pairs: set[tuple[str, str]] = set()
+        for link_a, ignored_links in dict(ignore_cfg).items():
+            a = str(link_a)
+            for link_b in list(ignored_links or []):
+                b = str(link_b)
+                if not a or not b:
+                    continue
+                ignore_pairs.add(tuple(sorted((a, b))))
+        return ignore_pairs
+
+    def _self_collision_buffers(self) -> dict[str, float]:
+        robot_cfg_dict: Mapping[str, Any] = self.robot_cfg_dict
+        if "robot_cfg" in robot_cfg_dict:
+            robot_cfg_dict = robot_cfg_dict["robot_cfg"]
+        buffer_cfg = (robot_cfg_dict.get("kinematics", {}) or {}).get("self_collision_buffer") or {}
+        return {str(k): float(v) for k, v in dict(buffer_cfg).items()}
+
+    def diagnose_start_state_self_collision(self, q: Sequence[float], *, top_k: int = 10) -> dict[str, Any]:
+        q_np = self._normalize_q(q)
+        valid, status = self.check_start_state(q_np)
+        diagnosis: dict[str, Any] = {
+            "valid": bool(valid),
+            "status": status,
+            "pairs": [],
+            "link_pairs": [],
+        }
+        if valid or status != "MotionGenStatus.INVALID_START_STATE_SELF_COLLISION":
+            return diagnosis
+        try:
+            spheres = self._compute_world_link_spheres(q_np)
+            sphere_link_names = self._collision_sphere_link_names()
+        except Exception as exc:
+            diagnosis["error"] = str(exc)
+            return diagnosis
+        if len(sphere_link_names) != spheres.shape[0]:
+            diagnosis["error"] = (
+                f"sphere/link count mismatch: n_spheres={spheres.shape[0]} "
+                f"n_link_names={len(sphere_link_names)}"
+            )
+            return diagnosis
+
+        ignore_pairs = self._self_collision_ignore_pairs()
+        buffer_by_link = self._self_collision_buffers()
+        pair_records: list[dict[str, Any]] = []
+        link_pair_best: dict[tuple[str, str], dict[str, Any]] = {}
+        for i in range(spheres.shape[0]):
+            c_i = spheres[i, :3]
+            r_i = float(spheres[i, 3])
+            link_i = sphere_link_names[i]
+            for j in range(i + 1, spheres.shape[0]):
+                link_j = sphere_link_names[j]
+                if link_i == link_j:
+                    continue
+                pair_key = tuple(sorted((link_i, link_j)))
+                if pair_key in ignore_pairs:
+                    continue
+                c_j = spheres[j, :3]
+                r_j = float(spheres[j, 3])
+                center_dist = float(np.linalg.norm(c_i - c_j))
+                threshold = (
+                    r_i
+                    + r_j
+                    + float(buffer_by_link.get(link_i, 0.0))
+                    + float(buffer_by_link.get(link_j, 0.0))
+                )
+                overlap = threshold - center_dist
+                if overlap <= 0.0:
+                    continue
+                record = {
+                    "sphere_i": int(i),
+                    "sphere_j": int(j),
+                    "link_i": link_i,
+                    "link_j": link_j,
+                    "overlap": float(overlap),
+                    "center_distance": float(center_dist),
+                    "threshold": float(threshold),
+                }
+                pair_records.append(record)
+                current_best = link_pair_best.get(pair_key)
+                if current_best is None or float(record["overlap"]) > float(current_best["overlap"]):
+                    link_pair_best[pair_key] = {
+                        "link_a": pair_key[0],
+                        "link_b": pair_key[1],
+                        "overlap": float(record["overlap"]),
+                        "count": 1,
+                    }
+                else:
+                    current_best["count"] = int(current_best.get("count", 1)) + 1
+
+        pair_records.sort(key=lambda x: (-float(x["overlap"]), str(x["link_i"]), str(x["link_j"])))
+        link_pair_records = sorted(
+            link_pair_best.values(),
+            key=lambda x: (-float(x["overlap"]), str(x["link_a"]), str(x["link_b"])),
+        )
+        use_top_k = max(int(top_k), 0)
+        diagnosis["pairs"] = pair_records if use_top_k <= 0 else pair_records[:use_top_k]
+        diagnosis["link_pairs"] = link_pair_records if use_top_k <= 0 else link_pair_records[:use_top_k]
+        return diagnosis
+
     def solve_ik(
         self,
         start_q: Sequence[float],
@@ -660,7 +800,28 @@ class RM75CuRoboPlanner:
         )
 
         self.motion_gen.reset_seed()
-        result = self.motion_gen.plan_batch(start_state, goal, plan_config)
+        try:
+            result = self.motion_gen.plan_batch(start_state, goal, plan_config)
+        except Exception as exc:
+            print(
+                "[curobo] plan_batch_start_goal_pairs failed inside motion_gen.plan_batch; "
+                f"falling back to per-pair planning ({type(exc).__name__}: {exc})"
+            )
+            outputs: list[CuRoboPlanResult] = []
+            for start_q, goal_pose in zip(start_qs, goal_poses):
+                outputs.append(
+                    self.plan_to_pose(
+                        start_q,
+                        goal_pose,
+                        enable_graph=enable_graph,
+                        max_attempts=max_attempts,
+                        timeout=timeout,
+                        num_ik_seeds=num_ik_seeds,
+                        num_trajopt_seeds=num_trajopt_seeds,
+                        num_graph_seeds=num_graph_seeds,
+                    )
+                )
+            return outputs
         success_arr = self._to_numpy(result.success).reshape(-1).astype(bool)
         status = None if result.status is None else str(result.status)
         paths = self._extract_batch_paths(result, len(goal_poses))
@@ -842,6 +1003,77 @@ class RM75CuRoboPlanner:
         self.ik_solver.update_world(self._empty_world)
         self._world = self._empty_world
 
+    @staticmethod
+    def _quat_wxyz_to_rotmat(quaternion: Sequence[float]) -> np.ndarray:
+        q = np.asarray(quaternion, dtype=np.float32).reshape(4)
+        norm = float(np.linalg.norm(q))
+        if norm <= 1e-8:
+            return np.eye(3, dtype=np.float32)
+        w, x, y, z = (q / norm).tolist()
+        return np.asarray(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            ],
+            dtype=np.float32,
+        )
+
+    def _build_linear_attached_sphere_tensor(
+        self,
+        *,
+        q: Sequence[float],
+        box_dims: Sequence[float],
+        object_pose_world: Any,
+        link_name: str,
+        sphere_count: int,
+        world_z_offset: float = 0.0,
+    ):
+        torch = self.mods["torch"]
+        dims = np.asarray(box_dims, dtype=np.float32).reshape(3)
+        axis_idx = int(np.argmax(dims))
+        short_axes = [i for i in range(3) if i != axis_idx]
+        long_dim = float(dims[axis_idx])
+        short_dim = float(max(dims[short_axes[0]], dims[short_axes[1]]))
+        # Bias slightly conservative on radius/extent so thin long objects do not
+        # end up visually or collision-wise shorter than their transport box.
+        sphere_radius = max(0.003, 0.48 * short_dim)
+
+        # Put the end-sphere centers slightly closer to the ends than the strict
+        # inscribed solution. This intentionally over-covers by a small margin so
+        # the effective payload length does not come out shorter than the box.
+        end_cover_margin = max(0.0015, 0.14 * short_dim)
+        center_limit = max(0.0, 0.5 * long_dim + end_cover_margin - sphere_radius)
+        if sphere_count <= 1 or center_limit <= 1e-6:
+            axis_positions = np.zeros((sphere_count,), dtype=np.float32)
+        else:
+            axis_positions = np.linspace(-center_limit, center_limit, sphere_count, dtype=np.float32)
+
+        local_centers = np.zeros((sphere_count, 3), dtype=np.float32)
+        local_centers[:, axis_idx] = axis_positions
+
+        obj_p, obj_q = self._extract_pose_components(object_pose_world)
+        obj_p = obj_p.astype(np.float32).copy()
+        obj_p[2] += float(world_z_offset)
+        obj_R = self._quat_wxyz_to_rotmat(obj_q)
+        world_centers = (obj_R @ local_centers.T).T + obj_p.reshape(1, 3)
+
+        q_np = self._normalize_q(q)
+        joint_state = self._make_start_state(q_np)
+        kin_state = self.motion_gen.compute_kinematics(joint_state)
+        ee_p = self._to_numpy(kin_state.ee_pose.position).reshape(-1, 3)[0].astype(np.float32)
+        ee_q = self._to_numpy(kin_state.ee_pose.quaternion).reshape(-1, 4)[0].astype(np.float32)
+        ee_R = self._quat_wxyz_to_rotmat(ee_q)
+        ee_centers = ((ee_R.T) @ (world_centers - ee_p.reshape(1, 3)).T).T
+
+        max_spheres = int(self.motion_gen.robot_cfg.kinematics.kinematics_config.get_number_of_spheres(link_name))
+        sphere_tensor = np.zeros((max_spheres, 4), dtype=np.float32)
+        sphere_tensor[:, 3] = -10.0
+        fill_count = min(int(sphere_count), max_spheres)
+        sphere_tensor[:fill_count, :3] = ee_centers[:fill_count]
+        sphere_tensor[:fill_count, 3] = float(sphere_radius)
+        return torch.as_tensor(sphere_tensor, device=self.tensor_args.device, dtype=self.tensor_args.dtype), sphere_radius
+
     def attach_object_box_to_robot(
         self,
         q: Sequence[float],
@@ -849,6 +1081,8 @@ class RM75CuRoboPlanner:
         *,
         link_name: str = "attached_object",
         surface_sphere_radius: float | None = None,
+        object_pose_world: Any | None = None,
+        world_z_offset: float = 0.0,
     ) -> bool:
         """Attach a box-shaped object to the robot in cuRobo collision checking.
 
@@ -862,25 +1096,76 @@ class RM75CuRoboPlanner:
         q_np = self._normalize_q(q)
         joint_state = self._make_start_state(q_np)
         dims = np.asarray(box_dims, dtype=np.float32).reshape(3)
+        extent_ratio = float(np.max(dims) / max(1e-6, float(np.min(dims))))
+        max_spheres = int(self.motion_gen.robot_cfg.kinematics.kinematics_config.get_number_of_spheres(link_name))
         if surface_sphere_radius is None:
             surface_sphere_radius = float(dims.min()) * 0.5
             surface_sphere_radius = max(surface_sphere_radius, 0.003)
+        prefer_linear_long_axis = bool(extent_ratio >= 2.0 and max_spheres >= 4 and object_pose_world is not None)
         try:
             from curobo.geom.types import Cuboid as CuRoboCuboid
         except ImportError:
             print("[curobo] could not import Cuboid from curobo.geom.types; attach skipped")
             return False
+        if object_pose_world is None:
+            obstacle_pose = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+        else:
+            position, quaternion = self._extract_pose_components(object_pose_world)
+            obstacle_pose = np.concatenate([position, quaternion]).astype(np.float32).tolist()
         box_obstacle = CuRoboCuboid(
             name="attached_payload",
-            pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            pose=obstacle_pose,
             dims=dims.tolist(),
         )
         try:
+            if prefer_linear_long_axis:
+                sphere_tensor, manual_radius = self._build_linear_attached_sphere_tensor(
+                    q=q_np,
+                    box_dims=dims,
+                    object_pose_world=object_pose_world,
+                    link_name=str(link_name),
+                    sphere_count=min(6, max_spheres),
+                    world_z_offset=float(world_z_offset),
+                )
+                self.motion_gen.attach_spheres_to_robot(
+                    sphere_radius=0.0,
+                    sphere_tensor=sphere_tensor,
+                    link_name=str(link_name),
+                )
+                try:
+                    self.ik_solver.attach_object_to_robot(
+                        sphere_radius=0.0,
+                        sphere_tensor=sphere_tensor.clone(),
+                        link_name=str(link_name),
+                    )
+                except Exception as exc:
+                    print(f"[curobo] failed to mirror manual attached spheres to ik_solver: {exc}")
+                self._attached_object_active = True
+                covered_length = 0.0
+                if min(6, max_spheres) > 0:
+                    covered_length = 2.0 * (center_limit + manual_radius)
+                print(
+                    f"[curobo] attached long-axis object {np.round(dims, 4).tolist()} "
+                    f"to link={link_name} with {min(6, max_spheres)} manual spheres, "
+                    f"manual_sphere_radius={float(manual_radius)*1000:.1f}mm, "
+                    f"covered_length={float(covered_length)*1000:.1f}mm/{float(np.max(dims))*1000:.1f}mm, "
+                    f"world_object_z_offset={float(world_z_offset)*1000:.1f}mm, "
+                    f"object_world_p={np.round(np.asarray(obstacle_pose[:3], dtype=np.float32), 4).tolist()}"
+                )
+                return True
+            world_objects_pose_offset = None
+            if abs(float(world_z_offset)) > 1e-8:
+                try:
+                    Pose = self.mods["Pose"]
+                except Exception:
+                    from curobo.types.math import Pose  # type: ignore
+                world_objects_pose_offset = Pose.from_list([0.0, 0.0, float(world_z_offset), 1.0, 0.0, 0.0, 0.0])
             ok = self.motion_gen.attach_external_objects_to_robot(
                 joint_state=joint_state,
                 external_objects=[box_obstacle],
                 surface_sphere_radius=float(surface_sphere_radius),
                 link_name=str(link_name),
+                world_objects_pose_offset=world_objects_pose_offset,
             )
             self._attached_object_active = bool(ok)
             if ok:
@@ -900,7 +1185,9 @@ class RM75CuRoboPlanner:
                 print(
                     f"[curobo] attached object box {np.round(dims, 4).tolist()} "
                     f"to link={link_name} with {n_spheres} spheres, "
-                    f"surface_sphere_radius={float(surface_sphere_radius)*1000:.1f}mm"
+                    f"surface_sphere_radius={float(surface_sphere_radius)*1000:.1f}mm, "
+                    f"world_object_z_offset={float(world_z_offset)*1000:.1f}mm, "
+                    f"object_world_p={np.round(np.asarray(obstacle_pose[:3], dtype=np.float32), 4).tolist()}"
                 )
             else:
                 print("[curobo] attach_external_objects_to_robot returned False")
@@ -937,7 +1224,17 @@ class RM75CuRoboPlanner:
             q_np = self._normalize_q(q)
             joint_state = self._make_start_state(q_np)
             kin_state = self.motion_gen.compute_kinematics(joint_state)
-            link_spheres = kin_state.link_spheres_tensor
+            link_spheres = getattr(kin_state, "link_spheres_tensor", None)
+            if link_spheres is None and hasattr(kin_state, "get_link_spheres"):
+                link_spheres = kin_state.get_link_spheres()
+            if link_spheres is None:
+                q_tensor = getattr(joint_state, "position", None)
+                if q_tensor is None:
+                    return []
+                kin_state = self.motion_gen.kinematics.get_state(q_tensor)
+                link_spheres = getattr(kin_state, "link_spheres_tensor", None)
+                if link_spheres is None and hasattr(kin_state, "get_link_spheres"):
+                    link_spheres = kin_state.get_link_spheres()
             kin_cfg = self.motion_gen.robot_cfg.kinematics.kinematics_config
             link_names = kin_cfg.link_names
             if link_name not in link_names:
