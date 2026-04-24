@@ -74,7 +74,7 @@ robot_cfg:
 
     self_collision_ignore:
       {
-        "base_link": ["link_1", "link_2"],
+        "base_link": ["link_1", "link_2", "attached_object"],
         "link_1": ["link_2", "link_3"],
         "link_2": ["link_3", "link_4"],
         "link_3": ["link_4", "link_5"],
@@ -97,12 +97,12 @@ robot_cfg:
             "right_pad",
             "attached_object",
           ],
-        "gripper_Left_1_Link": ["gripper_Left_Support_Link", "gripper_Left_2_Link", "left_pad"],
-        "gripper_Left_Support_Link": ["gripper_Left_2_Link", "left_pad"],
-        "gripper_Left_2_Link": ["left_pad"],
-        "gripper_Right_1_Link": ["gripper_Right_Support_Link", "gripper_Right_2_Link", "right_pad"],
-        "gripper_Right_Support_Link": ["gripper_Right_2_Link", "right_pad"],
-        "gripper_Right_2_Link": ["right_pad"],
+        "gripper_Left_1_Link": ["gripper_Left_Support_Link", "gripper_Left_2_Link", "left_pad", "attached_object"],
+        "gripper_Left_Support_Link": ["gripper_Left_2_Link", "left_pad", "attached_object"],
+        "gripper_Left_2_Link": ["gripper_Right_2_Link", "left_pad", "attached_object"],
+        "gripper_Right_1_Link": ["gripper_Right_Support_Link", "gripper_Right_2_Link", "right_pad", "attached_object"],
+        "gripper_Right_Support_Link": ["gripper_Right_2_Link", "right_pad", "attached_object"],
+        "gripper_Right_2_Link": ["right_pad", "attached_object"],
         "left_pad": ["right_pad", "attached_object"],
         "right_pad": ["attached_object"],
       }

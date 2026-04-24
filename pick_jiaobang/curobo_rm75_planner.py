@@ -689,6 +689,24 @@ class RM75CuRoboPlanner:
                 num_graph_seeds=num_graph_seeds,
             )
             return [single_result]
+        if bool(enable_graph):
+            print(
+                "[curobo] plan_batch_to_poses requested graph planning; "
+                "falling back to per-goal planning because cuRobo batch graph supports only one graph seed"
+            )
+            return [
+                self.plan_to_pose(
+                    start_q,
+                    goal_pose,
+                    enable_graph=enable_graph,
+                    max_attempts=max_attempts,
+                    timeout=timeout,
+                    num_ik_seeds=num_ik_seeds,
+                    num_trajopt_seeds=num_trajopt_seeds,
+                    num_graph_seeds=num_graph_seeds,
+                )
+                for goal_pose in goal_poses
+            ]
 
         start_q_np = self._normalize_q(start_q)
         start_state = self._make_batched_start_state(start_q_np, len(goal_poses))
@@ -713,7 +731,28 @@ class RM75CuRoboPlanner:
         )
 
         self.motion_gen.reset_seed()
-        result = self.motion_gen.plan_batch(start_state, goal, plan_config)
+        try:
+            result = self.motion_gen.plan_batch(start_state, goal, plan_config)
+        except Exception as exc:
+            print(
+                "[curobo] plan_batch_to_poses failed inside motion_gen.plan_batch; "
+                f"falling back to per-goal planning ({type(exc).__name__}: {exc})"
+            )
+            outputs: list[CuRoboPlanResult] = []
+            for goal_pose in goal_poses:
+                outputs.append(
+                    self.plan_to_pose(
+                        start_q,
+                        goal_pose,
+                        enable_graph=enable_graph,
+                        max_attempts=max_attempts,
+                        timeout=timeout,
+                        num_ik_seeds=num_ik_seeds,
+                        num_trajopt_seeds=num_trajopt_seeds,
+                        num_graph_seeds=num_graph_seeds,
+                    )
+                )
+            return outputs
         success_arr = self._to_numpy(result.success).reshape(-1).astype(bool)
         status = None if result.status is None else str(result.status)
         paths = self._extract_batch_paths(result, len(goal_poses))
@@ -776,6 +815,24 @@ class RM75CuRoboPlanner:
                 num_graph_seeds=num_graph_seeds,
             )
             return [single_result]
+        if bool(enable_graph):
+            print(
+                "[curobo] plan_batch_start_goal_pairs requested graph planning; "
+                "falling back to per-pair planning because cuRobo batch graph supports only one graph seed"
+            )
+            return [
+                self.plan_to_pose(
+                    start_q,
+                    goal_pose,
+                    enable_graph=enable_graph,
+                    max_attempts=max_attempts,
+                    timeout=timeout,
+                    num_ik_seeds=num_ik_seeds,
+                    num_trajopt_seeds=num_trajopt_seeds,
+                    num_graph_seeds=num_graph_seeds,
+                )
+                for start_q, goal_pose in zip(start_qs, goal_poses)
+            ]
 
         start_state = self._make_multi_start_state(start_qs)
         goal = self._make_batch_pose(goal_poses)
@@ -1027,21 +1084,22 @@ class RM75CuRoboPlanner:
         link_name: str,
         sphere_count: int,
         world_z_offset: float = 0.0,
+        radius_scale: float = 0.48,
+        end_cover_margin_scale: float = 0.14,
+        length_scale: float = 1.0,
     ):
         torch = self.mods["torch"]
         dims = np.asarray(box_dims, dtype=np.float32).reshape(3)
+        dims = dims.copy()
         axis_idx = int(np.argmax(dims))
+        if float(length_scale) > 0.0:
+            dims[axis_idx] *= float(length_scale)
         short_axes = [i for i in range(3) if i != axis_idx]
         long_dim = float(dims[axis_idx])
         short_dim = float(max(dims[short_axes[0]], dims[short_axes[1]]))
-        # Bias slightly conservative on radius/extent so thin long objects do not
-        # end up visually or collision-wise shorter than their transport box.
-        sphere_radius = max(0.003, 0.48 * short_dim)
+        sphere_radius = max(0.0025, float(radius_scale) * short_dim)
 
-        # Put the end-sphere centers slightly closer to the ends than the strict
-        # inscribed solution. This intentionally over-covers by a small margin so
-        # the effective payload length does not come out shorter than the box.
-        end_cover_margin = max(0.0015, 0.14 * short_dim)
+        end_cover_margin = max(0.0, float(end_cover_margin_scale) * short_dim)
         center_limit = max(0.0, 0.5 * long_dim + end_cover_margin - sphere_radius)
         if sphere_count <= 1 or center_limit <= 1e-6:
             axis_positions = np.zeros((sphere_count,), dtype=np.float32)
@@ -1071,7 +1129,46 @@ class RM75CuRoboPlanner:
         fill_count = min(int(sphere_count), max_spheres)
         sphere_tensor[:fill_count, :3] = ee_centers[:fill_count]
         sphere_tensor[:fill_count, 3] = float(sphere_radius)
-        return torch.as_tensor(sphere_tensor, device=self.tensor_args.device, dtype=self.tensor_args.dtype), sphere_radius
+        covered_length = 2.0 * (float(center_limit) + float(sphere_radius)) if fill_count > 0 else 0.0
+        return (
+            torch.as_tensor(sphere_tensor, device=self.tensor_args.device, dtype=self.tensor_args.dtype),
+            sphere_radius,
+            covered_length,
+            fill_count,
+        )
+
+    def _build_single_attached_sphere_tensor(
+        self,
+        *,
+        q: Sequence[float],
+        object_pose_world: Any,
+        link_name: str,
+        sphere_radius: float,
+        world_z_offset: float = 0.0,
+    ):
+        torch = self.mods["torch"]
+        obj_p, _ = self._extract_pose_components(object_pose_world)
+        obj_p = obj_p.astype(np.float32).copy()
+        obj_p[2] += float(world_z_offset)
+
+        q_np = self._normalize_q(q)
+        joint_state = self._make_start_state(q_np)
+        kin_state = self.motion_gen.compute_kinematics(joint_state)
+        ee_p = self._to_numpy(kin_state.ee_pose.position).reshape(-1, 3)[0].astype(np.float32)
+        ee_q = self._to_numpy(kin_state.ee_pose.quaternion).reshape(-1, 4)[0].astype(np.float32)
+        ee_R = self._quat_wxyz_to_rotmat(ee_q)
+        ee_center = (ee_R.T @ (obj_p - ee_p)).astype(np.float32)
+
+        max_spheres = int(self.motion_gen.robot_cfg.kinematics.kinematics_config.get_number_of_spheres(link_name))
+        sphere_tensor = np.zeros((max_spheres, 4), dtype=np.float32)
+        sphere_tensor[:, 3] = -10.0
+        sphere_tensor[0, :3] = ee_center
+        sphere_tensor[0, 3] = float(max(sphere_radius, 0.0025))
+        return (
+            torch.as_tensor(sphere_tensor, device=self.tensor_args.device, dtype=self.tensor_args.dtype),
+            float(max(sphere_radius, 0.0025)),
+            1,
+        )
 
     def attach_object_box_to_robot(
         self,
@@ -1082,6 +1179,11 @@ class RM75CuRoboPlanner:
         surface_sphere_radius: float | None = None,
         object_pose_world: Any | None = None,
         world_z_offset: float = 0.0,
+        linear_sphere_count: int | None = None,
+        linear_sphere_radius_scale: float = 0.48,
+        linear_end_cover_margin_scale: float = 0.14,
+        linear_length_scale: float = 1.0,
+        single_sphere_radius: float | None = None,
     ) -> bool:
         """Attach a box-shaped object to the robot in cuRobo collision checking.
 
@@ -1117,14 +1219,52 @@ class RM75CuRoboPlanner:
             dims=dims.tolist(),
         )
         try:
+            if single_sphere_radius is not None and object_pose_world is not None:
+                sphere_tensor, manual_radius, filled_spheres = self._build_single_attached_sphere_tensor(
+                    q=q_np,
+                    object_pose_world=object_pose_world,
+                    link_name=str(link_name),
+                    sphere_radius=float(single_sphere_radius),
+                    world_z_offset=float(world_z_offset),
+                )
+                self.motion_gen.attach_spheres_to_robot(
+                    sphere_radius=0.0,
+                    sphere_tensor=sphere_tensor,
+                    link_name=str(link_name),
+                )
+                try:
+                    self.ik_solver.attach_object_to_robot(
+                        sphere_radius=0.0,
+                        sphere_tensor=sphere_tensor.clone(),
+                        link_name=str(link_name),
+                    )
+                except Exception as exc:
+                    print(f"[curobo] failed to mirror single attached sphere to ik_solver: {exc}")
+                self._attached_object_active = True
+                enabled_spheres = self.get_attached_sphere_count(link_name=str(link_name))
+                print(
+                    f"[curobo] attached single-sphere object {np.round(dims, 4).tolist()} "
+                    f"to link={link_name}, enabled_spheres={enabled_spheres}, "
+                    f"sphere_radius={float(manual_radius)*1000:.1f}mm, "
+                    f"world_object_z_offset={float(world_z_offset)*1000:.1f}mm, "
+                    f"object_world_p={np.round(np.asarray(obstacle_pose[:3], dtype=np.float32), 4).tolist()}"
+                )
+                return True
             if prefer_linear_long_axis:
-                sphere_tensor, manual_radius = self._build_linear_attached_sphere_tensor(
+                use_sphere_count = min(
+                    max_spheres,
+                    max(1, int(linear_sphere_count)) if linear_sphere_count is not None else min(6, max_spheres),
+                )
+                sphere_tensor, manual_radius, covered_length, filled_spheres = self._build_linear_attached_sphere_tensor(
                     q=q_np,
                     box_dims=dims,
                     object_pose_world=object_pose_world,
                     link_name=str(link_name),
-                    sphere_count=min(6, max_spheres),
+                    sphere_count=use_sphere_count,
                     world_z_offset=float(world_z_offset),
+                    radius_scale=float(linear_sphere_radius_scale),
+                    end_cover_margin_scale=float(linear_end_cover_margin_scale),
+                    length_scale=float(linear_length_scale),
                 )
                 self.motion_gen.attach_spheres_to_robot(
                     sphere_radius=0.0,
@@ -1140,14 +1280,15 @@ class RM75CuRoboPlanner:
                 except Exception as exc:
                     print(f"[curobo] failed to mirror manual attached spheres to ik_solver: {exc}")
                 self._attached_object_active = True
-                covered_length = 0.0
-                if min(6, max_spheres) > 0:
-                    covered_length = 2.0 * (center_limit + manual_radius)
+                enabled_spheres = self.get_attached_sphere_count(link_name=str(link_name))
                 print(
                     f"[curobo] attached long-axis object {np.round(dims, 4).tolist()} "
-                    f"to link={link_name} with {min(6, max_spheres)} manual spheres, "
+                    f"to link={link_name} with {filled_spheres}/{max_spheres} manual spheres, "
+                    f"enabled_spheres={enabled_spheres}, "
                     f"manual_sphere_radius={float(manual_radius)*1000:.1f}mm, "
                     f"covered_length={float(covered_length)*1000:.1f}mm/{float(np.max(dims))*1000:.1f}mm, "
+                    f"radius_scale={float(linear_sphere_radius_scale):.2f}, "
+                    f"length_scale={float(linear_length_scale):.2f}, "
                     f"world_object_z_offset={float(world_z_offset)*1000:.1f}mm, "
                     f"object_world_p={np.round(np.asarray(obstacle_pose[:3], dtype=np.float32), 4).tolist()}"
                 )
@@ -1181,9 +1322,11 @@ class RM75CuRoboPlanner:
                 except Exception as exc:
                     print(f"[curobo] failed to mirror attached object spheres to ik_solver: {exc}")
                 n_spheres = self.motion_gen.robot_cfg.kinematics.kinematics_config.get_number_of_spheres(link_name)
+                enabled_spheres = self.get_attached_sphere_count(link_name=str(link_name))
                 print(
                     f"[curobo] attached object box {np.round(dims, 4).tolist()} "
                     f"to link={link_name} with {n_spheres} spheres, "
+                    f"enabled_spheres={enabled_spheres}, "
                     f"surface_sphere_radius={float(surface_sphere_radius)*1000:.1f}mm, "
                     f"world_object_z_offset={float(world_z_offset)*1000:.1f}mm, "
                     f"object_world_p={np.round(np.asarray(obstacle_pose[:3], dtype=np.float32), 4).tolist()}"
@@ -1215,6 +1358,19 @@ class RM75CuRoboPlanner:
     def attached_object_active(self) -> bool:
         return bool(getattr(self, "_attached_object_active", False))
 
+    def get_attached_sphere_count(self, *, link_name: str = "attached_object") -> int:
+        """Return the number of enabled collision spheres on the attached-object link."""
+        try:
+            spheres = (
+                self.motion_gen.robot_cfg.kinematics.kinematics_config.get_link_spheres(str(link_name))
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            return int(np.count_nonzero(np.asarray(spheres, dtype=np.float32)[:, 3] > 0.0))
+        except Exception:
+            return 0
+
     def get_attached_spheres_world(self, q: Sequence[float], *, link_name: str = "attached_object") -> list[dict]:
         """Return the world-frame positions and radii of attached object collision spheres."""
         if not self.attached_object_active:
@@ -1235,15 +1391,16 @@ class RM75CuRoboPlanner:
                 if link_spheres is None and hasattr(kin_state, "get_link_spheres"):
                     link_spheres = kin_state.get_link_spheres()
             kin_cfg = self.motion_gen.robot_cfg.kinematics.kinematics_config
-            link_names = kin_cfg.link_names
-            if link_name not in link_names:
+            link_sphere_index = kin_cfg.get_sphere_index_from_link_name(str(link_name))
+            if link_sphere_index.numel() == 0:
                 return []
-            link_idx = link_names.index(link_name)
-            sphere_offsets = kin_cfg.link_sphere_idx_map[link_idx]
-            start_idx, end_idx = int(sphere_offsets[0]), int(sphere_offsets[1])
-            spheres_tensor = link_spheres[0, start_idx:end_idx, :].detach().cpu().numpy()
+            if link_spheres.ndim == 3:
+                link_spheres = link_spheres[0]
+            spheres_tensor = link_spheres[link_sphere_index, :].detach().cpu().numpy()
             result = []
             for i in range(spheres_tensor.shape[0]):
+                if float(spheres_tensor[i, 3]) <= 0.0:
+                    continue
                 result.append({
                     "center": spheres_tensor[i, :3].tolist(),
                     "radius": float(spheres_tensor[i, 3]),
@@ -1555,6 +1712,11 @@ class RM75CuRoboPlanner:
         if hasattr(pose_like, "p") and hasattr(pose_like, "q"):
             position = self._as_float_array(pose_like.p, expected=3, name="pose.p")
             quaternion = self._as_float_array(pose_like.q, expected=4, name="pose.q")
+            return position, quaternion
+
+        if isinstance(pose_like, (tuple, list)) and len(pose_like) == 2:
+            position = self._as_float_array(pose_like[0], expected=3, name="pose[0]")
+            quaternion = self._as_float_array(pose_like[1], expected=4, name="pose[1]")
             return position, quaternion
 
         if isinstance(pose_like, Mapping):

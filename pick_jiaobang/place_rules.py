@@ -206,6 +206,20 @@ def make_vertical_long_axis_grasp_bias_variants() -> tuple[GraspBiasVariant, ...
     )
 
 
+def make_pen_insert_grasp_bias_variants() -> tuple[GraspBiasVariant, ...]:
+    # For the pen, avoid tilted pickup branches: after attach they often start
+    # transport in collision with nearby tabletop objects.  Bias the TCP along
+    # the pen's long axis instead, so insertion keeps a usable TCP<->pen frame.
+    return (
+        GraspBiasVariant(axis_shift_m=-0.018, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="pen_bias_neg18"),
+        GraspBiasVariant(axis_shift_m=-0.014, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="pen_bias_neg14"),
+        GraspBiasVariant(axis_shift_m=-0.010, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="pen_bias_neg10"),
+        GraspBiasVariant(axis_shift_m=-0.006, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="pen_bias_neg6"),
+        GraspBiasVariant(axis_shift_m=-0.014, tilt_toward_robot_deg=0.0, z_lift_m=0.006, label="pen_bias_neg14_lift6"),
+        GraspBiasVariant(axis_shift_m=-0.010, tilt_toward_robot_deg=0.0, z_lift_m=0.006, label="pen_bias_neg10_lift6"),
+    )
+
+
 def apply_vertical_long_axis_rule_overrides(
     rule: PlaceRule,
     *,
@@ -229,6 +243,7 @@ PLACE_RULES: Dict[str, PlaceRule] = {
         hover_height=0.15,
         release_retreat_height=0.15,
         allow_long_axis_flip=True,
+        grasp_bias_variants=make_pen_insert_grasp_bias_variants(),
         # Desired source-object pose in the target object's local frame.
         # Both pen.glb and holder.glb currently use their longest local axis as +Y,
         # so identity orientation is a reasonable first rule for vertical insertion.
@@ -292,7 +307,6 @@ PLACE_RULES["hongshupian"] = apply_vertical_long_axis_rule_overrides(
     PLACE_RULES["hongshupian"],
     face_robot_axis_local=(0.0, 0.0, 1.0),
 )
-
 PLACE_RULES["tennis"] = PlaceRule(
     **{
         **PLACE_RULES["tennis"].__dict__,
