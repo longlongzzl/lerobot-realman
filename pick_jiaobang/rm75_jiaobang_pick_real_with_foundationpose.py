@@ -1261,6 +1261,25 @@ def build_arg_parser():
     parser.add_argument("--goal-z-offset", type=float, default=0.0)
     parser.add_argument("--yaw-offset-deg", type=float, default=180.0)
     parser.add_argument("--render-mode", type=str, default="human")
+    parser.add_argument(
+        "--failure-render-dir",
+        type=str,
+        default=str(Path(__file__).resolve().parent / "failure_renders"),
+        help="Directory for automatic PNG snapshots when planning fails.",
+    )
+    parser.add_argument(
+        "--failure-render-image",
+        dest="failure_render_image",
+        action="store_true",
+        default=True,
+        help="Save a PNG snapshot when inspect_failed_pose is called. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-failure-render-image",
+        dest="failure_render_image",
+        action="store_false",
+        help="Disable automatic failure PNG snapshots.",
+    )
     parser.add_argument("--max-episode-steps", type=int, default=500)
     parser.add_argument("--auto-execute", action="store_true")
     parser.add_argument("--single-confirm-per-object", action="store_true", help="Ask once per object, then execute the remaining pick-place stages for that object without additional Enter confirmations.")
@@ -5138,6 +5157,301 @@ def execute_joint_stage(demo, bridge_mod, real_exec: RealmanJointExecutor | None
     return True, q_target
 
 
+def _safe_failure_render_token(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    chars = []
+    for ch in text:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            chars.append(ch)
+        else:
+            chars.append("_")
+    token = "".join(chars).strip("._")
+    return token[:96] or "unknown"
+
+
+def _rgb_array_from_render_value(value):
+    if value is None:
+        return None
+    try:
+        import torch
+    except Exception:
+        torch = None
+
+    if torch is not None and isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, dict):
+        preferred_keys = ("rgb", "Color", "color", "image", "images")
+        for key in preferred_keys:
+            if key in value:
+                image = _rgb_array_from_render_value(value[key])
+                if image is not None:
+                    return image
+        for item in value.values():
+            image = _rgb_array_from_render_value(item)
+            if image is not None:
+                return image
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            image = _rgb_array_from_render_value(item)
+            if image is not None:
+                return image
+        return None
+
+    arr = np.asarray(value)
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.ndim != 3 or arr.shape[-1] < 3:
+        return None
+    arr = arr[..., :3]
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.float32)
+        if np.nanmax(arr) <= 1.5:
+            arr = arr * 255.0
+        arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+    return np.ascontiguousarray(arr)
+
+
+def _copy_sapien_pose(pose) -> sapien.Pose:
+    try:
+        return sapien.Pose(
+            p=np.asarray(pose.p, dtype=np.float32).reshape(3).copy(),
+            q=np.asarray(pose.q, dtype=np.float32).reshape(4).copy(),
+        )
+    except Exception:
+        p = flatten_np(getattr(pose, "p", [0.0, 0.0, 0.0]))[:3]
+        q = flatten_np(getattr(pose, "q", [1.0, 0.0, 0.0, 0.0]))[:4]
+        return sapien.Pose(p=np.asarray(p, dtype=np.float32), q=np.asarray(q, dtype=np.float32))
+
+
+def _pose_to_sapien_pose(pose) -> sapien.Pose:
+    try:
+        created = Pose.create(pose)
+        return _copy_sapien_pose(created.sp if hasattr(created, "sp") else created)
+    except Exception:
+        pass
+    try:
+        return _copy_sapien_pose(pose)
+    except Exception:
+        return sapien.Pose()
+
+
+def _capture_human_render_camera_image(demo, args, *, camera_pose=None):
+    env = getattr(demo, "env", None)
+    if env is None:
+        return None
+    scene = getattr(getattr(env, "unwrapped", env), "scene", None)
+    if scene is None or not hasattr(scene, "get_human_render_camera_images"):
+        return None
+
+    camera_items = list((getattr(scene, "human_render_cameras", {}) or {}).items())
+    if not camera_items:
+        return None
+
+    saved_poses: list[tuple[object, sapien.Pose]] = []
+    try:
+        if camera_pose is not None:
+            sapien_pose = _pose_to_sapien_pose(camera_pose)
+            for _name, camera in camera_items:
+                render_camera = getattr(camera, "camera", None)
+                if render_camera is None:
+                    continue
+                try:
+                    saved_poses.append((render_camera, _copy_sapien_pose(render_camera.local_pose)))
+                    set_local_pose = getattr(render_camera, "set_local_pose", None)
+                    if callable(set_local_pose):
+                        set_local_pose(sapien_pose)
+                    else:
+                        render_camera.local_pose = sapien_pose
+                except Exception:
+                    continue
+        try:
+            scene.update_render(update_sensors=False, update_human_render_cameras=True)
+        except Exception:
+            pass
+        images = scene.get_human_render_camera_images()
+        return _rgb_array_from_render_value(images)
+    except Exception:
+        return None
+    finally:
+        for render_camera, old_pose in saved_poses:
+            try:
+                set_local_pose = getattr(render_camera, "set_local_pose", None)
+                if callable(set_local_pose):
+                    set_local_pose(old_pose)
+                else:
+                    render_camera.local_pose = old_pose
+            except Exception:
+                pass
+        if saved_poses:
+            try:
+                scene.update_render(update_sensors=False, update_human_render_cameras=True)
+            except Exception:
+                pass
+
+
+def capture_failure_render_image(demo, args, *, camera_pose=None):
+    env = getattr(demo, "env", None)
+    if env is None:
+        return None
+
+    if camera_pose is not None:
+        image = _capture_human_render_camera_image(demo, args, camera_pose=camera_pose)
+        if image is not None:
+            return image
+
+    for _ in range(2):
+        try:
+            image = _rgb_array_from_render_value(env.render())
+            if image is not None:
+                return image
+        except Exception:
+            break
+
+    try:
+        image = _capture_human_render_camera_image(demo, args)
+        if image is not None:
+            return image
+    except Exception:
+        pass
+    return None
+
+
+def _failure_render_output_path(args, label: str, *, suffix: str = "") -> Path:
+    output_dir = Path(getattr(args, "failure_render_dir", Path(__file__).resolve().parent / "failure_renders")).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    object_token = _safe_failure_render_token(getattr(args, "object_name", "object"))
+    label_token = _safe_failure_render_token(label)
+    suffix_token = f"_{_safe_failure_render_token(suffix)}" if suffix else ""
+    return output_dir / f"{timestamp}_{object_token}_{label_token}{suffix_token}.png"
+
+
+def _draw_failure_image_label(image, text: str):
+    from PIL import Image, ImageDraw
+
+    pil = Image.fromarray(image)
+    try:
+        draw = ImageDraw.Draw(pil)
+        draw.rectangle((0, 0, min(pil.width, 1100), 28), fill=(0, 0, 0))
+        draw.text((8, 7), text, fill=(255, 255, 255))
+    except Exception:
+        pass
+    return pil
+
+
+def save_failure_render_image(demo, args, label: str) -> Path | None:
+    if not bool(getattr(args, "failure_render_image", True)):
+        return None
+    image = capture_failure_render_image(demo, args)
+    if image is None:
+        print(f"[inspect] failed to capture failure render image for {label}")
+        return None
+    object_token = _safe_failure_render_token(getattr(args, "object_name", "object"))
+    output_path = _failure_render_output_path(args, label)
+    try:
+        pil = _draw_failure_image_label(image, f"{object_token} | {label}")
+        pil.save(output_path)
+    except Exception as exc:
+        print(f"[inspect] failed to save failure render image for {label}: {exc}")
+        return None
+    print(f"[inspect] saved failure render image: {output_path}")
+    return output_path
+
+
+def _failure_pose_world_position(pose) -> np.ndarray | None:
+    if pose is None:
+        return None
+    try:
+        return np.asarray(flatten_np(pose.p)[:3], dtype=np.float32).reshape(3)
+    except Exception:
+        return None
+
+
+def _failure_candidate_focus_points(pose, candidate_poses) -> list[np.ndarray]:
+    points: list[np.ndarray] = []
+    for candidate_pose in list(candidate_poses or []):
+        p = _failure_pose_world_position(candidate_pose)
+        if p is not None and np.all(np.isfinite(p)):
+            points.append(p)
+    p = _failure_pose_world_position(pose)
+    if p is not None and np.all(np.isfinite(p)):
+        points.append(p)
+    return points
+
+
+def _failure_place_camera_poses(points: list[np.ndarray]):
+    if not points:
+        return []
+    from mani_skill.utils import sapien_utils
+
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    center = np.mean(pts, axis=0)
+    xy_radius = float(np.max(np.linalg.norm(pts[:, :2] - center[:2], axis=1))) if len(pts) > 1 else 0.08
+    distance = max(0.30, min(0.70, xy_radius + 0.38))
+    target = center.astype(np.float32).copy()
+    target[2] = max(float(target[2]), 0.06)
+    return [
+        ("place_oblique_front", sapien_utils.look_at(target + np.array([distance, -distance, 0.32], dtype=np.float32), target, up=(0, 0, 1))),
+        ("place_oblique_side", sapien_utils.look_at(target + np.array([-distance, -0.10, 0.30], dtype=np.float32), target, up=(0, 0, 1))),
+        ("place_oblique_back", sapien_utils.look_at(target + np.array([-0.18, distance, 0.34], dtype=np.float32), target, up=(0, 0, 1))),
+        ("place_top", sapien_utils.look_at(target + np.array([0.02, -0.02, 0.75], dtype=np.float32), target, up=(1, 0, 0))),
+    ]
+
+
+def _tile_failure_render_images(labeled_images: list[tuple[str, np.ndarray]]):
+    if not labeled_images:
+        return None
+    from PIL import Image, ImageDraw
+
+    pil_images = []
+    for title, image in labeled_images:
+        pil = Image.fromarray(image)
+        try:
+            draw = ImageDraw.Draw(pil)
+            draw.rectangle((0, 0, min(pil.width, 900), 26), fill=(0, 0, 0))
+            draw.text((8, 6), title, fill=(255, 255, 255))
+        except Exception:
+            pass
+        pil_images.append(pil)
+    cell_w = max(img.width for img in pil_images)
+    cell_h = max(img.height for img in pil_images)
+    cols = 2 if len(pil_images) > 1 else 1
+    rows = int(np.ceil(len(pil_images) / cols))
+    canvas = Image.new("RGB", (cols * cell_w, rows * cell_h), (20, 20, 20))
+    for idx, img in enumerate(pil_images):
+        canvas.paste(img, ((idx % cols) * cell_w, (idx // cols) * cell_h))
+    return canvas
+
+
+def save_failure_place_candidate_render_image(demo, args, label: str, *, pose=None, candidate_poses=None) -> Path | None:
+    if not bool(getattr(args, "failure_render_image", True)):
+        return None
+    points = _failure_candidate_focus_points(pose, candidate_poses)
+    if not points:
+        return None
+    camera_poses = _failure_place_camera_poses(points)
+    labeled_images: list[tuple[str, np.ndarray]] = []
+    for view_name, camera_pose in camera_poses:
+        image = capture_failure_render_image(demo, args, camera_pose=camera_pose)
+        if image is not None:
+            labeled_images.append((f"{label} | {view_name}", image))
+    tiled = _tile_failure_render_images(labeled_images)
+    if tiled is None:
+        print(f"[inspect] failed to capture place-candidate render image for {label}")
+        return None
+    output_path = _failure_render_output_path(args, label, suffix="place_candidates")
+    try:
+        tiled.save(output_path)
+    except Exception as exc:
+        print(f"[inspect] failed to save place-candidate render image for {label}: {exc}")
+        return None
+    print(f"[inspect] saved place-candidate render image: {output_path}")
+    return output_path
+
+
 def inspect_failed_pose(
     demo,
     bridge_mod,
@@ -5163,6 +5477,8 @@ def inspect_failed_pose(
     print_failure_diagnostics(demo, args, label, q_target=q_target, use_attach=use_attach)
     if args.render_mode == "human":
         bridge_mod.render_preview(demo.env, repeats=12)
+    save_failure_render_image(demo, args, label)
+    save_failure_place_candidate_render_image(demo, args, label, pose=pose, candidate_poses=candidate_poses)
     if args.auto_execute:
         return
     bridge_mod.prompt_with_live_render(

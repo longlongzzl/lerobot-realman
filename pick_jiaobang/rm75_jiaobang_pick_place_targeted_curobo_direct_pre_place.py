@@ -131,7 +131,32 @@ def build_arg_parser():
         curobo_ee_link="gripper_tcp",
         curobo_rm75_robot_cfg=Path(__file__).resolve().parent / "curobo_rm75_config" / "rm75.yml",
         carry_sim_arm_across_cycles=False,
-        insert_vertical_axial_spin_deg=[0.0, -15.0, 15.0, -35.0, 35.0, -55.0, 55.0, -75.0],
+        insert_vertical_axial_spin_deg=[
+            0.0,
+            -15.0,
+            15.0,
+            -30.0,
+            30.0,
+            -45.0,
+            45.0,
+            -60.0,
+            60.0,
+            -75.0,
+            75.0,
+            -90.0,
+            90.0,
+            -105.0,
+            105.0,
+            -120.0,
+            120.0,
+            -135.0,
+            135.0,
+            -150.0,
+            150.0,
+            -165.0,
+            165.0,
+            180.0,
+        ],
         targeted_place_allow_insert_axis_flip=False,
         tabletop_place_yaw_variant_deg=[0.0, -45.0, 45.0, -90.0, 90.0, -135.0, 135.0, 180.0],
         tabletop_place_tilt_toward_robot_deg=[0.0],
@@ -309,7 +334,7 @@ def build_arg_parser():
     parser.add_argument(
         "--joint-search-max-pre-place-candidates",
         type=int,
-        default=3,
+        default=0,
         help="During joint search, only expand this many heuristic-ranked pre-place candidates per grasp before running cuRobo. Set <=0 to search all pre-place candidates.",
     )
     parser.add_argument(
@@ -1668,6 +1693,26 @@ def _pre_place_screen_sort_key(item):
     place_z = float(_get_pose_position(item["place_pose"])[2]) if "place_pose" in item else 0.0
     yaw_abs = _variant_abs_yaw_deg_from_labels(variant, label)
     hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
+    verticality_target = _candidate_tcp_verticality_target(item)
+    axis_vertical_target = _candidate_tcp_axis_vertical_target(item)
+    if verticality_target is not None or axis_vertical_target is not None:
+        axes_z = _tcp_axis_world_z_components(item["place_pose"]) if "place_pose" in item else {}
+        axis_delta = 0.0
+        if axis_vertical_target is not None:
+            axis_delta = abs(float(axes_z.get(f"abs_{axis_vertical_target}", 0.0)) - 1.0)
+        verticality_delta = 0.0
+        if verticality_target is not None:
+            verticality_delta = abs(float(item.get("tcp_verticality", 0.0)) - verticality_target)
+        return (
+            axis_delta,
+            verticality_delta,
+            yaw_abs,
+            hover_extra,
+            -place_z,
+            -pose_z,
+            variant,
+            label,
+        )
     return (
         yaw_abs,
         hover_extra,
@@ -1677,6 +1722,87 @@ def _pre_place_screen_sort_key(item):
         variant,
         label,
     )
+
+
+def _candidate_tcp_verticality_target(item) -> float | None:
+    place_plan = item.get("place_plan") if isinstance(item, dict) else None
+    rule = getattr(place_plan, "rule", None)
+    if rule is None:
+        return None
+    target = getattr(rule, "tabletop_place_tcp_verticality_target", None)
+    if target is None:
+        return None
+    try:
+        return float(np.clip(float(target), 0.0, 1.0))
+    except Exception:
+        return None
+
+
+def _candidate_tcp_axis_vertical_target(item) -> str | None:
+    place_plan = item.get("place_plan") if isinstance(item, dict) else None
+    rule = getattr(place_plan, "rule", None)
+    if rule is None:
+        return None
+    axis_name = getattr(rule, "tabletop_place_tcp_axis_vertical", None)
+    if axis_name is None:
+        return None
+    axis_name = str(axis_name).strip().lower()
+    if axis_name not in {"x", "y", "z"}:
+        return None
+    return axis_name
+
+
+def _filter_place_candidates_by_tcp_verticality_target(candidates, args, *, label: str) -> list:
+    remaining = list(candidates or [])
+    if not remaining:
+        return remaining
+    band = float(max(getattr(args, "direct_pre_place_verticality_band", 0.08), 0.0))
+    verticality_values = [
+        float(v)
+        for v in (_candidate_tcp_verticality_target(item) for item in remaining)
+        if v is not None and np.isfinite(float(v))
+    ]
+    axis_values = [v for v in (_candidate_tcp_axis_vertical_target(item) for item in remaining) if v is not None]
+    if not verticality_values and not axis_values:
+        return remaining
+    filtered = remaining
+    if axis_values:
+        axis_name = axis_values[0]
+        best_axis_delta = min(
+            abs(float(_tcp_axis_world_z_components(item["place_pose"]).get(f"abs_{axis_name}", 0.0)) - 1.0)
+            for item in filtered
+            if "place_pose" in item
+        )
+        axis_filtered = [
+            item
+            for item in filtered
+            if "place_pose" in item
+            and abs(float(_tcp_axis_world_z_components(item["place_pose"]).get(f"abs_{axis_name}", 0.0)) - 1.0)
+            <= best_axis_delta + band
+        ]
+        if axis_filtered:
+            filtered = axis_filtered
+            print(
+                f"[direct_pre_place] {label}: kept {len(filtered)}/{len(remaining)} candidate(s) "
+                f"near tcp_{axis_name}_vertical (best_delta={best_axis_delta:.3f}, band={band:.3f})"
+            )
+    if verticality_values:
+        target = float(verticality_values[0])
+        best_delta = min(abs(float(item.get("tcp_verticality", 0.0)) - target) for item in filtered)
+        verticality_filtered = [
+            item
+            for item in filtered
+            if abs(float(item.get("tcp_verticality", 0.0)) - target) <= best_delta + band
+        ]
+        if verticality_filtered:
+            filtered = verticality_filtered
+    if filtered is not remaining:
+        print(
+            f"[direct_pre_place] {label}: kept {len(filtered)}/{len(remaining)} candidate(s) "
+            f"near tcp_verticality_target={float(verticality_values[0]) if verticality_values else float('nan'):.3f}"
+        )
+        return filtered
+    return remaining
 
 
 def _yaw_distance_deg(a: float, b: float) -> float:
@@ -1886,6 +2012,24 @@ def _tcp_pad_tilt_z(pose) -> float:
     R = _quat_wxyz_to_rotmat(q_wxyz)
     tcp_y_in_world = R[:, 1]
     return float(abs(tcp_y_in_world[2]))
+
+
+def _tcp_axis_world_z_components(pose) -> dict[str, float]:
+    q_wxyz = _normalize_quat_wxyz(targeted.base.flatten_np(pose.q)[:4])
+    R = _quat_wxyz_to_rotmat(q_wxyz)
+    return _rotation_axis_world_z_components(R)
+
+
+def _rotation_axis_world_z_components(R) -> dict[str, float]:
+    R = np.asarray(R, dtype=np.float32).reshape(3, 3)
+    return {
+        "x": float(R[2, 0]),
+        "y": float(R[2, 1]),
+        "z": float(R[2, 2]),
+        "abs_x": float(abs(R[2, 0])),
+        "abs_y": float(abs(R[2, 1])),
+        "abs_z": float(abs(R[2, 2])),
+    }
 
 
 def _get_pose_position(pose) -> np.ndarray:
@@ -2098,6 +2242,7 @@ def _plan_short_curobo_cartesian_descent(
     pose_goal,
     *,
     label: str,
+    force_segmented: bool = False,
 ):
     start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
     motiongen_path = _plan_release_with_motiongen_constraint(
@@ -2112,6 +2257,8 @@ def _plan_short_curobo_cartesian_descent(
     if motiongen_path is not None:
         return motiongen_path
     if not (
+        bool(force_segmented)
+        or
         bool(getattr(args, "allow_segmented_ik_rescue", False))
         or bool(getattr(args, "final_contact_segmented_ik_fallback", False))
     ):
@@ -2938,6 +3085,12 @@ def _evaluate_curobo_pose_candidates_goalset(
                         "success": bool(ik_result.success),
                     }
                 )
+                if bool(getattr(args, "curobo_debug", False)) and "lvmukuai_vertical_gripper" in str(candidate.get("label", "")).lower():
+                    print(
+                        f"[curobo][diag] {label} {candidate['label']} IK "
+                        f"success={bool(ik_result.success)} status={ik_result.status} "
+                        f"pos_err={pos_err:.5f} rot_err={rot_err:.5f}"
+                    )
                 if ik_result.success:
                     ik_screened.append(candidate)
                     continue
@@ -3551,6 +3704,7 @@ def _build_direct_grasp_candidates(demo, args):
     T_world_obj0 = targeted.base.pose_to_matrix(obj_p0, obj_q0)
     grasp_mode = str(getattr(args, "grasp_mode", "object_normal") or "object_normal").strip().lower()
     place_rule = targeted.get_place_rule(getattr(args, "object_name", None))
+    source_name = _current_source_object_name(args)
     grasp_variant_args = SimpleNamespace(**vars(args))
     grasp_variant_args.topdown_grasp_yaw_variant_deg = [0.0]
     orientation_invariant_place = bool(getattr(place_rule, "orientation_invariant", False))
@@ -3713,6 +3867,7 @@ def _build_direct_grasp_candidates(demo, args):
                 if float(shift_d) > 1e-6:
                     base_label += f"_shift_{int(round(1000.0 * float(shift_d)))}mm"
                 _append(base_label, shifted_pose)
+
         return variants
 
     grasp_variants = _build_pose_variants()
@@ -4128,6 +4283,125 @@ def _roll_pose_about_tcp_approach(pose, roll_deg: float):
         return pose
 
 
+def _make_vertical_gripper_rotation_candidates(demo, obj_position: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    """Build TCP frames with a gripper body axis vertical, while the approach axis stays horizontal."""
+    obj_position = np.asarray(obj_position, dtype=np.float32).reshape(3)
+    base_p = _get_robot_base_world_transform(demo)[:3, 3].astype(np.float32)
+    to_robot = (base_p - obj_position).astype(np.float32)
+    to_robot[2] = 0.0
+    to_robot = _normalize(to_robot)
+    if to_robot is None:
+        to_robot = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+
+    variants: list[tuple[str, np.ndarray]] = []
+    for x_label, x_axis in (
+        ("x_down", np.asarray([0.0, 0.0, -1.0], dtype=np.float32)),
+        ("x_up", np.asarray([0.0, 0.0, 1.0], dtype=np.float32)),
+    ):
+        for z_label, z_axis in (
+            ("face_robot", to_robot),
+            ("away_robot", -to_robot),
+        ):
+            z_axis = _normalize(z_axis)
+            if z_axis is None:
+                continue
+            y_axis = _normalize(np.cross(z_axis, x_axis))
+            if y_axis is None:
+                continue
+            z_axis = _normalize(np.cross(x_axis, y_axis))
+            if z_axis is None:
+                continue
+            R_tcp = np.stack([x_axis, y_axis, z_axis], axis=1).astype(np.float32)
+            variants.append((f"vertical_gripper_{x_label}_{z_label}", R_tcp))
+    for y_label, y_axis in (
+        ("y_down", np.asarray([0.0, 0.0, -1.0], dtype=np.float32)),
+        ("y_up", np.asarray([0.0, 0.0, 1.0], dtype=np.float32)),
+    ):
+        for z_label, z_axis in (
+            ("face_robot", to_robot),
+            ("away_robot", -to_robot),
+        ):
+            z_axis = _normalize(z_axis)
+            if z_axis is None:
+                continue
+            x_axis = _normalize(np.cross(y_axis, z_axis))
+            if x_axis is None:
+                continue
+            z_axis = _normalize(np.cross(x_axis, y_axis))
+            if z_axis is None:
+                continue
+            R_tcp = np.stack([x_axis, y_axis, z_axis], axis=1).astype(np.float32)
+            variants.append((f"vertical_gripper_{y_label}_{z_label}", R_tcp))
+    return variants
+
+
+def _build_lvmukuai_vertical_gripper_pose_variants(
+    demo,
+    args,
+    rule,
+    bridge_mod,
+    scene_capture_cache,
+    place_state_cache,
+    T_world_obj_current: np.ndarray,
+) -> list[tuple[str, object]]:
+    """Generate grasp TCP poses that keep the fixed place object pose but make the gripper upright.
+
+    The place code uses: T_world_tcp_place = T_world_obj_desired @ inv(T_tcp_obj).
+    So choose an upright place TCP frame first, then solve the corresponding grasp TCP frame:
+    R_grasp = R_obj_current @ R_obj_desired.T @ R_place.
+    """
+    if bridge_mod is None or scene_capture_cache is None or place_state_cache is None or rule is None:
+        return []
+    try:
+        place_plans = targeted.build_targeted_place_plan_variants(
+            demo,
+            bridge_mod,
+            scene_capture_cache,
+            rule,
+            place_state_cache,
+            args,
+            T_tcp_obj_override=None,
+        )
+    except Exception as exc:
+        print(f"[direct_grasp] lvmukuai vertical-gripper place-pose lookup failed: {exc}")
+        return []
+    if not place_plans:
+        return []
+
+    try:
+        center_p = np.asarray(demo.get_object_world_aabb_center(), dtype=np.float32).reshape(3)
+    except Exception:
+        center_p = np.asarray(T_world_obj_current[:3, 3], dtype=np.float32).reshape(3)
+
+    variants: list[tuple[str, object]] = []
+    seen = set()
+    for plan_idx, plan in enumerate(place_plans[:4]):
+        T_world_obj_desired = np.asarray(plan.T_world_obj_desired, dtype=np.float32).reshape(4, 4)
+        for rot_label, R_place_tcp in _make_vertical_gripper_rotation_candidates(
+            demo,
+            T_world_obj_desired[:3, 3],
+        ):
+            R_grasp_tcp = (
+                T_world_obj_current[:3, :3].astype(np.float32)
+                @ T_world_obj_desired[:3, :3].astype(np.float32).T
+                @ R_place_tcp.astype(np.float32)
+            ).astype(np.float32)
+            q_grasp = targeted.base.bridge_mod_mat2quat(R_grasp_tcp).astype(np.float32)
+            pose = targeted.Pose.create_from_pq(p=center_p.astype(np.float32), q=q_grasp)
+            key = (
+                tuple(np.round(targeted.base.flatten_np(pose.p)[:3], 5).tolist()),
+                tuple(np.round(targeted.base.flatten_np(pose.q)[:4], 5).tolist()),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            slot_label = f"place{plan_idx}" if plan_idx else "place"
+            variants.append((f"lvmukuai_{rot_label}_{slot_label}", pose))
+    if variants:
+        print(f"[direct_grasp] lvmukuai added {len(variants)} true vertical-gripper grasp variant(s)")
+    return variants
+
+
 def _make_sphere_free_release_pose_variants(
     demo,
     raw_release_pose,
@@ -4387,6 +4661,8 @@ def _build_direct_pre_place_candidates(demo, bridge_mod, scene_capture_cache, ru
             z_offsets = [0.0]
     min_place_tcp_z = float(getattr(args, "direct_min_place_tcp_z", 0.005))
     max_pad_tilt = float(max(getattr(args, "direct_place_max_pad_tilt", 0.25), 0.0))
+    if getattr(rule, "tabletop_place_tcp_verticality_target", None) is not None:
+        max_pad_tilt = 1.0
 
     # 获取物体尺寸用于计算倾斜时的最低点偏移
     try:
@@ -4461,6 +4737,7 @@ def _build_direct_pre_place_candidates(demo, bridge_mod, scene_capture_cache, ru
         )
     else:
         candidates = []
+    candidates = _filter_place_candidates_by_tcp_verticality_target(candidates, args, label="short_pre_place")
     print(
         f"[direct_pre_place] built {len(candidates)} short pre-place candidate(s) "
         f"with approach_distances={np.round(np.asarray(approach_distances, dtype=np.float32), 4).tolist()} "
@@ -4484,6 +4761,8 @@ def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, 
 
     min_place_tcp_z = float(getattr(args, "direct_min_place_tcp_z", 0.005))
     max_pad_tilt = float(max(getattr(args, "direct_place_max_pad_tilt", 0.25), 0.0))
+    if getattr(rule, "tabletop_place_tcp_verticality_target", None) is not None:
+        max_pad_tilt = 1.0
     max_abs_yaw = float(getattr(args, "direct_place_max_abs_yaw_deg", 0.0) or 0.0)
     source_name = _current_source_object_name(args)
     try:
@@ -4623,6 +4902,7 @@ def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, 
     else:
         candidates = []
         print("[place_state] built 0 transport hover candidate(s) (all rejected by tcp_z threshold)")
+    candidates = _filter_place_candidates_by_tcp_verticality_target(candidates, args, label="transport_hover")
     return candidates
 
 
@@ -4713,6 +4993,27 @@ def plan_final_contact_approach(
 
     final_start_q = np.asarray(pre_q_path[-1], dtype=np.float32).reshape(-1)[:7]
     final_label = f"{transport_choice['label']}_final_contact"
+    verticality_target = _candidate_tcp_verticality_target(transport_choice)
+    axis_vertical_target = _candidate_tcp_axis_vertical_target(transport_choice)
+    if bool(getattr(args, "curobo_debug", False)):
+        axes_z = _tcp_axis_world_z_components(release_pose)
+        object_axes_text = ""
+        place_plan = transport_choice.get("place_plan")
+        T_world_obj_desired = getattr(place_plan, "T_world_obj_desired", None)
+        if T_world_obj_desired is not None:
+            obj_axes_z = _rotation_axis_world_z_components(np.asarray(T_world_obj_desired, dtype=np.float32).reshape(4, 4)[:3, :3])
+            object_axes_text = (
+                f", object_axes_world_z: x={obj_axes_z['x']:.3f}, y={obj_axes_z['y']:.3f}, z={obj_axes_z['z']:.3f} "
+                f"(abs: x={obj_axes_z['abs_x']:.3f}, y={obj_axes_z['abs_y']:.3f}, z={obj_axes_z['abs_z']:.3f})"
+            )
+        print(
+            f"[place_state] {final_label} tcp_axes_world_z: "
+            f"x={axes_z['x']:.3f}, y={axes_z['y']:.3f}, z={axes_z['z']:.3f} "
+            f"(abs: x={axes_z['abs_x']:.3f}, y={axes_z['abs_y']:.3f}, z={axes_z['abs_z']:.3f}), "
+            f"tcp_verticality={float(transport_choice.get('tcp_verticality', 0.0)):.3f}, "
+            f"verticality_target={verticality_target}, axis_vertical_target={axis_vertical_target}"
+            f"{object_axes_text}"
+        )
     disabled = set_payload_collision_mode(
         planner,
         "disabled_for_contact",
@@ -4720,10 +5021,13 @@ def plan_final_contact_approach(
         disabled_world_collision_links=disabled_world_collision_links,
         label=final_label,
     )
+    use_segmented_final_contact = bool(getattr(args, "final_contact_segmented_ik_fallback", False)) or bool(
+        getattr(args, "allow_segmented_ik_rescue", False)
+    )
+    if verticality_target is not None and verticality_target < 0.5:
+        use_segmented_final_contact = True
     try:
-        if bool(getattr(args, "final_contact_segmented_ik_fallback", False)) or bool(
-            getattr(args, "allow_segmented_ik_rescue", False)
-        ):
+        if use_segmented_final_contact:
             release_q_path = _plan_short_curobo_cartesian_descent(
                 planner,
                 demo,
@@ -4732,6 +5036,7 @@ def plan_final_contact_approach(
                 hover_pose,
                 release_pose,
                 label=final_label,
+                force_segmented=verticality_target is not None and verticality_target < 0.5,
             )
         else:
             release_q_path = _plan_release_with_motiongen_constraint(
@@ -5741,7 +6046,13 @@ def run_targeted_place_episode_curobo_direct(
                 break
     if place_choice is None:
         print("[FAIL] final_contact_approach failed for all reachable hover candidates")
-        failed_pose = transport_successes[0].get("release_pose", transport_successes[0]["pose"])
+        failure_candidates = list(transport_successes or direct_place_candidates or [])
+        if failure_candidates:
+            failed_pose = failure_candidates[0].get("release_pose", failure_candidates[0]["pose"])
+            failed_candidate_poses = [item.get("release_pose", item["pose"]) for item in failure_candidates]
+        else:
+            failed_pose = demo.tcp.pose
+            failed_candidate_poses = []
         _print_attached_sphere_clearance(planner, demo, args, label="final_contact")
         targeted.base.inspect_failed_pose(
             demo,
@@ -5751,7 +6062,7 @@ def run_targeted_place_episode_curobo_direct(
             pose=failed_pose,
             gripper_closed=True,
             use_attach=True,
-            candidate_poses=[item.get("release_pose", item["pose"]) for item in transport_successes],
+            candidate_poses=failed_candidate_poses,
         )
         return False
 
@@ -5771,6 +6082,15 @@ def run_targeted_place_episode_curobo_direct(
         f"target={place_choice['target_name']}{slot_suffix}{variant_suffix}, "
         f"tcp_verticality={place_choice['tcp_verticality']:.3f}"
     )
+    place_plan = place_choice.get("place_plan")
+    T_world_obj_desired = getattr(place_plan, "T_world_obj_desired", None)
+    if T_world_obj_desired is not None:
+        obj_axes_z = _rotation_axis_world_z_components(np.asarray(T_world_obj_desired, dtype=np.float32).reshape(4, 4)[:3, :3])
+        print(
+            "[place] target object_axes_world_z: "
+            f"x={obj_axes_z['x']:.3f}, y={obj_axes_z['y']:.3f}, z={obj_axes_z['z']:.3f} "
+            f"(abs: x={obj_axes_z['abs_x']:.3f}, y={obj_axes_z['abs_y']:.3f}, z={obj_axes_z['abs_z']:.3f})"
+        )
     print("[place] hover p:", np.round(targeted.base.flatten_np(place_choice["pre_place_pose"].p)[:3], 6), "q:", np.round(targeted.base.flatten_np(place_choice["pre_place_pose"].q)[:4], 6))
     print("[place] release p:", np.round(targeted.base.flatten_np(place_choice["place_pose"].p)[:3], 6), "q:", np.round(targeted.base.flatten_np(place_choice["place_pose"].q)[:4], 6))
     if rule.primitive == "insert_vertical":

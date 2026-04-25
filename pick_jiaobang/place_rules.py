@@ -42,6 +42,9 @@ class PlaceRule:
     allow_tabletop_yaw_variants: bool = False
     allow_long_axis_flip: bool = False
     face_robot_axis_local: tuple[float, float, float] | None = None
+    tabletop_axial_spin_deg: tuple[float, ...] = ()
+    tabletop_place_tcp_verticality_target: float | None = None
+    tabletop_place_tcp_axis_vertical: str | None = None
     object_pose_local: LocalPoseSpec | None = None
     slots: tuple[PlaceSlotSpec, ...] = ()
     grasp_bias_variants: tuple[GraspBiasVariant, ...] = ()
@@ -195,6 +198,11 @@ def make_tabletop_slot_rule(
 
 def make_vertical_long_axis_grasp_bias_variants() -> tuple[GraspBiasVariant, ...]:
     return (
+        GraspBiasVariant(axis_shift_m=0.000, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="top_bias_center_vertical"),
+        GraspBiasVariant(axis_shift_m=-0.002, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="top_bias_neg2_vertical"),
+        GraspBiasVariant(axis_shift_m=-0.006, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="top_bias_neg6_vertical"),
+        GraspBiasVariant(axis_shift_m=-0.010, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="top_bias_neg10_vertical"),
+        GraspBiasVariant(axis_shift_m=-0.014, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="top_bias_neg14_vertical"),
         GraspBiasVariant(axis_shift_m=-0.014, tilt_toward_robot_deg=15.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg14_tilt15_away"),
         GraspBiasVariant(axis_shift_m=-0.010, tilt_toward_robot_deg=15.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg10_tilt15_away"),
         GraspBiasVariant(axis_shift_m=-0.006, tilt_toward_robot_deg=15.0, tilt_direction="away_robot", tilt_shift_m=0.0, label="top_bias_neg6_tilt15_away"),
@@ -270,7 +278,7 @@ PLACE_RULES: Dict[str, PlaceRule] = {
     "lvmukuai": make_tabletop_slot_rule(
         "lvmukuai",
         center_y=0.07,
-        rpy_deg=(0.0, 90.0, -90.0),
+        rpy_deg=(90.0, 90.0, 0.0),
         hover_height=0.08,
         release_retreat_height=0.10,
     ),

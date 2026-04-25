@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -402,7 +403,9 @@ def _make_tabletop_axial_spin_local_pose_variants(
     if rule.primitive != "place_on_slots":
         return variants
 
-    spin_degs = [float(v) for v in list(getattr(args, "tabletop_place_axial_spin_deg", []) or []) if np.isfinite(float(v))]
+    rule_spin_degs = tuple(getattr(rule, "tabletop_axial_spin_deg", ()) or ())
+    raw_spin_degs = rule_spin_degs if rule_spin_degs else getattr(args, "tabletop_place_axial_spin_deg", [])
+    spin_degs = [float(v) for v in list(raw_spin_degs or []) if np.isfinite(float(v))]
     if not spin_degs:
         return variants
 
@@ -720,16 +723,27 @@ def build_targeted_place_plan_variants(
                         )
                     )
     if rule.primitive == "place_on_slots" and plans:
-        min_verticality = float(max(getattr(args, "tabletop_place_min_tcp_verticality", 0.0), 0.0))
-        if any(plan.tcp_verticality >= min_verticality for plan in plans):
-            plans = [plan for plan in plans if plan.tcp_verticality >= min_verticality]
-        plans.sort(
-            key=lambda plan: (
-                -float(plan.tcp_verticality),
-                "" if plan.variant_label is None else str(plan.variant_label),
-                "" if plan.slot_name is None else str(plan.slot_name),
+        verticality_target = getattr(rule, "tabletop_place_tcp_verticality_target", None)
+        if verticality_target is not None:
+            target_value = float(np.clip(float(verticality_target), 0.0, 1.0))
+            plans.sort(
+                key=lambda plan: (
+                    abs(float(plan.tcp_verticality) - target_value),
+                    "" if plan.variant_label is None else str(plan.variant_label),
+                    "" if plan.slot_name is None else str(plan.slot_name),
+                )
             )
-        )
+        else:
+            min_verticality = float(max(getattr(args, "tabletop_place_min_tcp_verticality", 0.0), 0.0))
+            if any(plan.tcp_verticality >= min_verticality for plan in plans):
+                plans = [plan for plan in plans if plan.tcp_verticality >= min_verticality]
+            plans.sort(
+                key=lambda plan: (
+                    -float(plan.tcp_verticality),
+                    "" if plan.variant_label is None else str(plan.variant_label),
+                    "" if plan.slot_name is None else str(plan.slot_name),
+                )
+            )
     return plans
 
 
@@ -1442,6 +1456,61 @@ def _is_cached_scene_object_placed(scene_capture_cache, object_name: str | None)
     return isinstance(entry, dict) and bool(entry.get("placed", False))
 
 
+def _unique_rule_names(names) -> list[str]:
+    result = []
+    seen = set()
+    for raw_name in list(names or []):
+        name = normalize_object_name(raw_name)
+        if name is None or name in seen or get_place_rule(name) is None:
+            continue
+        seen.add(name)
+        result.append(name)
+    return result
+
+
+def _random_target_pool_for_cycle(
+    base_args,
+    cycle_object_sequence,
+    scene_capture_cache,
+    available_rule_names,
+    cycle_idx: int,
+) -> list[str]:
+    if available_rule_names:
+        if cycle_object_sequence:
+            allowed = set(_unique_rule_names(cycle_object_sequence))
+            pool = [name for name in _unique_rule_names(available_rule_names) if name in allowed]
+        else:
+            pool = _unique_rule_names(available_rule_names)
+    elif cycle_object_sequence:
+        pool = _unique_rule_names(cycle_object_sequence)
+    elif cycle_idx == 1 and base_args.object_name is not None:
+        pool = _unique_rule_names([base_args.object_name])
+    else:
+        pool = _unique_rule_names(list_place_rule_sources())
+    return [name for name in pool if not _is_cached_scene_object_placed(scene_capture_cache, name)]
+
+
+def _select_random_cycle_target(
+    base_args,
+    cycle_object_sequence,
+    scene_capture_cache,
+    available_rule_names,
+    failed_targets_this_cycle: set[str],
+    cycle_idx: int,
+) -> tuple[str | None, list[str], list[str]]:
+    pool = _random_target_pool_for_cycle(
+        base_args,
+        cycle_object_sequence,
+        scene_capture_cache,
+        available_rule_names,
+        cycle_idx,
+    )
+    candidates = [name for name in pool if name not in failed_targets_this_cycle]
+    if not candidates:
+        return None, pool, []
+    return random.choice(candidates), pool, candidates
+
+
 def main():
     args = parse_args()
     maybe_print_and_exit_place_rules(args)
@@ -1487,7 +1556,7 @@ def main():
     scene_capture_cache: dict | None = {} if bool(getattr(args, "reuse_foundationpose_scene_across_cycles", True)) else None
     place_state_cache: dict = {"used_slots_by_target": {}}
     previous_cycle_final_q: np.ndarray | None = None
-    force_prompt_target_selection = False
+    failed_targets_this_cycle: set[str] = set()
     try:
         if args.execute_real:
             real_exec = base.RealmanJointExecutor(args)
@@ -1504,38 +1573,32 @@ def main():
             ok = False
             cached_scene_names = base.list_cached_scene_object_names(scene_capture_cache)
             available_rule_names = _list_cached_unplaced_rule_names(scene_capture_cache)
-            if not force_prompt_target_selection and cycle_idx <= len(cycle_object_sequence):
-                selected_name = cycle_object_sequence[cycle_idx - 1]
-                if _is_cached_scene_object_placed(scene_capture_cache, selected_name):
-                    print(
-                        f"\n[cycle {cycle_idx}] skipping CLI target object {selected_name}: "
-                        "it is already marked placed in the cached scene"
-                    )
-                    continue
-                print(f"\n[cycle {cycle_idx}] using CLI target object: {selected_name}")
-            elif not force_prompt_target_selection and cycle_idx == 1 and base_args.object_name is not None:
-                selected_name = base_args.object_name
-                print(f"\n[cycle {cycle_idx}] using CLI target object: {selected_name}")
-            elif cycle_idx > 1 and available_rule_names:
-                print(f"\n[cycle {cycle_idx}] reusing the cached tabletop scene; choose the next target from the remaining rule-enabled objects")
-                selected_name = base.prompt_cycle_object_name(
-                    base_args,
-                    cycle_idx,
-                    available_names=available_rule_names,
-                    default_name=available_rule_names[0],
-                )
-            else:
-                selected_name = base.prompt_cycle_object_name(
-                    base_args,
-                    cycle_idx,
-                    available_names=list_place_rule_sources(),
-                    default_name=(base_args.object_name or (list_place_rule_sources()[0] if list_place_rule_sources() else None)),
-                )
-            force_prompt_target_selection = False
+            selected_name, target_pool, target_candidates = _select_random_cycle_target(
+                base_args,
+                cycle_object_sequence,
+                scene_capture_cache,
+                available_rule_names,
+                failed_targets_this_cycle,
+                cycle_idx,
+            )
             if selected_name is None:
                 final_ok = False
-                print(f"[abort] user cancelled object selection for cycle {cycle_idx}")
+                if target_pool and failed_targets_this_cycle:
+                    print(
+                        f"[abort] cycle {cycle_idx}: all selectable targets failed in this cycle: "
+                        f"{sorted(failed_targets_this_cycle & set(target_pool))}"
+                    )
+                else:
+                    print(f"[abort] cycle {cycle_idx}: no selectable target object remains")
                 break
+            if failed_targets_this_cycle:
+                print(
+                    f"\n[cycle {cycle_idx}] random target pool after failures: {target_candidates}; "
+                    f"failed_this_cycle={sorted(failed_targets_this_cycle)}"
+                )
+            else:
+                print(f"\n[cycle {cycle_idx}] random target pool: {target_candidates}")
+            print(f"[cycle {cycle_idx}] randomly selected target object: {selected_name}")
             rule = get_place_rule(selected_name)
             if rule is None:
                 final_ok = False
@@ -1579,15 +1642,16 @@ def main():
             print(f"\ncycle {cycle_idx} success = {ok}")
             if not ok:
                 if bool(getattr(base_args, "reselect_target_on_planning_failure", True)):
+                    failed_targets_this_cycle.add(selected_name)
                     print(
                         f"[cycle {cycle_idx}] planning/execution failed; "
-                        "keeping the current cached scene and returning to target selection."
+                        "keeping the current cached scene and trying a different target."
                     )
-                    force_prompt_target_selection = True
                     cycle_idx -= 1
                     continue
                 final_ok = False
                 break
+            failed_targets_this_cycle.clear()
             if final_sim_arm_q is not None:
                 previous_cycle_final_q = final_sim_arm_q
             base.cache_successfully_placed_object_world_pose(demo, cycle_args.object_name, cycle_args)
