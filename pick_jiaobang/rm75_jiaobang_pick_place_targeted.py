@@ -1431,6 +1431,17 @@ def _list_cached_unplaced_rule_names(scene_capture_cache) -> list[str]:
     return sorted(dict.fromkeys(names))
 
 
+def _is_cached_scene_object_placed(scene_capture_cache, object_name: str | None) -> bool:
+    name = normalize_object_name(object_name)
+    if name is None or not isinstance(scene_capture_cache, dict):
+        return False
+    objects = scene_capture_cache.get("objects")
+    if not isinstance(objects, dict):
+        return False
+    entry = objects.get(name)
+    return isinstance(entry, dict) and bool(entry.get("placed", False))
+
+
 def main():
     args = parse_args()
     maybe_print_and_exit_place_rules(args)
@@ -1495,6 +1506,12 @@ def main():
             available_rule_names = _list_cached_unplaced_rule_names(scene_capture_cache)
             if not force_prompt_target_selection and cycle_idx <= len(cycle_object_sequence):
                 selected_name = cycle_object_sequence[cycle_idx - 1]
+                if _is_cached_scene_object_placed(scene_capture_cache, selected_name):
+                    print(
+                        f"\n[cycle {cycle_idx}] skipping CLI target object {selected_name}: "
+                        "it is already marked placed in the cached scene"
+                    )
+                    continue
                 print(f"\n[cycle {cycle_idx}] using CLI target object: {selected_name}")
             elif not force_prompt_target_selection and cycle_idx == 1 and base_args.object_name is not None:
                 selected_name = base_args.object_name

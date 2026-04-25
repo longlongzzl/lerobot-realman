@@ -277,7 +277,7 @@ PLACE_RULES: Dict[str, PlaceRule] = {
     "carriot": make_tabletop_slot_rule(
         "carriot",
         center_y=0.070,
-        rpy_deg=(0.0, 0.0, 0.0),
+        rpy_deg=(0.0, 90.0, 0.0),
         hover_height=0.08,
         release_retreat_height=0.10,
     ),
@@ -306,6 +306,12 @@ PLACE_RULES["gluestick"] = apply_vertical_long_axis_rule_overrides(
 PLACE_RULES["hongshupian"] = apply_vertical_long_axis_rule_overrides(
     PLACE_RULES["hongshupian"],
     face_robot_axis_local=(0.0, 0.0, 1.0),
+)
+PLACE_RULES["carriot"] = PlaceRule(
+    **{
+        **PLACE_RULES["carriot"].__dict__,
+        "allow_tabletop_yaw_variants": False,
+    }
 )
 PLACE_RULES["tennis"] = PlaceRule(
     **{

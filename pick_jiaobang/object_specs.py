@@ -96,7 +96,7 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
     ),
     "hongshupian": ObjectSpec(
         name="hongshupian",
-        grounding_prompt="a red cylindrical can of potato chips",
+        grounding_prompt="Red Potato Chip Can.",
         mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/hongshupian.glb",
         sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/hongshupian.glb",
         real_longest_axis_m=0.15,

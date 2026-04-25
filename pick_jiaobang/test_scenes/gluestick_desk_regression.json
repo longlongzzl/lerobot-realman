@@ -65,6 +65,37 @@
         ]
       ]
     },
+    "carriot": {
+      "label": "orange carrot.",
+      "score": 1.0,
+      "placed": false,
+      "T_world_obj": [
+        [
+          0.0,
+          1.0,
+          0.0,
+          -0.05
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          -0.25
+        ],
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.018
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
     "desk": {
       "label": "small wooden tabletop platform.",
       "score": 0.49363523721694946,

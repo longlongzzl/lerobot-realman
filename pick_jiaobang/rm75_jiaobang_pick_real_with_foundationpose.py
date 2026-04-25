@@ -202,6 +202,7 @@ def build_visual_obstacle_actor(
     *,
     box_size: np.ndarray | None = None,
     color=None,
+    hollow_holder_collision: bool = False,
 ):
     builder = env.unwrapped.scene.create_actor_builder()
     try:
@@ -211,14 +212,56 @@ def build_visual_obstacle_actor(
     scale = [float(mesh_scale), float(mesh_scale), float(mesh_scale)]
     builder.add_visual_from_file(str(Path(mesh_file).expanduser()), scale=scale)
     if box_size is not None:
-        half_size = (np.asarray(box_size, dtype=np.float32).reshape(3) * 0.5).tolist()
+        size = np.asarray(box_size, dtype=np.float32).reshape(3)
         try:
-            builder.add_box_collision(half_size=half_size)
+            if hollow_holder_collision:
+                _add_hollow_holder_collision_boxes(builder, size)
+            else:
+                builder.add_box_collision(half_size=(size * 0.5).tolist())
         except Exception as exc:
             print(f"[scene obstacle] {actor_name}: failed to add sim collision shape: {exc}")
     actor = builder.build_kinematic(name=actor_name)
     _set_actor_visual_base_color(actor, color)
     return actor
+
+
+def _add_hollow_holder_collision_boxes(builder, box_size: np.ndarray) -> None:
+    """Approximate the pen holder as an open-top cup in local coordinates.
+
+    holder.glb uses local +Y as the open direction.  A single box collision
+    makes the holder solid, so use bottom + four wall boxes instead.
+    """
+    size = np.asarray(box_size, dtype=np.float32).reshape(3)
+    sx, sy, sz = [float(max(v, 1e-4)) for v in size.tolist()]
+    hx, hy, hz = sx * 0.5, sy * 0.5, sz * 0.5
+    wall_t = float(np.clip(min(sx, sz) * 0.08, 0.004, min(sx, sz) * 0.22))
+    bottom_t = wall_t
+    wall_h = max(sy - bottom_t, 1e-4)
+    wall_center_y = -hy + bottom_t + wall_h * 0.5
+
+    # Bottom cap at local -Y; local +Y remains open.
+    builder.add_box_collision(
+        pose=sapien.Pose([0.0, -hy + bottom_t * 0.5, 0.0]),
+        half_size=[hx, bottom_t * 0.5, hz],
+    )
+    # Two X-side walls.
+    builder.add_box_collision(
+        pose=sapien.Pose([hx - wall_t * 0.5, wall_center_y, 0.0]),
+        half_size=[wall_t * 0.5, wall_h * 0.5, hz],
+    )
+    builder.add_box_collision(
+        pose=sapien.Pose([-hx + wall_t * 0.5, wall_center_y, 0.0]),
+        half_size=[wall_t * 0.5, wall_h * 0.5, hz],
+    )
+    # Two Z-side walls.
+    builder.add_box_collision(
+        pose=sapien.Pose([0.0, wall_center_y, hz - wall_t * 0.5]),
+        half_size=[hx, wall_h * 0.5, wall_t * 0.5],
+    )
+    builder.add_box_collision(
+        pose=sapien.Pose([0.0, wall_center_y, -hz + wall_t * 0.5]),
+        half_size=[hx, wall_h * 0.5, wall_t * 0.5],
+    )
 
 
 def build_attached_box_visual_actor(env, box_size: np.ndarray, actor_name: str = "transport_attached_box_visual"):
@@ -1000,7 +1043,15 @@ def register_scene_obstacles(env, demo, bridge_mod, T_base_cam: np.ndarray, scen
         box_scale = float(global_box_scale * object_box_scale * non_fixed_object_box_scale * placed_box_scale)
         scaled_box_size = None if box_size is None else (np.asarray(box_size, dtype=np.float32) * box_scale).astype(np.float32)
 
-        actor = build_visual_obstacle_actor(env, asset_file, asset_scale, actor_name, box_size=scaled_box_size)
+        hollow_holder_collision = normalize_object_name(object_name) == "bitong"
+        actor = build_visual_obstacle_actor(
+            env,
+            asset_file,
+            asset_scale,
+            actor_name,
+            box_size=scaled_box_size,
+            hollow_holder_collision=hollow_holder_collision,
+        )
         pos = T_world_obj[:3, 3].astype(np.float32)
         quat = bridge_mod.mat2quat(T_world_obj[:3, :3]).astype(np.float32)
         actor.set_pose(Pose.create_from_pq(p=pos, q=quat))
@@ -1051,7 +1102,8 @@ def register_scene_obstacles(env, demo, bridge_mod, T_base_cam: np.ndarray, scen
             f"[scene obstacle] applied {object_name}: world translation={np.round(T_world_obj[:3, 3], 6).tolist()}, "
             f"planner_collision={'yes' if planner_collision else 'no'}, "
             f"box_scale={box_scale:.3f} (global={global_box_scale:.3f}, object={object_box_scale:.3f}, non_fixed={non_fixed_object_box_scale:.3f}, placed={placed_box_scale:.3f}), "
-            f"box_size={None if scaled_box_size is None else np.round(scaled_box_size, 6).tolist()}"
+            f"box_size={None if scaled_box_size is None else np.round(scaled_box_size, 6).tolist()}, "
+            f"sim_collision={'hollow_holder(+Y_open)' if hollow_holder_collision else 'box'}"
         )
         if planner_box_actor_name:
             print(
