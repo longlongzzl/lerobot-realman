@@ -5,6 +5,7 @@ import re
 import atexit
 import json
 import time
+import os
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -117,6 +118,17 @@ def _print_profile_summary() -> None:
             f"[planning_profile] {obj:12s} | {stage:28s} | {count:2d} | "
             f"{success_count:2d} | {total_ms:8.1f} | {avg_ms:7.1f} | {max_ms:7.1f} | {bar}"
         )
+
+
+def _configure_curobo_torch_extensions(args) -> None:
+    ext_dir = Path(getattr(args, "curobo_torch_extensions_dir", Path("/tmp/curobo_torch_extensions"))).expanduser().resolve()
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    prev = os.environ.get("TORCH_EXTENSIONS_DIR")
+    os.environ["TORCH_EXTENSIONS_DIR"] = str(ext_dir)
+    if prev is None:
+        print(f"[curobo] set TORCH_EXTENSIONS_DIR={ext_dir}")
+    elif Path(prev) != ext_dir:
+        print(f"[curobo] override TORCH_EXTENSIONS_DIR={prev} -> {ext_dir}")
 
 
 def build_arg_parser():
@@ -240,6 +252,13 @@ def build_arg_parser():
         nargs="*",
         default=[0.0, -45.0, 45.0, -90.0, 90.0, 180.0],
         help="For spherical objects, keep the same center grasp but try these equivalent wrist yaw angles.",
+    )
+    parser.add_argument(
+        "--bi-direct-grasp-approach-roll-degs",
+        type=float,
+        nargs="*",
+        default=[0.0, 180.0],
+        help="For the pen, try these equivalent TCP approach-axis rolls. 180deg swaps gripper pads without changing the top-down contact geometry.",
     )
     parser.add_argument(
         "--direct-grasp-diagnose-topk",
@@ -389,14 +408,14 @@ def build_arg_parser():
     parser.add_argument(
         "--joint-search-start-collision-lift-m",
         type=float,
-        default=0.030,
+        default=0.080,
         help="If joint-search transport starts in world collision, try a straight world-Z lift by this distance before replanning transport.",
     )
     parser.add_argument(
         "--skip-joint-search-object-names",
         type=str,
         nargs="*",
-        default=["bi"],
+        default=[],
         help="Object names that should skip conservative joint grasp->place pre-screening and plan place only after the real/sim grasp and lift.",
     )
     parser.add_argument(
@@ -653,6 +672,21 @@ def build_arg_parser():
         "This does not change the target ball center, but gives cuRobo more IK/collision branches.",
     )
     parser.add_argument(
+        "--carriot-direct-place-tilt-toward-robot-degs",
+        type=float,
+        nargs="*",
+        default=[0.0, 15.0, -15.0, 30.0, -30.0],
+        help="Center-preserving carriot release TCP-body tilt candidates in degrees. "
+        "The object center target is unchanged; only equivalent gripper orientations are searched.",
+    )
+    parser.add_argument(
+        "--carriot-direct-place-axial-roll-degs",
+        type=float,
+        nargs="*",
+        default=[0.0, -45.0, 45.0, -90.0, 90.0, 180.0],
+        help="Extra wrist-roll candidates around the carriot release approach axis.",
+    )
+    parser.add_argument(
         "--direct-place-contact-lift-m",
         type=float,
         default=0.003,
@@ -686,7 +720,7 @@ def build_arg_parser():
         "--transport-hover-extra-heights-m",
         type=float,
         nargs="*",
-        default=[0.0, 0.03],
+        default=[0.0, 0.03, 0.06],
         help="Additional world-z lifts applied to non-drop transport hover candidates.",
     )
     parser.add_argument(
@@ -719,6 +753,20 @@ def build_arg_parser():
         action="store_true",
         default=False,
         help="Allow slow segmented-IK rescue after cuRobo MotionGen fails for short Cartesian moves.",
+    )
+    parser.add_argument(
+        "--two-step-final-approach-segmented-fallback",
+        dest="two_step_final_approach_segmented_fallback",
+        action="store_true",
+        default=True,
+        help="If the official MotionGen metric fails for the short pregrasp->grasp descent, "
+        "try bounded segmented IK before rejecting the grasp candidate.",
+    )
+    parser.add_argument(
+        "--no-two-step-final-approach-segmented-fallback",
+        dest="two_step_final_approach_segmented_fallback",
+        action="store_false",
+        help="Disable segmented IK fallback for the two-step grasp final approach.",
     )
     parser.add_argument(
         "--allow-demo-planner-rescue",
@@ -772,7 +820,9 @@ def build_arg_parser():
 
 
 def parse_args():
-    return build_arg_parser().parse_args()
+    args = build_arg_parser().parse_args()
+    _configure_curobo_torch_extensions(args)
+    return args
 
 
 def _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, label: str, *, use_attach: bool) -> bool:
@@ -816,7 +866,13 @@ def _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, label: str, *, us
             lift_pose,
             ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
         )
-        disabled_links = _direct_place_contact_tolerant_disabled_links(planner)
+        disabled_links = (
+            _post_grasp_lift_disabled_world_links(planner, _direct_place_contact_tolerant_disabled_links(planner))
+            if use_attach
+            else _direct_place_contact_tolerant_disabled_links(planner)
+        )
+        if "attached_object" in set(disabled_links):
+            _cache_attached_spheres_for_contact(planner)
         disabled = _set_world_collision_for_links(
             planner,
             disabled_links,
@@ -841,6 +897,8 @@ def _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, label: str, *, us
                 enabled=True,
                 label=label,
             )
+            if "attached_object" in set(disabled):
+                _restore_attached_spheres_after_contact(planner)
         if result.success and result.joint_path is not None:
             q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in result.joint_path]
         else:
@@ -1093,11 +1151,30 @@ def _attach_transport_payload_to_curobo(planner, demo, args, *, label: str) -> b
                 np.asarray(obj_q_attach, dtype=np.float32).reshape(4),
             ]
         )
+        T_world_obj_attach = targeted.base.pose_to_matrix(
+            np.asarray(obj_p_attach, dtype=np.float32).reshape(3),
+            np.asarray(obj_q_attach, dtype=np.float32).reshape(4),
+        )
+        # cuRobo robot kinematics and collision world are expressed in the robot base frame.
+        # Convert the attached payload pose to the same frame before building attached spheres.
+        T_base_obj_attach = np.linalg.inv(_get_robot_base_world_transform(demo)) @ T_world_obj_attach
+        obj_pose_attach_for_curobo = np.concatenate(
+            [
+                T_base_obj_attach[:3, 3].astype(np.float32),
+                targeted.base.bridge_mod_mat2quat(T_base_obj_attach[:3, :3]).astype(np.float32),
+            ]
+        ).astype(np.float32)
+        if bool(getattr(args, "curobo_debug", False)):
+            print(
+                f"[curobo] {label} attach pose converted world->base: "
+                f"world_p={np.round(obj_pose_attach[:3], 4).tolist()}, "
+                f"base_p={np.round(obj_pose_attach_for_curobo[:3], 4).tolist()}"
+            )
         base_z_offset = float(getattr(args, "curobo_attach_world_z_offset_m", 0.002))
         ok = planner.attach_object_box_to_robot(
             current_q,
             attach_box_dims,
-            object_pose_world=obj_pose_attach,
+            object_pose_world=obj_pose_attach_for_curobo,
             world_z_offset=base_z_offset,
             **attach_kwargs,
         )
@@ -1125,7 +1202,7 @@ def _attach_transport_payload_to_curobo(planner, demo, args, *, label: str) -> b
                 ok = planner.attach_object_box_to_robot(
                     current_q,
                     attach_box_dims,
-                    object_pose_world=obj_pose_attach,
+                    object_pose_world=obj_pose_attach_for_curobo,
                     world_z_offset=adjusted_offset,
                     **attach_kwargs,
                 )
@@ -1199,6 +1276,60 @@ def _apply_deferred_two_step_final_approach(planner, demo, args, grasp_choice, p
             grasp_pose,
             label=final_approach_label,
         )
+        if final_approach_path is None and bool(getattr(args, "two_step_final_approach_segmented_fallback", True)):
+            print(
+                f"[two_step_grasp] official final approach failed for {grasp_choice.get('label', '?')}; "
+                "trying bounded segmented IK fallback"
+            )
+            final_approach_path = _plan_short_curobo_cartesian_descent(
+                planner,
+                demo,
+                args,
+                pregrasp_q,
+                pregrasp_pose,
+                grasp_pose,
+                label=f"{final_approach_label}_segmented_ik",
+                force_segmented=True,
+            )
+        if final_approach_path is None and _current_source_object_name(args) == "bi":
+            disabled = _set_world_collision_for_links(
+                planner,
+                _direct_place_contact_tolerant_disabled_links(planner),
+                enabled=False,
+                label=f"{final_approach_label}_support_relaxed",
+            )
+            try:
+                print(
+                    f"[two_step_grasp] final approach still failed for {grasp_choice.get('label', '?')}; "
+                    "retrying with gripper support-link world collision relaxed"
+                )
+                final_approach_path = _plan_with_official_approach_metric(
+                    planner,
+                    demo,
+                    args,
+                    pregrasp_q,
+                    pregrasp_pose,
+                    grasp_pose,
+                    label=f"{final_approach_label}_support_relaxed",
+                )
+                if final_approach_path is None and bool(getattr(args, "two_step_final_approach_segmented_fallback", True)):
+                    final_approach_path = _plan_short_curobo_cartesian_descent(
+                        planner,
+                        demo,
+                        args,
+                        pregrasp_q,
+                        pregrasp_pose,
+                        grasp_pose,
+                        label=f"{final_approach_label}_support_relaxed_segmented_ik",
+                        force_segmented=True,
+                    )
+            finally:
+                _set_world_collision_for_links(
+                    planner,
+                    disabled,
+                    enabled=True,
+                    label=f"{final_approach_label}_support_relaxed",
+                )
         _refresh_curobo_world(
             planner,
             demo,
@@ -1365,10 +1496,11 @@ def _visualize_attached_spheres(planner, demo, args):
     if not spheres:
         print("[curobo] no attached spheres to visualize")
         return
-    base_p = targeted.base.flatten_np(demo.robot.pose.p)[:3].astype(np.float32)
+    T_world_base = _get_robot_base_world_transform(demo)
     print(f"[curobo] attached object collision spheres ({len(spheres)} total):")
     for i, s in enumerate(spheres):
-        world_center = np.asarray(s["center"], dtype=np.float32) + base_p
+        center_base = np.asarray(s["center"], dtype=np.float32).reshape(3)
+        world_center = (T_world_base @ np.array([center_base[0], center_base[1], center_base[2], 1.0], dtype=np.float32))[:3]
         print(
             f"  sphere[{i}]: world_center=[{world_center[0]:.4f}, {world_center[1]:.4f}, {world_center[2]:.4f}], "
             f"radius={s['radius']*1000:.1f}mm"
@@ -1388,7 +1520,8 @@ def _visualize_attached_spheres(planner, demo, args):
         visual_seq = int(getattr(env.unwrapped, "_attached_sphere_visual_seq", 0)) + 1
         env.unwrapped._attached_sphere_visual_seq = visual_seq
         for i, s in enumerate(spheres):
-            world_center = np.asarray(s["center"], dtype=np.float32) + base_p
+            center_base = np.asarray(s["center"], dtype=np.float32).reshape(3)
+            world_center = (T_world_base @ np.array([center_base[0], center_base[1], center_base[2], 1.0], dtype=np.float32))[:3]
             radius = float(s["radius"])
             builder = env.unwrapped.scene.create_actor_builder()
             builder.add_sphere_visual(radius=radius, material=None)
@@ -1552,6 +1685,18 @@ def _direct_place_contact_tolerant_disabled_links(planner) -> list[str]:
         "gripper_Right_Support_Link",
     }
     return sorted(candidate_disable_links & configured_links)
+
+
+def _post_grasp_lift_disabled_world_links(planner, base_links: list[str] | None = None) -> list[str]:
+    """
+    抓住后的第一段直线上提用于把物体从接触面上解耦。
+    这段允许 attached payload 暂时忽略世界碰撞；后续 transport 会重新启用。
+    """
+    configured_links = set(getattr(planner, "configured_collision_links", []) or [])
+    links = set(base_links or [])
+    if "attached_object" in configured_links:
+        links.add("attached_object")
+    return sorted(links & configured_links) if configured_links else sorted(links)
 
 
 def _normalize_disabled_world_collision_links(planner, disabled_world_collision_links) -> list[str]:
@@ -2354,9 +2499,13 @@ def _plan_short_world_z_lift_ik(
         include_table=include_table,
         exclude_object_names=exclude_object_names,
     )
+    requested_disabled_links = _normalize_disabled_world_collision_links(planner, disabled_world_collision_links)
+    restore_attached_spheres = "attached_object" in set(requested_disabled_links or [])
+    if restore_attached_spheres:
+        _cache_attached_spheres_for_contact(planner)
     disabled_world_collision_links = _set_world_collision_for_links(
         planner,
-        disabled_world_collision_links,
+        requested_disabled_links,
         enabled=False,
         label=label,
     )
@@ -2471,6 +2620,8 @@ def _plan_short_world_z_lift_ik(
             enabled=True,
             label=label,
         )
+        if restore_attached_spheres:
+            _restore_attached_spheres_after_contact(planner)
 
     if q_path is None:
         return None
@@ -3892,64 +4043,72 @@ def _build_direct_grasp_candidates(demo, args):
         z_lift_values = [float(rule_bias.z_lift_m)] if rule_bias is not None else grasp_z_lifts
         for axis_shift in axis_shift_values:
             for z_lift in z_lift_values:
-                current_grasp_pose = grasp_variant_pose
+                base_grasp_pose = grasp_variant_pose
                 if object_axis_world is not None and abs(float(axis_shift)) > 1e-6:
-                    shifted_p = (_get_pose_position(current_grasp_pose) + object_axis_world * float(axis_shift)).astype(np.float32)
-                    current_grasp_pose = targeted.base.make_pose_with_position(current_grasp_pose, shifted_p)
+                    shifted_p = (_get_pose_position(base_grasp_pose) + object_axis_world * float(axis_shift)).astype(np.float32)
+                    base_grasp_pose = targeted.base.make_pose_with_position(base_grasp_pose, shifted_p)
                 if float(z_lift) > 1e-6:
-                    shifted_p = (_get_pose_position(current_grasp_pose) + np.array([0.0, 0.0, float(z_lift)], dtype=np.float32)).astype(
+                    shifted_p = (_get_pose_position(base_grasp_pose) + np.array([0.0, 0.0, float(z_lift)], dtype=np.float32)).astype(
                         np.float32
                     )
-                    current_grasp_pose = targeted.base.make_pose_with_position(current_grasp_pose, shifted_p)
-                current_pregrasp_pose = demo.build_pregrasp_pose(current_grasp_pose)
-                current_grasp_pose, current_pregrasp_pose, geometry_grasp_raise = targeted.base.enforce_topdown_grasp_insertion_limit(
-                    demo,
-                    args,
-                    current_grasp_pose,
-                    current_pregrasp_pose,
-                )
-                if geometry_grasp_raise > 0:
-                    print(
-                        f"[safety] raised grasp TCP z by {geometry_grasp_raise:.4f} m "
-                        f"to satisfy topdown_grasp_max_insertion_depth={args.topdown_grasp_max_insertion_depth:.4f}"
+                    base_grasp_pose = targeted.base.make_pose_with_position(base_grasp_pose, shifted_p)
+                approach_roll_values = [0.0]
+                if source_name == "bi":
+                    approach_roll_values = _bi_direct_grasp_approach_roll_degs(args)
+                for approach_roll_deg in approach_roll_values:
+                    current_grasp_pose = _roll_pose_about_tcp_approach(base_grasp_pose, float(approach_roll_deg))
+                    current_pregrasp_pose = demo.build_pregrasp_pose(current_grasp_pose)
+                    current_grasp_pose, current_pregrasp_pose, geometry_grasp_raise = targeted.base.enforce_topdown_grasp_insertion_limit(
+                        demo,
+                        args,
+                        current_grasp_pose,
+                        current_pregrasp_pose,
                     )
-                current_grasp_pose, _, grasp_tcp_raise = targeted.base.enforce_min_grasp_tcp_z(
-                    current_grasp_pose,
-                    current_pregrasp_pose,
-                    args.min_grasp_tcp_z,
-                )
-                if grasp_tcp_raise > 0:
-                    print(
-                        f"[safety] raised grasp TCP z by {grasp_tcp_raise:.4f} m "
-                        f"to satisfy min_grasp_tcp_z={args.min_grasp_tcp_z:.4f}"
+                    if geometry_grasp_raise > 0:
+                        print(
+                            f"[safety] raised grasp TCP z by {geometry_grasp_raise:.4f} m "
+                            f"to satisfy topdown_grasp_max_insertion_depth={args.topdown_grasp_max_insertion_depth:.4f}"
+                        )
+                    current_grasp_pose, _, grasp_tcp_raise = targeted.base.enforce_min_grasp_tcp_z(
+                        current_grasp_pose,
+                        current_pregrasp_pose,
+                        args.min_grasp_tcp_z,
                     )
-                key = (
-                    tuple(np.round(targeted.base.flatten_np(current_grasp_pose.p)[:3], 5).tolist()),
-                    tuple(np.round(targeted.base.flatten_np(current_grasp_pose.q)[:4], 5).tolist()),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                label = "grasp_direct" if grasp_variant_label in (None, "grasp") else f"grasp_direct_{grasp_variant_label}"
-                if abs(float(axis_shift)) > 1e-6:
-                    label = f"{label}_axis_{int(round(float(axis_shift) * 1000.0))}mm"
-                if float(z_lift) > 1e-6:
-                    label = f"{label}_lift_{int(round(float(z_lift) * 1000.0))}mm"
-                candidates.append(
-                    {
-                        "label": label,
-                        "pose": current_grasp_pose,
-                        "pregrasp_pose": current_pregrasp_pose,  # 保存pregrasp pose用于两步抓取
-                        "T_tcp_obj": np.linalg.inv(
-                            targeted.base.pose_to_matrix(
-                                targeted.base.flatten_np(current_grasp_pose.p)[:3],
-                                targeted.base.flatten_np(current_grasp_pose.q)[:4],
-                            )
-                        ) @ T_world_obj0,
-                        "grasp_axis_shift_m": float(axis_shift),
-                        "grasp_z_lift_m": float(z_lift),
-                    }
-                )
+                    if grasp_tcp_raise > 0:
+                        print(
+                            f"[safety] raised grasp TCP z by {grasp_tcp_raise:.4f} m "
+                            f"to satisfy min_grasp_tcp_z={args.min_grasp_tcp_z:.4f}"
+                        )
+                    key = (
+                        tuple(np.round(targeted.base.flatten_np(current_grasp_pose.p)[:3], 5).tolist()),
+                        tuple(np.round(targeted.base.flatten_np(current_grasp_pose.q)[:4], 5).tolist()),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    label = "grasp_direct" if grasp_variant_label in (None, "grasp") else f"grasp_direct_{grasp_variant_label}"
+                    if abs(float(axis_shift)) > 1e-6:
+                        label = f"{label}_axis_{int(round(float(axis_shift) * 1000.0))}mm"
+                    if float(z_lift) > 1e-6:
+                        label = f"{label}_lift_{int(round(float(z_lift) * 1000.0))}mm"
+                    if abs(float(approach_roll_deg)) > 1e-6:
+                        label = f"{label}_roll_{int(round(float(approach_roll_deg)))}deg"
+                    candidates.append(
+                        {
+                            "label": label,
+                            "pose": current_grasp_pose,
+                            "pregrasp_pose": current_pregrasp_pose,  # 保存pregrasp pose用于两步抓取
+                            "T_tcp_obj": np.linalg.inv(
+                                targeted.base.pose_to_matrix(
+                                    targeted.base.flatten_np(current_grasp_pose.p)[:3],
+                                    targeted.base.flatten_np(current_grasp_pose.q)[:4],
+                                )
+                            ) @ T_world_obj0,
+                            "grasp_axis_shift_m": float(axis_shift),
+                            "grasp_z_lift_m": float(z_lift),
+                            "grasp_approach_roll_deg": float(approach_roll_deg),
+                        }
+                    )
     variant_labels = [label for label, _ in grasp_variants]
     tilt_variants = [l for l in variant_labels if "tilt" in l.lower()]
     if sphere_category and tilt_variants:
@@ -4136,9 +4295,16 @@ def _skip_joint_search_for_current_object(args) -> bool:
     source_name = _current_source_object_name(args)
     skip_names = {
         curobo_wrapper.normalize_object_name(name)
-        for name in list(getattr(args, "skip_joint_search_object_names", ["bi"]) or [])
+        for name in list(getattr(args, "skip_joint_search_object_names", []) or [])
     }
     return source_name is not None and source_name in skip_names
+
+
+def _bi_direct_grasp_approach_roll_degs(args) -> list[float]:
+    values = _unique_finite_float_list(
+        getattr(args, "bi_direct_grasp_approach_roll_degs", [0.0, 180.0]),
+    )
+    return values or [0.0]
 
 
 def _tennis_release_tilt_toward_robot_degs(args) -> list[float]:
@@ -4158,10 +4324,24 @@ def _tennis_release_axial_roll_degs(args) -> list[float]:
     return values or [0.0]
 
 
+def _carriot_release_tilt_toward_robot_degs(args) -> list[float]:
+    values = _unique_finite_float_list(
+        getattr(args, "carriot_direct_place_tilt_toward_robot_degs", [0.0, 15.0, -15.0, 30.0, -30.0]),
+    )
+    return values or [0.0]
+
+
+def _carriot_release_axial_roll_degs(args) -> list[float]:
+    values = _unique_finite_float_list(
+        getattr(args, "carriot_direct_place_axial_roll_degs", [0.0, -45.0, 45.0, -90.0, 90.0, 180.0]),
+    )
+    return values or [0.0]
+
+
 def _transport_screen_args_for_object(args, source_name: str | None):
     adjusted = SimpleNamespace(**vars(args))
     if source_name == "bi":
-        adjusted.place_transport_max_winners = max(int(getattr(args, "place_transport_max_winners", 2)), 3)
+        adjusted.place_transport_max_winners = max(int(getattr(args, "place_transport_max_winners", 2)), 12)
     if source_name == "carriot":
         adjusted.place_transport_max_winners = max(int(getattr(args, "place_transport_max_winners", 2)), 3)
     if source_name != "tennis":
@@ -4235,7 +4415,7 @@ def _sphere_tcp_object_distance_m(T_tcp_obj_override, args) -> float:
 
 def _sphere_release_tcp_pose_from_center(demo, args, center_p: np.ndarray, tilt_deg: float, tcp_object_distance_m: float):
     center_p = np.asarray(center_p, dtype=np.float32).reshape(3)
-    if _current_source_object_name(args) == "tennis":
+    if _current_source_object_name(args) in {"tennis", "carriot"}:
         pose = _make_base_referenced_tennis_release_pose(demo, center_p, float(tilt_deg))
     else:
         pose = None
@@ -4427,17 +4607,33 @@ def _make_sphere_free_release_pose_variants(
     if source_name == "carriot":
         variants = []
         seen = set()
-        for roll_deg in [0.0, -45.0, 45.0, -90.0, 90.0, 180.0]:
-            pose = _roll_pose_about_tcp_approach(release_pose, float(roll_deg))
-            suffix = None if abs(float(roll_deg)) <= 1e-6 else f"free_roll_{int(round(float(roll_deg)))}deg"
-            key = (
-                tuple(np.round(targeted.base.flatten_np(pose.p)[:3], 5).tolist()),
-                tuple(np.round(targeted.base.flatten_np(pose.q)[:4], 5).tolist()),
+        for tilt_deg in _carriot_release_tilt_toward_robot_degs(args):
+            base_pose = _sphere_release_tcp_pose_from_center(
+                demo,
+                args,
+                center_p,
+                float(tilt_deg),
+                tcp_object_distance,
             )
-            if key in seen:
+            if base_pose is None:
                 continue
-            seen.add(key)
-            variants.append((suffix, pose))
+            tilt_suffix = None
+            if abs(float(tilt_deg)) > 1e-6:
+                dir_label = "body_toward_robot" if float(tilt_deg) >= 0.0 else "body_away_robot"
+                tilt_suffix = f"tilt_{dir_label}_{int(round(abs(float(tilt_deg))))}deg"
+            for roll_deg in _carriot_release_axial_roll_degs(args):
+                pose = _roll_pose_about_tcp_approach(base_pose, float(roll_deg))
+                roll_suffix = None if abs(float(roll_deg)) <= 1e-6 else f"free_roll_{int(round(float(roll_deg)))}deg"
+                suffix_parts = [part for part in (tilt_suffix, roll_suffix) if part]
+                suffix = "+".join(suffix_parts) if suffix_parts else None
+                key = (
+                    tuple(np.round(targeted.base.flatten_np(pose.p)[:3], 5).tolist()),
+                    tuple(np.round(targeted.base.flatten_np(pose.q)[:4], 5).tolist()),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                variants.append((suffix, pose))
         return variants or [(None, release_pose)]
     if source_name != "tennis":
         return [(None, release_pose)]
@@ -4800,6 +4996,27 @@ def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, 
         )
     all_candidates = []
     level_candidates = []
+    target_axis = None
+    insert_approach_distances: list[float] = []
+    if place_mode == "insert_place":
+        T_world_target = targeted._get_scene_object_world_transform(
+            demo,
+            bridge_mod,
+            scene_capture_cache,
+            rule.target_object_name,
+        )
+        if T_world_target is not None:
+            target_axis = _normalize(np.asarray(T_world_target[:3, 1], dtype=np.float32).reshape(3))
+            sign = 1.0 if float(getattr(rule.object_pose_local, "position", (0.0, 1.0, 0.0))[1]) >= 0.0 else -1.0
+            if target_axis is not None:
+                target_axis = (target_axis * sign).astype(np.float32)
+        insert_approach_distances = _unique_finite_float_list(
+            list(getattr(args, "direct_release_approach_distances", []) or [])
+            + [float(max(getattr(args, "direct_release_approach_distance", 0.04), 0.005))],
+            min_value=0.005,
+        )
+        if not insert_approach_distances:
+            insert_approach_distances = [0.04]
     hover_extra_heights = [0.0]
     if place_mode != "drop_place":
         hover_extra_heights = _unique_finite_float_list(
@@ -4834,54 +5051,77 @@ def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, 
             combined_variant_label = "+".join(combined_variant_parts) if combined_variant_parts else None
             if release_lift > 1e-6:
                 release_pose = _lift_pose_world_z(release_pose, release_lift)
-            base_hover_pose = build_hover_pose(
-                release_pose,
-                place_mode,
-                args,
-                rule,
-                candidate_pre_place_pose=candidate.pre_place_pose,
-            )
+            if place_mode == "insert_place" and target_axis is not None:
+                base_hover_entries = []
+                release_p = _get_pose_position(release_pose)
+                for approach_distance in insert_approach_distances:
+                    approach_pose = targeted.base.make_pose_with_position(
+                        release_pose,
+                        (release_p + target_axis * float(approach_distance)).astype(np.float32),
+                    )
+                    base_hover_entries.append(
+                        (
+                            f"approach_{int(round(float(approach_distance) * 1000.0))}mm",
+                            approach_pose,
+                        )
+                    )
+            else:
+                base_hover_entries = [
+                    (
+                        None,
+                        build_hover_pose(
+                            release_pose,
+                            place_mode,
+                            args,
+                            rule,
+                            candidate_pre_place_pose=candidate.pre_place_pose,
+                        ),
+                    )
+                ]
             pad_tilt = _tcp_pad_tilt_z(release_pose)
             place_z = float(_get_pose_position(release_pose)[2])
             if place_z < min_place_tcp_z:
                 continue
-            label = "transport_hover" if combined_variant_label is None else f"transport_hover_{combined_variant_label}"
-            if max_abs_yaw > 0.0:
-                ydeg = _variant_abs_yaw_deg_from_labels(combined_variant_label, label)
-                if ydeg > max_abs_yaw + 1e-4:
-                    continue
-            for hover_extra in hover_extra_heights:
-                hover_pose = base_hover_pose
-                if float(hover_extra) > 1e-6:
-                    hover_pose = _lift_pose_world_z(base_hover_pose, float(hover_extra))
-                hover_label = label
-                if float(hover_extra) > 1e-6:
-                    hover_label = f"{hover_label}_hover_plus_{int(round(float(hover_extra) * 1000.0))}mm"
-                item = {
-                    "label": hover_label,
-                    "pose": hover_pose,
-                    "hover_pose": hover_pose,
-                    "pre_place_pose": hover_pose,
-                    "place_pose": release_pose,
-                    "release_pose": release_pose,
-                    "raw_release_pose": raw_release_pose,
-                    "retreat_pose": hover_pose,
-                    "target_name": candidate.target_name,
-                    "slot_name": candidate.slot_name,
-                    "variant_label": combined_variant_label,
-                    "tcp_verticality": float(candidate.tcp_verticality),
-                    "pad_tilt": float(pad_tilt),
-                    "place_plan": candidate,
-                    "place_mode": place_mode,
-                    "object_category": object_category,
-                    "direct_place_mode": False,
-                    "transport_to_hover": True,
-                    "release_lift_m": float(release_lift),
-                    "hover_extra_height_m": float(hover_extra),
-                }
-                all_candidates.append(item)
-                if pad_tilt <= max_pad_tilt:
-                    level_candidates.append(item)
+            for hover_variant_label, base_hover_pose in base_hover_entries:
+                label_parts = [combined_variant_label, hover_variant_label]
+                hover_variant = "+".join([part for part in label_parts if part]) or None
+                label = "transport_hover" if hover_variant is None else f"transport_hover_{hover_variant}"
+                if max_abs_yaw > 0.0:
+                    ydeg = _variant_abs_yaw_deg_from_labels(hover_variant, label)
+                    if ydeg > max_abs_yaw + 1e-4:
+                        continue
+                for hover_extra in hover_extra_heights:
+                    hover_pose = base_hover_pose
+                    if float(hover_extra) > 1e-6:
+                        hover_pose = _lift_pose_world_z(base_hover_pose, float(hover_extra))
+                    hover_label = label
+                    if float(hover_extra) > 1e-6:
+                        hover_label = f"{hover_label}_hover_plus_{int(round(float(hover_extra) * 1000.0))}mm"
+                    item = {
+                        "label": hover_label,
+                        "pose": hover_pose,
+                        "hover_pose": hover_pose,
+                        "pre_place_pose": hover_pose,
+                        "place_pose": release_pose,
+                        "release_pose": release_pose,
+                        "raw_release_pose": raw_release_pose,
+                        "retreat_pose": hover_pose,
+                        "target_name": candidate.target_name,
+                        "slot_name": candidate.slot_name,
+                        "variant_label": hover_variant,
+                        "tcp_verticality": float(candidate.tcp_verticality),
+                        "pad_tilt": float(pad_tilt),
+                        "place_plan": candidate,
+                        "place_mode": place_mode,
+                        "object_category": object_category,
+                        "direct_place_mode": False,
+                        "transport_to_hover": True,
+                        "release_lift_m": float(release_lift),
+                        "hover_extra_height_m": float(hover_extra),
+                    }
+                    all_candidates.append(item)
+                    if pad_tilt <= max_pad_tilt:
+                        level_candidates.append(item)
     if level_candidates:
         candidates = _dedupe_place_candidates(level_candidates)
         candidates.sort(key=_pre_place_screen_sort_key)
@@ -5021,11 +5261,20 @@ def plan_final_contact_approach(
         disabled_world_collision_links=disabled_world_collision_links,
         label=final_label,
     )
+    source_name = _current_source_object_name(args)
     use_segmented_final_contact = bool(getattr(args, "final_contact_segmented_ik_fallback", False)) or bool(
         getattr(args, "allow_segmented_ik_rescue", False)
     )
+    force_segmented_final_contact = False
+    if source_name == "carriot":
+        use_segmented_final_contact = True
+        force_segmented_final_contact = True
+    if place_mode == "insert_place":
+        use_segmented_final_contact = True
+        force_segmented_final_contact = True
     if verticality_target is not None and verticality_target < 0.5:
         use_segmented_final_contact = True
+        force_segmented_final_contact = True
     try:
         if use_segmented_final_contact:
             release_q_path = _plan_short_curobo_cartesian_descent(
@@ -5036,7 +5285,7 @@ def plan_final_contact_approach(
                 hover_pose,
                 release_pose,
                 label=final_label,
-                force_segmented=verticality_target is not None and verticality_target < 0.5,
+                force_segmented=force_segmented_final_contact,
             )
         else:
             release_q_path = _plan_release_with_motiongen_constraint(
@@ -5153,6 +5402,24 @@ def _evaluate_joint_grasp_place_chains(
     chains = []
     grasp_candidates = list(grasp_successes or [])
     max_grasp_candidates = int(getattr(args, "joint_search_max_grasp_candidates", 8))
+    source_name = _current_source_object_name(args)
+    if (
+        rule is not None
+        and bool(getattr(rule, "preserve_long_axis_vertical", False))
+        and max_grasp_candidates > 0
+        and max_grasp_candidates < 5
+    ):
+        print(
+            "[joint_search] vertical long-axis placement: increasing downstream grasp expansion "
+            f"{max_grasp_candidates}->5 so final-approach can test deeper axis biases"
+        )
+        max_grasp_candidates = 5
+    if source_name == "bi" and max_grasp_candidates > 0 and max_grasp_candidates < 12:
+        print(
+            "[joint_search] bi insert: increasing downstream grasp expansion "
+            f"{max_grasp_candidates}->12 to test equivalent wrist-roll branches"
+        )
+        max_grasp_candidates = 12
     if max_grasp_candidates > 0 and len(grasp_candidates) > max_grasp_candidates:
         non_tilt = [c for c in grasp_candidates if "tilt" not in str(c.get("label", "")).lower()]
         tilted = [c for c in grasp_candidates if "tilt" in str(c.get("label", "")).lower()]
@@ -5413,6 +5680,10 @@ def _evaluate_joint_grasp_place_chains(
                     if not direct_place_successes:
                         lift_m = float(max(getattr(args, "joint_search_start_collision_lift_m", 0.030), 0.0))
                         lift_exclude_names = set(exclude_names or set())
+                        lift_disabled_links = _post_grasp_lift_disabled_world_links(
+                            planner,
+                            direct_place_disabled_links,
+                        )
                         relief_name = _single_obstacle_start_collision_relief(
                             planner,
                             grasp_terminal_q,
@@ -5434,7 +5705,7 @@ def _evaluate_joint_grasp_place_chains(
                                 label=f"joint_start_lift_{safe_label}_{pass_label}",
                                 include_table=True,
                                 exclude_object_names=lift_exclude_names,
-                                disabled_world_collision_links=direct_place_disabled_links,
+                                disabled_world_collision_links=lift_disabled_links,
                             )
                             prof["success"] = lift_path is not None
                             prof["status"] = "Success" if lift_path is not None else "PLAN_FAIL"
@@ -5622,6 +5893,25 @@ def run_targeted_place_episode_curobo_direct(
     print("\n[poses]")
     print("object p:", np.round(demo.get_obj_pose()[0], 6), "object q:", np.round(demo.get_obj_pose()[1], 6))
     direct_grasp_disabled_links: list[str] = []
+    direct_grasp_max_winners = int(getattr(args, "direct_grasp_goalset_max_winners", 2))
+    source_name = _current_source_object_name(args)
+    if (
+        rule is not None
+        and bool(getattr(rule, "preserve_long_axis_vertical", False))
+        and direct_grasp_max_winners > 0
+        and direct_grasp_max_winners < 5
+    ):
+        print(
+            "[direct_grasp] vertical long-axis placement: increasing pregrasp winners "
+            f"{direct_grasp_max_winners}->5 so downstream final-approach can test deeper axis biases"
+        )
+        direct_grasp_max_winners = 5
+    if source_name == "bi" and direct_grasp_max_winners > 0 and direct_grasp_max_winners < 12:
+        print(
+            "[direct_grasp] bi insert: increasing pregrasp winners "
+            f"{direct_grasp_max_winners}->12 to test equivalent wrist-roll branches"
+        )
+        direct_grasp_max_winners = 12
     two_step_pregrasp_successes = _evaluate_two_step_grasp_candidates(
         planner,
         demo,
@@ -5629,7 +5919,7 @@ def run_targeted_place_episode_curobo_direct(
         np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
         grasp_candidates,
         label="two_step_grasp",
-        max_winners=int(getattr(args, "direct_grasp_goalset_max_winners", 12)),
+        max_winners=direct_grasp_max_winners,
         include_active_object=True,
         disabled_world_collision_links=direct_grasp_disabled_links,
     )
@@ -5949,7 +6239,10 @@ def run_targeted_place_episode_curobo_direct(
             label="transport_start_lift",
             include_table=bool(getattr(args, "curobo_table_collision", True)),
             exclude_object_names=lift_exclude_names,
-            disabled_world_collision_links=direct_place_disabled_links,
+            disabled_world_collision_links=_post_grasp_lift_disabled_world_links(
+                planner,
+                direct_place_disabled_links,
+            ),
         )
         if lift_path is not None and len(lift_path) >= 2:
             lift_pose = _lift_pose_world_z(demo.tcp.pose, lift_m)

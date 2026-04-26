@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import os
 from pathlib import Path
 from typing import Any
 
@@ -177,8 +178,21 @@ def build_arg_parser():
     return parser
 
 
+def _configure_curobo_torch_extensions(args) -> None:
+    ext_dir = Path(getattr(args, "curobo_torch_extensions_dir", Path("/tmp/curobo_torch_extensions"))).expanduser().resolve()
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    prev = os.environ.get("TORCH_EXTENSIONS_DIR")
+    os.environ["TORCH_EXTENSIONS_DIR"] = str(ext_dir)
+    if prev is None:
+        print(f"[curobo] set TORCH_EXTENSIONS_DIR={ext_dir}")
+    elif Path(prev) != ext_dir:
+        print(f"[curobo] override TORCH_EXTENSIONS_DIR={prev} -> {ext_dir}")
+
+
 def parse_args():
-    return build_arg_parser().parse_args()
+    args = build_arg_parser().parse_args()
+    _configure_curobo_torch_extensions(args)
+    return args
 
 
 def _planner_cache_key(args) -> tuple[Any, ...]:

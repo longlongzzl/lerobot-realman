@@ -315,6 +315,12 @@ PLACE_RULES["hongshupian"] = apply_vertical_long_axis_rule_overrides(
     PLACE_RULES["hongshupian"],
     face_robot_axis_local=(0.0, 0.0, 1.0),
 )
+PLACE_RULES["lvmukuai"] = PlaceRule(
+    **{
+        **PLACE_RULES["lvmukuai"].__dict__,
+        "tabletop_axial_spin_deg": (0.0, 90.0, 180.0, 270.0),
+    }
+)
 PLACE_RULES["carriot"] = PlaceRule(
     **{
         **PLACE_RULES["carriot"].__dict__,

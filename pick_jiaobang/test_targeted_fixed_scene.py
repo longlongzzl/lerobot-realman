@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from datetime import datetime
 
 from place_rules import list_place_rule_sources
 
@@ -30,6 +31,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--child-python", type=Path, default=DEFAULT_CHILD_PYTHON)
     parser.add_argument("--objects", nargs="*", default=None, help="Optional subset of source objects to test.")
     parser.add_argument("--render-mode", type=str, default="none")
+    parser.add_argument("--repetitions", type=int, default=1, help="Run each selected object this many times.")
+    parser.add_argument("--log-dir", type=Path, default=None, help="Directory to store per-object child logs.")
     parser.add_argument("--per-object-timeout", type=float, default=300.0)
     parser.add_argument("--heartbeat-seconds", type=float, default=15.0)
     parser.add_argument("--post-final-grace-seconds", type=float, default=2.0)
@@ -267,6 +270,10 @@ def _emit_result(result: dict) -> None:
     print(f"{RESULT_PREFIX} {json.dumps(result, ensure_ascii=True, sort_keys=True)}")
 
 
+def _safe_log_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in value)
+
+
 def main() -> None:
     args, extra_args = parse_args()
     scene_file = args.scene_file.resolve()
@@ -274,6 +281,10 @@ def main() -> None:
     child_python = args.child_python.resolve()
     scene_object_names = _load_scene_object_names(scene_file)
     test_objects = _resolve_test_objects(scene_object_names, args.objects)
+    repetitions = max(1, int(args.repetitions))
+    log_dir = args.log_dir.resolve() if args.log_dir is not None else None
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
 
     if not test_objects:
         result = {
@@ -288,47 +299,77 @@ def main() -> None:
 
     print(
         f"[test] fixed-scene batch planning: scene={scene_file} seed={args.seed} "
-        f"objects={test_objects} render_mode={args.render_mode}"
+        f"objects={test_objects} render_mode={args.render_mode} repetitions={repetitions}"
     )
 
     results: list[dict] = []
-    for index, object_name in enumerate(test_objects, start=1):
-        obstacle_names = [name for name in scene_object_names if name != object_name]
-        print(f"\n[test] object {index}/{len(test_objects)}: {object_name} obstacles={obstacle_names}")
-        cmd = _build_child_cmd(
-            child_python=child_python,
-            entrypoint=entrypoint,
-            scene_file=scene_file,
-            seed=args.seed,
-            render_mode=args.render_mode,
-            object_name=object_name,
-            obstacle_names=obstacle_names,
-            extra_args=extra_args,
-        )
-        returncode, stdout, stderr = _run_child(
-            cmd,
-            print_child_logs=bool(args.print_child_logs),
-            heartbeat_seconds=float(args.heartbeat_seconds),
-            timeout_seconds=float(args.per_object_timeout),
-            post_final_grace_seconds=float(args.post_final_grace_seconds),
-            object_name=object_name,
-        )
-        success = returncode == 0 and "final success = True" in stdout
-        effective_returncode = 0 if success else (returncode if returncode != 0 else 1)
-        failure_code = "ok"
-        failure_detail = ""
-        if not success:
-            failure_code, failure_detail = _extract_failure_reason(stdout, stderr)
-        result = {
-            "object_name": object_name,
-            "success": success,
-            "returncode": effective_returncode,
-            "raw_returncode": returncode,
-            "failure_reason_code": failure_code,
-            "failure_reason_detail": failure_detail,
-        }
-        results.append(result)
-        _emit_result(result)
+    for repetition in range(1, repetitions + 1):
+        for index, object_name in enumerate(test_objects, start=1):
+            obstacle_names = [name for name in scene_object_names if name != object_name]
+            print(
+                f"\n[test] repetition {repetition}/{repetitions} object {index}/{len(test_objects)}: "
+                f"{object_name} obstacles={obstacle_names}"
+            )
+            cmd = _build_child_cmd(
+                child_python=child_python,
+                entrypoint=entrypoint,
+                scene_file=scene_file,
+                seed=args.seed,
+                render_mode=args.render_mode,
+                object_name=object_name,
+                obstacle_names=obstacle_names,
+                extra_args=extra_args,
+            )
+            returncode, stdout, stderr = _run_child(
+                cmd,
+                print_child_logs=bool(args.print_child_logs),
+                heartbeat_seconds=float(args.heartbeat_seconds),
+                timeout_seconds=float(args.per_object_timeout),
+                post_final_grace_seconds=float(args.post_final_grace_seconds),
+                object_name=object_name,
+            )
+            success = returncode == 0 and "final success = True" in stdout
+            effective_returncode = 0 if success else (returncode if returncode != 0 else 1)
+            failure_code = "ok"
+            failure_detail = ""
+            if not success:
+                failure_code, failure_detail = _extract_failure_reason(stdout, stderr)
+            log_path = None
+            if log_dir is not None:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                scene_stem = _safe_log_name(scene_file.stem)
+                object_stem = _safe_log_name(object_name)
+                log_path = log_dir / f"{timestamp}_{scene_stem}_{object_stem}_rep{repetition}.log"
+                header = {
+                    "cmd": cmd,
+                    "scene_file": str(scene_file),
+                    "object_name": object_name,
+                    "repetition": repetition,
+                    "returncode": effective_returncode,
+                    "raw_returncode": returncode,
+                    "success": success,
+                    "failure_reason_code": failure_code,
+                    "failure_reason_detail": failure_detail,
+                }
+                log_path.write_text(
+                    "# TEST_CHILD_METADATA "
+                    + json.dumps(header, ensure_ascii=True, sort_keys=True)
+                    + "\n"
+                    + stdout,
+                    encoding="utf-8",
+                )
+            result = {
+                "object_name": object_name,
+                "repetition": repetition,
+                "success": success,
+                "returncode": effective_returncode,
+                "raw_returncode": returncode,
+                "failure_reason_code": failure_code,
+                "failure_reason_detail": failure_detail,
+                "log_path": str(log_path) if log_path is not None else "",
+            }
+            results.append(result)
+            _emit_result(result)
 
     passed = sum(1 for item in results if bool(item["success"]))
     total = len(results)
@@ -336,6 +377,7 @@ def main() -> None:
         "scene_file": str(scene_file),
         "seed": int(args.seed),
         "tested_objects": [item["object_name"] for item in results],
+        "repetitions": repetitions,
         "passed": passed,
         "failed": total - passed,
         "success_rate": (float(passed) / float(total)) if total else 0.0,
