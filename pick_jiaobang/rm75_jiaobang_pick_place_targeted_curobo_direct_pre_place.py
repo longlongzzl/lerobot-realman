@@ -212,6 +212,26 @@ def build_arg_parser():
         help="For insert_vertical rules, also try these short pre-place approach distances along the target long axis.",
     )
     parser.add_argument(
+        "--bi-insert-release-height-offsets-m",
+        type=float,
+        nargs="*",
+        default=[0.0],
+        help=(
+            "For bi insert placement, try these extra release offsets along the holder opening axis. "
+            "Default keeps the original target depth; use the fallback option to retry shallower releases only after failure."
+        ),
+    )
+    parser.add_argument(
+        "--bi-insert-release-fallback-height-offsets-m",
+        type=float,
+        nargs="*",
+        default=[0.01],
+        help=(
+            "For bi insert placement, retry these shallower release offsets only if the original release depth "
+            "does not produce a complete grasp->place chain."
+        ),
+    )
+    parser.add_argument(
         "--direct-pre-place-z-offsets",
         type=float,
         nargs="*",
@@ -257,8 +277,18 @@ def build_arg_parser():
         "--bi-direct-grasp-approach-roll-degs",
         type=float,
         nargs="*",
-        default=[0.0, 180.0],
-        help="For the pen, try these equivalent TCP approach-axis rolls. 180deg swaps gripper pads without changing the top-down contact geometry.",
+        default=[0.0, 90.0, 180.0, 270.0],
+        help="For the pen, try equivalent TCP approach-axis rolls. 90/270deg cover otherwise unreachable yaw-only pen poses without changing the top-down contact geometry.",
+    )
+    parser.add_argument(
+        "--shuazi-direct-grasp-approach-roll-degs",
+        type=float,
+        nargs="*",
+        default=[0.0, 90.0, 180.0, 270.0],
+        help=(
+            "For shuazi, try equivalent TCP approach-axis rolls. This changes the gripper/object relation "
+            "without changing the fixed final object pose."
+        ),
     )
     parser.add_argument(
         "--direct-grasp-diagnose-topk",
@@ -476,7 +506,7 @@ def build_arg_parser():
     parser.add_argument(
         "--direct-grasp-goalset-max-winners",
         type=int,
-        default=2,
+        default=1,
         help="When screening grasp candidates with cuRobo goalset, keep extracting at most this many successful winners. Set <=0 to exhaust the goalset.",
     )
     parser.add_argument(
@@ -687,10 +717,20 @@ def build_arg_parser():
         help="Extra wrist-roll candidates around the carriot release approach axis.",
     )
     parser.add_argument(
+        "--carriot-transport-fast-lane-max-candidates",
+        type=int,
+        default=48,
+        help=(
+            "For carriot joint-search transport, try this many preferred candidates first "
+            "with cuRobo goalset max_winners=1. If that fast lane fails final contact, "
+            "the full candidate set remains fallback."
+        ),
+    )
+    parser.add_argument(
         "--direct-place-contact-lift-m",
         type=float,
-        default=0.003,
-        help="Legacy alias for final contact clearance on tabletop release candidates.",
+        default=0.0,
+        help="Legacy alias for tabletop release lift. Default 0 keeps the final object height fixed.",
     )
     parser.add_argument(
         "--place-mode",
@@ -726,8 +766,8 @@ def build_arg_parser():
     parser.add_argument(
         "--final-contact-clearance-m",
         type=float,
-        default=0.003,
-        help="Small world-z clearance added to tabletop contact release poses before the final contact approach.",
+        default=0.0,
+        help="Small world-z clearance added to tabletop contact release poses. Default 0 keeps the final object height fixed.",
     )
     parser.add_argument(
         "--place-transport-max-winners",
@@ -736,11 +776,141 @@ def build_arg_parser():
         help="Keep this many successful transport-to-hover candidates before trying final contact approach.",
     )
     parser.add_argument(
+        "--joint-search-max-final-contact-checks",
+        type=int,
+        default=4,
+        help=(
+            "Maximum sequential final-contact MotionGen validations per joint-search "
+            "transport batch. Set <=0 to validate every transport winner."
+        ),
+    )
+    parser.add_argument(
+        "--insert-joint-search-max-final-contact-checks",
+        type=int,
+        default=2,
+        help=(
+            "Maximum sequential final-contact validations for insert_place batches "
+            "such as bi->bitong. Set <=0 to use --joint-search-max-final-contact-checks."
+        ),
+    )
+    parser.add_argument(
+        "--skip-return-to-cycle-start",
+        action="store_true",
+        default=False,
+        help="After a successful place, do not plan the empty-gripper return-to-start segment. Useful for headless batch regression speed tests.",
+    )
+    parser.add_argument(
+        "--strict-return-to-cycle-start",
+        action="store_true",
+        default=False,
+        help=(
+            "Treat empty-gripper return_to_cycle_start failure after a completed place as fatal. "
+            "By default the object placement remains successful and the next cycle starts from the current arm pose."
+        ),
+    )
+    parser.add_argument(
+        "--skip-post-place-clearance",
+        action="store_true",
+        default=False,
+        help="After opening the gripper, skip the empty-gripper post-place clearance plan. Useful for headless batch regression speed tests.",
+    )
+    parser.add_argument(
         "--final-contact-segmented-ik-fallback",
         dest="final_contact_segmented_ik_fallback",
         action="store_true",
         default=False,
         help="If constrained final contact approach fails, allow short segmented IK fallback for the last few centimeters.",
+    )
+    parser.add_argument(
+        "--final-contact-segmented-ik-first",
+        dest="final_contact_segmented_ik_first",
+        action="store_true",
+        default=False,
+        help="For short final-contact descents, try segmented IK before MotionGen and fall back to MotionGen if needed.",
+    )
+    parser.add_argument(
+        "--no-final-contact-segmented-ik-first",
+        dest="final_contact_segmented_ik_first",
+        action="store_false",
+        help="Use MotionGen first for final-contact descents.",
+    )
+    parser.add_argument(
+        "--strict-final-contact-linear",
+        dest="strict_final_contact_linear",
+        action="store_true",
+        default=True,
+        help=(
+            "Require hover->release final contact to use cuRobo PoseCostMetric constrained approach "
+            "and reject returned paths whose realized TCP waypoints deviate too much from the straight line."
+        ),
+    )
+    parser.add_argument(
+        "--no-strict-final-contact-linear",
+        dest="strict_final_contact_linear",
+        action="store_false",
+        help="Allow final contact paths without straight-line waypoint validation.",
+    )
+    parser.add_argument(
+        "--strict-final-contact-waypoint-pos-tol-m",
+        type=float,
+        default=0.008,
+        help="Maximum realized TCP distance from the commanded straight line for short constrained segments.",
+    )
+    parser.add_argument(
+        "--strict-final-contact-waypoint-backtrack-tol-m",
+        type=float,
+        default=0.008,
+        help=(
+            "Maximum extra movement opposite the commanded hover->release line before descending. "
+            "This allows small same-line cuRobo pre-lifts without allowing lateral drift."
+        ),
+    )
+    parser.add_argument(
+        "--strict-short-linear-waypoint-pos-tol-m",
+        type=float,
+        default=0.010,
+        help=(
+            "Maximum realized TCP line error for non-contact short constrained segments "
+            "(grasp approach, post-grasp lift, post-place retreat). Final contact keeps "
+            "--strict-final-contact-waypoint-pos-tol-m."
+        ),
+    )
+    parser.add_argument(
+        "--strict-final-contact-waypoint-rot-tol-deg",
+        type=float,
+        default=8.0,
+        help="Maximum realized TCP rotation error for short constrained-segment waypoints.",
+    )
+    parser.add_argument(
+        "--final-contact-approach-metric-tstep-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "cuRobo PoseCostMetric activation fraction for hover->release final contact. "
+            "Default constrains the whole short contact segment so release descents stay straight."
+        ),
+    )
+    parser.add_argument(
+        "--curobo-approach-metric-tstep-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "cuRobo PoseCostMetric activation fraction for non-contact short straight segments "
+            "(grasp approach, post-grasp lift, post-place retreat). Default 0 constrains the whole segment."
+        ),
+    )
+    parser.add_argument(
+        "--strict-short-linear-segments",
+        dest="strict_short_linear_segments",
+        action="store_true",
+        default=True,
+        help="Apply straight-line waypoint validation to grasp approach, post-grasp lift, final contact, and post-place retreat.",
+    )
+    parser.add_argument(
+        "--no-strict-short-linear-segments",
+        dest="strict_short_linear_segments",
+        action="store_false",
+        help="Disable straight-line waypoint validation for short constrained segments.",
     )
     parser.add_argument(
         "--no-final-contact-segmented-ik-fallback",
@@ -758,7 +928,7 @@ def build_arg_parser():
         "--two-step-final-approach-segmented-fallback",
         dest="two_step_final_approach_segmented_fallback",
         action="store_true",
-        default=True,
+        default=False,
         help="If the official MotionGen metric fails for the short pregrasp->grasp descent, "
         "try bounded segmented IK before rejecting the grasp candidate.",
     )
@@ -767,6 +937,19 @@ def build_arg_parser():
         dest="two_step_final_approach_segmented_fallback",
         action="store_false",
         help="Disable segmented IK fallback for the two-step grasp final approach.",
+    )
+    parser.add_argument(
+        "--two-step-final-approach-segmented-first",
+        dest="two_step_final_approach_segmented_first",
+        action="store_true",
+        default=False,
+        help="For short pregrasp->grasp descents, try bounded segmented IK before MotionGen.",
+    )
+    parser.add_argument(
+        "--no-two-step-final-approach-segmented-first",
+        dest="two_step_final_approach_segmented_first",
+        action="store_false",
+        help="Use MotionGen first for pregrasp->grasp final approach.",
     )
     parser.add_argument(
         "--allow-demo-planner-rescue",
@@ -787,6 +970,12 @@ def build_arg_parser():
         default=0.25,
         help="Soft rotation threshold (rad) used by batch IK prefilter before MotionGen. "
         "Raise this when direct-place candidates are close in position but fail due to orientation error.",
+    )
+    parser.add_argument(
+        "--curobo-multistart-stage-size",
+        type=int,
+        default=128,
+        help="For large multi-start goal sets with a small winner count, evaluate candidates in ordered stages of this size; set <=0 to prefilter all candidates at once.",
     )
     parser.add_argument(
         "--transport-attached-box-scale-xy",
@@ -861,11 +1050,6 @@ def _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, label: str, *, us
             include_active_object=False,
             include_table=bool(getattr(args, "curobo_table_collision", True)),
         )
-        planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
-            demo,
-            lift_pose,
-            ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
-        )
         disabled_links = (
             _post_grasp_lift_disabled_world_links(planner, _direct_place_contact_tolerant_disabled_links(planner))
             if use_attach
@@ -880,15 +1064,15 @@ def _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, label: str, *, us
             label=label,
         )
         try:
-            result = planner.plan_to_pose(
+            q_path = _plan_constrained_linear_segment(
+                planner,
+                demo,
+                args,
                 q_current,
-                planner_pose,
-                enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
-                max_attempts=max(int(getattr(args, "curobo_max_attempts", 2)), 3),
-                timeout=max(float(getattr(args, "curobo_timeout", 5.0)), 5.0),
-                num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
-                num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
-                num_graph_seeds=max(int(getattr(args, "curobo_num_graph_seeds", 1)), 2),
+                demo.tcp.pose,
+                lift_pose,
+                label=label,
+                validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
             )
         finally:
             _set_world_collision_for_links(
@@ -899,11 +1083,9 @@ def _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, label: str, *, us
             )
             if "attached_object" in set(disabled):
                 _restore_attached_spheres_after_contact(planner)
-        if result.success and result.joint_path is not None:
-            q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in result.joint_path]
-        else:
+        if q_path is None:
             print(
-                f"[post_grasp_lift] cuRobo lift failed with status={getattr(result, 'status', None)}; "
+                "[post_grasp_lift] cuRobo constrained lift failed; "
                 "demo planner rescue is "
                 f"{'enabled' if bool(getattr(args, 'allow_demo_planner_rescue', False)) else 'disabled'}"
             )
@@ -1267,16 +1449,96 @@ def _apply_deferred_two_step_final_approach(planner, demo, args, grasp_choice, p
             include_active_object=False,
             include_table=False,
         )
-        final_approach_path = _plan_with_official_approach_metric(
-            planner,
-            demo,
-            args,
-            pregrasp_q,
-            pregrasp_pose,
-            grasp_pose,
-            label=final_approach_label,
-        )
-        if final_approach_path is None and bool(getattr(args, "two_step_final_approach_segmented_fallback", True)):
+        source_name = _current_source_object_name(args)
+        segmented_fallback_enabled = bool(getattr(args, "two_step_final_approach_segmented_fallback", False))
+        final_approach_path = None
+        approach_distance_m = float(pregrasp_success.get("approach_distance_m", 0.0) or 0.0)
+        if (
+            bool(getattr(args, "two_step_final_approach_segmented_first", False))
+            and segmented_fallback_enabled
+            and approach_distance_m <= 0.080 + 1e-6
+        ):
+            final_approach_path = _plan_short_curobo_cartesian_descent(
+                planner,
+                demo,
+                args,
+                pregrasp_q,
+                pregrasp_pose,
+                grasp_pose,
+                label=f"{final_approach_label}_segmented_first",
+                force_segmented=True,
+            )
+        if final_approach_path is None:
+            final_approach_path = _plan_constrained_linear_segment(
+                planner,
+                demo,
+                args,
+                pregrasp_q,
+                pregrasp_pose,
+                grasp_pose,
+                label=final_approach_label,
+                validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
+            )
+        if final_approach_path is None:
+            # The last 7 cm of grasping starts from a near-contact configuration.
+            # Keep cuRobo's constrained straight approach, but relax gripper/world
+            # collision for this contact segment only; the active target remains
+            # excluded from the world and full collision is restored immediately.
+            disabled = _set_world_collision_for_links(
+                planner,
+                _direct_grasp_target_contact_only_disabled_links(planner),
+                enabled=False,
+                label=f"{final_approach_label}_gripper_world_relaxed",
+            )
+            try:
+                print(
+                    f"[two_step_grasp] official final approach failed for {grasp_choice.get('label', '?')}; "
+                    "retrying with gripper world collision relaxed"
+                )
+                final_approach_path = _plan_constrained_linear_segment(
+                    planner,
+                    demo,
+                    args,
+                    pregrasp_q,
+                    pregrasp_pose,
+                    grasp_pose,
+                    label=f"{final_approach_label}_gripper_world_relaxed",
+                    validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
+                )
+            finally:
+                _set_world_collision_for_links(
+                    planner,
+                    disabled,
+                    enabled=True,
+                    label=f"{final_approach_label}_gripper_world_relaxed",
+                )
+        if final_approach_path is None and source_name == "bi" and segmented_fallback_enabled:
+            disabled = _set_world_collision_for_links(
+                planner,
+                _direct_place_contact_tolerant_disabled_links(planner),
+                enabled=False,
+                label=f"{final_approach_label}_support_relaxed_segmented_ik",
+            )
+            try:
+                final_approach_path = _plan_short_curobo_cartesian_descent(
+                    planner,
+                    demo,
+                    args,
+                    pregrasp_q,
+                    pregrasp_pose,
+                    grasp_pose,
+                    label=f"{final_approach_label}_support_relaxed_segmented_ik",
+                    force_segmented=True,
+                    allow_motiongen_fallback=False,
+                )
+            finally:
+                _set_world_collision_for_links(
+                    planner,
+                    disabled,
+                    enabled=True,
+                    label=f"{final_approach_label}_support_relaxed_segmented_ik",
+                )
+        if final_approach_path is None and source_name != "bi" and segmented_fallback_enabled:
             print(
                 f"[two_step_grasp] official final approach failed for {grasp_choice.get('label', '?')}; "
                 "trying bounded segmented IK fallback"
@@ -1290,46 +1552,8 @@ def _apply_deferred_two_step_final_approach(planner, demo, args, grasp_choice, p
                 grasp_pose,
                 label=f"{final_approach_label}_segmented_ik",
                 force_segmented=True,
+                allow_motiongen_fallback=False,
             )
-        if final_approach_path is None and _current_source_object_name(args) == "bi":
-            disabled = _set_world_collision_for_links(
-                planner,
-                _direct_place_contact_tolerant_disabled_links(planner),
-                enabled=False,
-                label=f"{final_approach_label}_support_relaxed",
-            )
-            try:
-                print(
-                    f"[two_step_grasp] final approach still failed for {grasp_choice.get('label', '?')}; "
-                    "retrying with gripper support-link world collision relaxed"
-                )
-                final_approach_path = _plan_with_official_approach_metric(
-                    planner,
-                    demo,
-                    args,
-                    pregrasp_q,
-                    pregrasp_pose,
-                    grasp_pose,
-                    label=f"{final_approach_label}_support_relaxed",
-                )
-                if final_approach_path is None and bool(getattr(args, "two_step_final_approach_segmented_fallback", True)):
-                    final_approach_path = _plan_short_curobo_cartesian_descent(
-                        planner,
-                        demo,
-                        args,
-                        pregrasp_q,
-                        pregrasp_pose,
-                        grasp_pose,
-                        label=f"{final_approach_label}_support_relaxed_segmented_ik",
-                        force_segmented=True,
-                    )
-            finally:
-                _set_world_collision_for_links(
-                    planner,
-                    disabled,
-                    enabled=True,
-                    label=f"{final_approach_label}_support_relaxed",
-                )
         _refresh_curobo_world(
             planner,
             demo,
@@ -1505,6 +1729,8 @@ def _visualize_attached_spheres(planner, demo, args):
             f"  sphere[{i}]: world_center=[{world_center[0]:.4f}, {world_center[1]:.4f}, {world_center[2]:.4f}], "
             f"radius={s['radius']*1000:.1f}mm"
         )
+    if str(getattr(args, "render_mode", "none")) == "none":
+        return
     if not bool(getattr(args, "curobo_show_attached_spheres", True)):
         return
     try:
@@ -1690,13 +1916,19 @@ def _direct_place_contact_tolerant_disabled_links(planner) -> list[str]:
 def _post_grasp_lift_disabled_world_links(planner, base_links: list[str] | None = None) -> list[str]:
     """
     抓住后的第一段直线上提用于把物体从接触面上解耦。
-    这段允许 attached payload 暂时忽略世界碰撞；后续 transport 会重新启用。
+    这段从夹爪/物体/桌面的接触状态出发，允许夹爪和 attached payload
+    暂时忽略世界碰撞；后续 transport 会重新启用完整碰撞。
     """
     configured_links = set(getattr(planner, "configured_collision_links", []) or [])
     links = set(base_links or [])
-    if "attached_object" in configured_links:
+    links.update(_direct_grasp_target_contact_only_disabled_links(planner))
+    # attached_object is a dynamic cuRobo collision link created by attach_spheres_to_robot().
+    # It is not guaranteed to appear in the static robot yaml collision_link_names.
+    if getattr(planner, "attached_object_active", False) or "attached_object" in configured_links:
         links.add("attached_object")
-    return sorted(links & configured_links) if configured_links else sorted(links)
+    if configured_links:
+        return sorted((links & configured_links) | ({"attached_object"} if "attached_object" in links else set()))
+    return sorted(links)
 
 
 def _normalize_disabled_world_collision_links(planner, disabled_world_collision_links) -> list[str]:
@@ -1709,7 +1941,7 @@ def _normalize_disabled_world_collision_links(planner, disabled_world_collision_
         name = str(link_name)
         if not name or name in seen:
             continue
-        if configured_links and name not in configured_links:
+        if configured_links and name not in configured_links and name != "attached_object":
             continue
         seen.add(name)
         normalized.append(name)
@@ -1806,6 +2038,7 @@ def _candidate_place_orientation_penalty(candidate, demo, args) -> float:
 def _candidate_sort_key(item):
     metrics = item["metrics"]
     return (
+        *_carriot_place_variant_preference(item.get("variant_label"), item.get("label")),
         float(item["score"]),
         float(metrics["total_motion"]),
         float(metrics["joint7_total_motion"]),
@@ -1814,9 +2047,9 @@ def _candidate_sort_key(item):
 
 
 def _variant_yaw_deg_from_labels(variant_label: str | None, label: str | None = None) -> float:
-    """Parse tabletop yaw from variant/label, e.g. yaw_-60deg -> -60. No match -> 0."""
+    """Parse tabletop yaw or insert axial spin from labels. No match -> 0."""
     text = " ".join(str(x) for x in (variant_label, label) if x is not None)
-    m = re.search(r"yaw_([-+]?\d+(?:\.\d+)?)deg", text)
+    m = re.search(r"(?:yaw|spin)_([-+]?\d+(?:\.\d+)?)deg", text)
     if not m:
         return 0.0
     yaw = float(m.group(1))
@@ -1831,12 +2064,48 @@ def _variant_abs_yaw_deg_from_labels(variant_label: str | None, label: str | Non
     return abs(_variant_yaw_deg_from_labels(variant_label, label))
 
 
+def _carriot_place_variant_preference(variant_label: str | None, label: str | None = None) -> tuple[int, int, float]:
+    """Prefer cariot release variants that consistently pass final contact.
+
+    The full candidate set is still evaluated as fallback. This only changes
+    ordering so the search does not spend most of the budget validating
+    free-roll poses that are reachable in transport but frequently fail descent.
+    """
+    text = " ".join(str(x).lower() for x in (variant_label, label) if x is not None)
+    if "free_roll" not in text and "tilt_body_" not in text:
+        return (0, 3, 0.0)
+
+    free_roll_penalty = 1 if "free_roll" in text else 0
+    roll_abs = 0.0
+    roll_match = re.search(r"free_roll_([-+]?\d+(?:\.\d+)?)deg", text)
+    if roll_match:
+        roll_abs = abs(float(roll_match.group(1)))
+
+    tilt_pref = 3
+    tilt_match = re.search(r"tilt_body_(toward|away)_robot_([-+]?\d+(?:\.\d+)?)deg", text)
+    if tilt_match:
+        direction = tilt_match.group(1)
+        deg = abs(float(tilt_match.group(2)))
+        if direction == "toward":
+            if abs(deg - 15.0) <= 1.0:
+                tilt_pref = 0
+            elif abs(deg - 30.0) <= 1.0:
+                tilt_pref = 1
+            else:
+                tilt_pref = 2
+        else:
+            tilt_pref = 5
+
+    return (free_roll_penalty, tilt_pref, roll_abs)
+
+
 def _pre_place_screen_sort_key(item):
     label = "" if item.get("label") is None else str(item.get("label"))
     variant = "" if item.get("variant_label") is None else str(item.get("variant_label"))
     pose_z = float(_get_pose_position(item["pose"])[2]) if "pose" in item else 0.0
     place_z = float(_get_pose_position(item["place_pose"])[2]) if "place_pose" in item else 0.0
     yaw_abs = _variant_abs_yaw_deg_from_labels(variant, label)
+    carriot_pref = _carriot_place_variant_preference(variant, label)
     hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
     verticality_target = _candidate_tcp_verticality_target(item)
     axis_vertical_target = _candidate_tcp_axis_vertical_target(item)
@@ -1852,6 +2121,7 @@ def _pre_place_screen_sort_key(item):
             axis_delta,
             verticality_delta,
             yaw_abs,
+            carriot_pref,
             hover_extra,
             -place_z,
             -pose_z,
@@ -1860,6 +2130,7 @@ def _pre_place_screen_sort_key(item):
         )
     return (
         yaw_abs,
+        carriot_pref,
         hover_extra,
         -float(item.get("tcp_verticality", 0.0)),
         -place_z,
@@ -2024,6 +2295,244 @@ def _select_diverse_place_candidates(candidates, max_count: int, *, label: str) 
         f"(yaw_deg={selected_yaw_values}, hover_extra_mm={selected_hover_mm})"
     )
     return selected
+
+
+def _bi_insert_fast_lane_candidates(candidates, *, label: str) -> list:
+    ordered = sorted(list(candidates or []), key=_pre_place_screen_sort_key)
+    if not ordered:
+        return []
+    preferred_spins = (0.0, -15.0, 15.0, -90.0, 90.0, -105.0, -120.0, -135.0, -150.0)
+    fast = []
+    for item in ordered:
+        item_label = str(item.get("label", ""))
+        if str(item.get("place_mode", "")) != "insert_place":
+            continue
+        if "approach_50mm" not in item_label:
+            continue
+        spin_deg = _variant_yaw_deg_from_labels(item.get("variant_label"), item.get("label"))
+        if all(_yaw_distance_deg(spin_deg, preferred) > 1.0 for preferred in preferred_spins):
+            continue
+        hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
+        if hover_extra > 0.031:
+            continue
+        fast.append(item)
+    if not fast or len(fast) >= len(ordered):
+        return ordered
+    selected_spins = sorted(
+        {int(round(_variant_yaw_deg_from_labels(item.get("variant_label"), item.get("label")))) for item in fast}
+    )
+    print(
+        f"[joint_search] {label} bi insert fast lane kept {len(fast)}/{len(ordered)} "
+        f"candidate(s): approach_50mm, hover_extra<=30mm, preferred raw/no-spin first, spin_deg={selected_spins}; "
+        "full set remains fallback"
+    )
+    return fast
+
+
+def _carriot_transport_fast_lane_candidates(candidates, args, *, label: str) -> list:
+    """Preferred carriot transport candidates for a cheap goalset-first probe.
+
+    This is an ordering-only optimization: callers must keep the full candidate
+    set as fallback if the fast lane does not produce an accepted chain.
+    """
+    ordered = sorted(list(candidates or []), key=_pre_place_screen_sort_key)
+    if not ordered:
+        return []
+    max_count = int(getattr(args, "carriot_transport_fast_lane_max_candidates", 48) or 0)
+    if max_count <= 0:
+        return []
+
+    preferred = []
+    fallback = []
+    for item in ordered:
+        text = " ".join(
+            str(item.get(k, ""))
+            for k in ("label", "variant_label", "slot_name")
+        ).lower()
+        hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
+        has_free_roll = "free_roll" in text
+        has_body_tilt = "tilt_body_" in text
+        body_toward_15 = "tilt_body_toward_robot_15deg" in text
+        body_away = "tilt_body_away_robot" in text
+
+        if hover_extra <= 0.031 and not has_free_roll and not body_away and (body_toward_15 or not has_body_tilt):
+            preferred.append(item)
+        else:
+            fallback.append(item)
+
+    fast = (preferred + fallback)[:max_count]
+    if not fast or len(fast) >= len(ordered):
+        return []
+    print(
+        f"[joint_search] {label} carriot transport fast lane kept {len(fast)}/{len(ordered)} "
+        "preferred candidate(s); full set remains fallback"
+    )
+    return fast
+
+
+def _vertical_long_axis_transport_fast_lane_candidates(candidates, source_name: str | None, args, *, label: str) -> list:
+    """High-probability transport candidates for vertical long-axis tabletop objects.
+
+    This does not remove any candidates from the full search.  It only probes a
+    small, repeatedly successful subset before falling back to the complete
+    candidate set.  The final object pose remains the original place-rule pose.
+    """
+    source = str(source_name or "").lower()
+    if source not in {"gluestick", "hongshupian"}:
+        return []
+
+    max_count = int(getattr(args, "vertical_long_axis_transport_fast_lane_max_candidates", 0) or 0)
+    if max_count <= 0:
+        return []
+
+    ordered = sorted(list(candidates or []), key=_pre_place_screen_sort_key)
+    if not ordered:
+        return []
+
+    def _slot_index(item) -> int:
+        m = re.search(r"slot_(\d+)", str(item.get("slot_name", "")))
+        return int(m.group(1)) if m else 999
+
+    preferred = []
+    fallback = []
+    for item in ordered:
+        label_text = " ".join(str(item.get(k, "")) for k in ("label", "variant_label", "slot_name")).lower()
+        yaw = _variant_yaw_deg_from_labels(item.get("variant_label"), item.get("label"))
+        hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
+        slot_idx = _slot_index(item)
+
+        if source == "gluestick":
+            # Glue-stick vertical placements have consistently accepted yaw_135
+            # once the transport branch is otherwise feasible.  Include the
+            # nearby opposite-wrap spelling in case label normalization changes.
+            yaw_rank = min(_yaw_distance_deg(yaw, 135.0), _yaw_distance_deg(yaw, -135.0))
+            is_preferred = yaw_rank <= 1.0 and hover_extra <= 0.061
+            rank = (yaw_rank, hover_extra, float(item.get("score", 0.0) or 0.0), label_text)
+        else:
+            # Chip-can vertical placements vary by slot.  Keep a small slot-aware
+            # yaw set that covers the successful fixed/random-scene branches.
+            if slot_idx >= 5:
+                target_yaws = (45.0, 0.0, -90.0)
+            elif slot_idx == 4:
+                target_yaws = (0.0, -90.0, 45.0)
+            else:
+                target_yaws = (0.0, 45.0, -90.0)
+            yaw_rank = min(_yaw_distance_deg(yaw, target) for target in target_yaws)
+            is_preferred = yaw_rank <= 1.0 and hover_extra <= 0.061
+            rank = (yaw_rank, hover_extra, float(item.get("score", 0.0) or 0.0), label_text)
+
+        bucket_item = (rank, item)
+        if is_preferred:
+            preferred.append(bucket_item)
+        else:
+            fallback.append(bucket_item)
+
+    preferred.sort(key=lambda x: x[0])
+    fallback.sort(key=lambda x: x[0])
+    fast = [item for _, item in (preferred + fallback)[:max_count]]
+    if not fast or len(fast) >= len(ordered):
+        return []
+    selected = [
+        str(item.get("label", "?"))
+        for item in fast[: min(len(fast), 8)]
+    ]
+    print(
+        f"[joint_search] {label} {source} vertical-long-axis fast lane kept "
+        f"{len(fast)}/{len(ordered)} candidate(s): {selected}; full set remains fallback"
+    )
+    return fast
+
+
+def _final_contact_validation_sort_key(item) -> tuple:
+    hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
+    spin_deg = _variant_yaw_deg_from_labels(item.get("variant_label"), item.get("label"))
+    metrics = item.get("metrics") or {}
+    return (
+        1 if hover_extra > 1e-6 else 0,
+        hover_extra,
+        _carriot_place_variant_preference(item.get("variant_label"), item.get("label")),
+        float(item.get("score", 0.0) or 0.0),
+        float(metrics.get("total_motion", 0.0) or 0.0),
+        _yaw_distance_deg(spin_deg, -90.0),
+        spin_deg,
+    )
+
+
+def _bi_final_contact_validation_sort_key(item) -> tuple:
+    """Prefer insert descents that have repeatedly validated for the pen.
+
+    This is deliberately ordering-only: if the preferred spin fails, the full
+    set still falls through to the generic validation order.
+    """
+    label = "" if item.get("label") is None else str(item.get("label"))
+    variant = "" if item.get("variant_label") is None else str(item.get("variant_label"))
+    text = f"{variant} {label}".lower()
+    spin_deg = _variant_yaw_deg_from_labels(variant, label)
+    hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
+    approach_match = re.search(r"approach_([-+]?\d+(?:\.\d+)?)mm", text)
+    approach_mm = float(approach_match.group(1)) if approach_match else 0.0
+    release_up_match = re.search(r"release_up_([-+]?\d+(?:\.\d+)?)mm", text)
+    release_up_mm = float(release_up_match.group(1)) if release_up_match else 0.0
+    is_insert = str(item.get("place_mode", "")) == "insert_place"
+    return (
+        0 if is_insert else 1,
+        0 if abs(approach_mm - 50.0) <= 1.0 else 1,
+        _yaw_distance_deg(spin_deg, 0.0),
+        release_up_mm,
+        _yaw_distance_deg(spin_deg, -15.0),
+        0 if hover_extra <= 1e-6 else 1,
+        hover_extra,
+        *_final_contact_validation_sort_key(item),
+    )
+
+
+def _vertical_long_axis_final_contact_sort_key(item, source_name: str | None) -> tuple:
+    source = str(source_name or "").lower()
+    label = "" if item.get("label") is None else str(item.get("label"))
+    variant = "" if item.get("variant_label") is None else str(item.get("variant_label"))
+    text = f"{variant} {label}".lower()
+    yaw = _variant_yaw_deg_from_labels(variant, label)
+    hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
+    slot_text = str(item.get("slot_name", ""))
+    slot_match = re.search(r"slot_(\d+)", slot_text)
+    slot_idx = int(slot_match.group(1)) if slot_match else 999
+    if source == "gluestick":
+        yaw_pref = min(_yaw_distance_deg(yaw, 135.0), _yaw_distance_deg(yaw, -135.0))
+    elif source == "hongshupian":
+        if slot_idx >= 5:
+            targets = (45.0, 0.0, -90.0)
+        elif slot_idx == 4:
+            targets = (0.0, -90.0, 45.0)
+        else:
+            targets = (0.0, 45.0, -90.0)
+        yaw_pref = min(_yaw_distance_deg(yaw, target) for target in targets)
+    else:
+        yaw_pref = _yaw_distance_deg(yaw, 0.0)
+    return (
+        yaw_pref,
+        hover_extra,
+        1 if "hover_plus_60mm" in text else 0,
+        float(item.get("score", 0.0) or 0.0),
+        *_final_contact_validation_sort_key(item),
+    )
+
+
+def _joint_search_final_contact_check_limit(args, source_name: str | None, place_modes=None) -> int | None:
+    """Limit expensive sequential final-contact validations after transport wins.
+
+    Transport candidates are still generated and screened by cuRobo. This limit
+    only prevents a single joint-search batch from spending minutes validating
+    many hover variants one-by-one after each final contact fails.
+    """
+    base_limit = int(getattr(args, "joint_search_max_final_contact_checks", 4))
+    modes = {str(mode) for mode in (place_modes or [])}
+    if source_name == "bi" or "insert_place" in modes:
+        insert_limit = int(getattr(args, "insert_joint_search_max_final_contact_checks", 2))
+        if insert_limit > 0:
+            return insert_limit
+    if base_limit > 0:
+        return base_limit
+    return None
 
 
 def _print_ik_error_summary(label: str, ik_records) -> None:
@@ -2286,7 +2795,15 @@ def _infer_goal_frame_free_linear_axis(pose_start, pose_goal):
     return free_axis, delta_goal, locked_delta, rot_err_deg
 
 
-def _build_official_approach_metric(planner, args, pose_start, pose_goal, *, label: str):
+def _build_official_approach_metric(
+    planner,
+    args,
+    pose_start,
+    pose_goal,
+    *,
+    label: str,
+    tstep_fraction: float | None = None,
+):
     free_axis, delta_goal, locked_delta, rot_err_deg = _infer_goal_frame_free_linear_axis(pose_start, pose_goal)
     if rot_err_deg > 5.0 or float(np.max(np.abs(locked_delta))) > 0.01:
         print(
@@ -2300,11 +2817,36 @@ def _build_official_approach_metric(planner, args, pose_start, pose_goal, *, lab
     metric = planner.mods["PoseCostMetric"].create_grasp_approach_metric(
         offset_position=offset,
         linear_axis=free_axis,
-        tstep_fraction=float(getattr(args, "curobo_approach_metric_tstep_fraction", 0.8)),
+        tstep_fraction=float(
+            getattr(args, "curobo_approach_metric_tstep_fraction", 0.0)
+            if tstep_fraction is None
+            else tstep_fraction
+        ),
         tensor_args=planner.tensor_args,
     )
     metric.project_to_goal_frame = True
     return metric, free_axis, delta_goal
+
+
+def _clip_arm_q_to_joint_limits(demo, q, *, label: str, margin: float = 1e-4, max_adjust: float = 0.005) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float32).reshape(-1)[:7].copy()
+    joint_limits = np.asarray(getattr(getattr(demo, "planner", None), "joint_limits", []), dtype=np.float32)
+    if joint_limits.ndim != 2 or joint_limits.shape[0] < q.shape[0] or joint_limits.shape[1] < 2:
+        return q
+    q_min = joint_limits[: q.shape[0], 0] + float(margin)
+    q_max = joint_limits[: q.shape[0], 1] - float(margin)
+    clipped = np.minimum(np.maximum(q, q_min), q_max).astype(np.float32)
+    max_delta = float(np.max(np.abs(clipped - q))) if clipped.size else 0.0
+    if max_delta <= 1e-8:
+        return q
+    if max_delta > float(max_adjust):
+        print(
+            f"[curobo] {label} start_q exceeds joint limits by {max_delta:.6f} rad; "
+            "not clipping because the adjustment is not a near-limit numerical correction"
+        )
+        return q
+    print(f"[curobo] {label} clipped near-limit start_q by max {max_delta:.6f} rad before MotionGen")
+    return clipped
 
 
 def _plan_with_official_approach_metric(
@@ -2316,11 +2858,20 @@ def _plan_with_official_approach_metric(
     pose_goal,
     *,
     label: str,
+    tstep_fraction: float | None = None,
 ):
-    metric_info = _build_official_approach_metric(planner, args, pose_start, pose_goal, label=label)
+    metric_info = _build_official_approach_metric(
+        planner,
+        args,
+        pose_start,
+        pose_goal,
+        label=label,
+        tstep_fraction=tstep_fraction,
+    )
     if metric_info is None:
         return None
     metric, free_axis, delta_goal = metric_info
+    start_q = _clip_arm_q_to_joint_limits(demo, start_q, label=label)
     planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
         demo,
         pose_goal,
@@ -2375,6 +2926,7 @@ def _plan_release_with_motiongen_constraint(
         pose_start,
         pose_goal,
         label=label,
+        tstep_fraction=float(getattr(args, "final_contact_approach_metric_tstep_fraction", 0.0)),
     )
 
 
@@ -2388,8 +2940,85 @@ def _plan_short_curobo_cartesian_descent(
     *,
     label: str,
     force_segmented: bool = False,
+    allow_motiongen_fallback: bool = True,
 ):
     start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    segmented_allowed = (
+        bool(force_segmented)
+        or
+        bool(getattr(args, "final_contact_segmented_ik_first", False))
+        or
+        bool(getattr(args, "allow_segmented_ik_rescue", False))
+        or bool(getattr(args, "final_contact_segmented_ik_fallback", False))
+    )
+    p0 = targeted.base.flatten_np(pose_start.p)[:3].astype(np.float32)
+    p1 = targeted.base.flatten_np(pose_goal.p)[:3].astype(np.float32)
+    distance = float(np.linalg.norm(p1 - p0))
+    step_m = float(max(getattr(args, "direct_release_cartesian_step_m", 0.005), 1e-3))
+    num_segments = max(2, int(np.ceil(distance / step_m)))
+
+    def _try_segmented_descent(reason: str):
+        print(
+            f"[curobo] {label} constrained cartesian descent {reason} with {num_segments} segments "
+            f"(distance={distance:.4f} m)"
+        )
+        q_prev = start_q.copy()
+        q_path = [q_prev.copy()]
+        max_joint_delta = 0.20
+        max_joint7_delta = 0.25
+        max_norm_delta = 0.35
+        for seg_idx, alpha in enumerate(np.linspace(0.0, 1.0, num_segments + 1)[1:], start=1):
+            interp_pose = _interpolate_demo_tcp_pose(pose_start, pose_goal, float(alpha))
+            planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
+                demo,
+                interp_pose,
+                ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
+            )
+            ik_result = planner.solve_ik(
+                q_prev,
+                planner_pose,
+                num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
+            )
+            print(f"[curobo] {label} segment={seg_idx}/{num_segments} ik_success={ik_result.success}")
+            if not ik_result.success or ik_result.goal_joint is None:
+                return None
+            q_next = np.asarray(ik_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
+            dq = np.abs(q_next - q_prev)
+            if (
+                float(np.max(dq)) > max_joint_delta
+                or float(dq[6]) > max_joint7_delta
+                or float(np.linalg.norm(q_next - q_prev)) > max_norm_delta
+            ):
+                print(
+                    f"[curobo] {label} segment={seg_idx}/{num_segments} rejected non-local IK step "
+                    f"(max_joint_delta={float(np.max(dq)):.3f}, "
+                    f"joint7_delta={float(dq[6]):.3f}, "
+                    f"norm_delta={float(np.linalg.norm(q_next - q_prev)):.3f})"
+                )
+                return None
+            q_path.append(q_next)
+            q_prev = q_next
+
+        final_diag = _measure_realized_tcp_error(demo, q_path[-1], pose_goal)
+        print(
+            f"[curobo] {label} realized tcp after constrained descent: "
+            f"pos_err={final_diag['pos_err']:.4f} m, rot_err={final_diag['rot_err_deg']:.2f} deg"
+        )
+        if not _terminal_error_within_limits(final_diag, args):
+            print(f"[curobo] {label} constrained descent misses the release pose too much")
+            return None
+        return q_path
+
+    segmented_first = bool(force_segmented) or (
+        segmented_allowed and bool(getattr(args, "final_contact_segmented_ik_first", False))
+    )
+    if segmented_first:
+        segmented_path = _try_segmented_descent("first")
+        if segmented_path is not None:
+            return segmented_path
+        if not bool(allow_motiongen_fallback):
+            return None
+
     motiongen_path = _plan_release_with_motiongen_constraint(
         planner,
         demo,
@@ -2401,72 +3030,134 @@ def _plan_short_curobo_cartesian_descent(
     )
     if motiongen_path is not None:
         return motiongen_path
-    if not (
-        bool(force_segmented)
-        or
-        bool(getattr(args, "allow_segmented_ik_rescue", False))
-        or bool(getattr(args, "final_contact_segmented_ik_fallback", False))
-    ):
+
+    if not segmented_allowed:
         print(
             f"[curobo] {label} MotionGen descent failed; segmented IK rescue disabled "
             "(enable --allow-segmented-ik-rescue to use it)"
         )
         return None
+    if not segmented_first:
+        return _try_segmented_descent("fallback")
+    return None
 
-    p0 = targeted.base.flatten_np(pose_start.p)[:3].astype(np.float32)
-    p1 = targeted.base.flatten_np(pose_goal.p)[:3].astype(np.float32)
-    distance = float(np.linalg.norm(p1 - p0))
-    step_m = float(max(getattr(args, "direct_release_cartesian_step_m", 0.005), 1e-3))
-    num_segments = max(2, int(np.ceil(distance / step_m)))
-    print(
-        f"[curobo] {label} constrained cartesian descent with {num_segments} segments "
-        f"(distance={distance:.4f} m)"
-    )
 
-    q_prev = start_q.copy()
-    q_path = [q_prev.copy()]
-    max_joint_delta = 0.20
-    max_joint7_delta = 0.25
-    max_norm_delta = 0.35
-    for seg_idx, alpha in enumerate(np.linspace(0.0, 1.0, num_segments + 1)[1:], start=1):
-        interp_pose = _interpolate_demo_tcp_pose(pose_start, pose_goal, float(alpha))
-        planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
-            demo,
-            interp_pose,
-            ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
-        )
-        ik_result = planner.solve_ik(
-            q_prev,
-            planner_pose,
-            num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
-        )
-        print(f"[curobo] {label} segment={seg_idx}/{num_segments} ik_success={ik_result.success}")
-        if not ik_result.success or ik_result.goal_joint is None:
-            return None
-        q_next = np.asarray(ik_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
-        dq = np.abs(q_next - q_prev)
-        if (
-            float(np.max(dq)) > max_joint_delta
-            or float(dq[6]) > max_joint7_delta
-            or float(np.linalg.norm(q_next - q_prev)) > max_norm_delta
-        ):
+def _validate_strict_linear_waypoints(
+    demo,
+    args,
+    q_path,
+    pose_start,
+    pose_goal,
+    *,
+    label: str,
+    max_pos_err_m: float | None = None,
+    max_rot_err_deg: float | None = None,
+    max_backtrack_m: float | None = None,
+) -> bool:
+    q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    if len(q_path) < 2:
+        print(f"[curobo] {label} strict linear validation failed: empty waypoint path")
+        return False
+    p0 = _get_pose_position(pose_start)
+    p1 = _get_pose_position(pose_goal)
+    delta = (p1 - p0).astype(np.float32)
+    distance = float(np.linalg.norm(delta))
+    if distance <= 1e-6:
+        return True
+    axis = delta / distance
+    if max_pos_err_m is None:
+        max_pos_err = float(max(getattr(args, "strict_final_contact_waypoint_pos_tol_m", 0.006), 0.0))
+    else:
+        max_pos_err = float(max(max_pos_err_m, 0.0))
+    if max_rot_err_deg is None:
+        max_rot_err = float(max(getattr(args, "strict_final_contact_waypoint_rot_tol_deg", 8.0), 0.0))
+    else:
+        max_rot_err = float(max(max_rot_err_deg, 0.0))
+    # cuRobo's approach metric can add a tiny retreat along the commanded line
+    # before descending.  That is still a straight-line contact approach and is
+    # safer than lateral drift; keep the allowance small and tied to the line
+    # tolerance so visibly curved paths are still rejected.
+    if max_backtrack_m is None:
+        max_backtrack = max(0.5 * max_pos_err, 0.003)
+    else:
+        max_backtrack = float(max(max_backtrack_m, 0.0))
+    worst_pos = 0.0
+    worst_rot = 0.0
+    worst_i = 0
+    last_progress = -max_backtrack
+    for idx, q in enumerate(q_path):
+        diag = _measure_realized_tcp_error(demo, q, pose_goal)
+        actual_p = np.asarray(diag["actual_p"], dtype=np.float32).reshape(3)
+        progress = float(np.dot(actual_p - p0, axis))
+        clipped_progress = float(np.clip(progress, 0.0, distance))
+        closest = p0 + axis * clipped_progress
+        pos_err = float(np.linalg.norm(actual_p - closest))
+        rot_err = float(diag["rot_err_deg"])
+        if pos_err > worst_pos or rot_err > worst_rot:
+            worst_pos = max(worst_pos, pos_err)
+            worst_rot = max(worst_rot, rot_err)
+            worst_i = idx
+        outside = max(0.0, -progress, progress - distance)
+        if outside > max_pos_err or progress + max_backtrack < last_progress:
             print(
-                f"[curobo] {label} segment={seg_idx}/{num_segments} rejected non-local IK step "
-                f"(max_joint_delta={float(np.max(dq)):.3f}, "
-                f"joint7_delta={float(dq[6]):.3f}, "
-                f"norm_delta={float(np.linalg.norm(q_next - q_prev)):.3f})"
+                f"[curobo] {label} strict linear validation failed at waypoint {idx}/{len(q_path) - 1}: "
+                f"progress={progress:.4f}m, outside_segment={outside:.4f}m, "
+                f"last_progress={last_progress:.4f}m"
             )
-            return None
-        q_path.append(q_next)
-        q_prev = q_next
-
-    final_diag = _measure_realized_tcp_error(demo, q_path[-1], pose_goal)
+            return False
+        if pos_err > max_pos_err or rot_err > max_rot_err:
+            print(
+                f"[curobo] {label} strict linear validation failed at waypoint {idx}/{len(q_path) - 1}: "
+                f"line_err={pos_err:.4f}m (limit={max_pos_err:.4f}), "
+                f"rot_err={rot_err:.2f}deg (limit={max_rot_err:.2f})"
+            )
+            return False
+        last_progress = max(last_progress, progress)
     print(
-        f"[curobo] {label} realized tcp after constrained descent: "
-        f"pos_err={final_diag['pos_err']:.4f} m, rot_err={final_diag['rot_err_deg']:.2f} deg"
+        f"[curobo] {label} strict linear validation passed: "
+        f"waypoints={len(q_path)}, distance={distance:.4f}m, worst_line_err={worst_pos:.4f}m, "
+        f"worst_rot_err={worst_rot:.2f}deg at waypoint={worst_i}"
     )
-    if not _terminal_error_within_limits(final_diag, args):
-        print(f"[curobo] {label} constrained descent misses the release pose too much")
+    return True
+
+
+def _plan_constrained_linear_segment(
+    planner,
+    demo,
+    args,
+    start_q,
+    pose_start,
+    pose_goal,
+    *,
+    label: str,
+    validate: bool = True,
+    validation_pos_tol_m: float | None = None,
+    validation_rot_tol_deg: float | None = None,
+):
+    q_path = _plan_with_official_approach_metric(
+        planner,
+        demo,
+        args,
+        start_q,
+        pose_start,
+        pose_goal,
+        label=label,
+    )
+    if (
+        q_path is not None
+        and bool(validate)
+        and bool(getattr(args, "strict_short_linear_segments", True))
+        and not _validate_strict_linear_waypoints(
+            demo,
+            args,
+            q_path,
+            pose_start,
+            pose_goal,
+            label=label,
+            max_pos_err_m=validation_pos_tol_m,
+            max_rot_err_deg=validation_rot_tol_deg,
+        )
+    ):
         return None
     return q_path
 
@@ -2511,7 +3202,7 @@ def _plan_short_world_z_lift_ik(
     )
     q_path = None
     try:
-        q_path = _plan_with_official_approach_metric(
+        q_path = _plan_constrained_linear_segment(
             planner,
             demo,
             args,
@@ -2519,8 +3210,9 @@ def _plan_short_world_z_lift_ik(
             pose_start,
             pose_goal,
             label=label,
+            validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
         )
-        if q_path is None:
+        if q_path is None and not bool(getattr(args, "strict_short_linear_segments", True)):
             planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
                 demo,
                 pose_goal,
@@ -2541,9 +3233,13 @@ def _plan_short_world_z_lift_ik(
                 print(f"[joint_search] {label}: cuRobo lift MotionGen success with {len(q_path)} waypoint(s)")
             else:
                 print(f"[joint_search] {label}: cuRobo lift MotionGen failed with status={getattr(result, 'status', None)}")
+        elif q_path is None:
+            print(f"[joint_search] {label}: constrained cuRobo lift failed; unconstrained MotionGen fallback disabled")
 
         if q_path is None:
-            if not bool(getattr(args, "allow_segmented_ik_rescue", False)):
+            source_name = _current_source_object_name(args)
+            allow_segmented_lift = bool(getattr(args, "allow_segmented_ik_rescue", False))
+            if not allow_segmented_lift:
                 print(
                     f"[joint_search] {label}: skipped segmented IK lift rescue "
                     "(enable --allow-segmented-ik-rescue to use it)"
@@ -2553,6 +3249,8 @@ def _plan_short_world_z_lift_ik(
             p1 = targeted.base.flatten_np(pose_goal.p)[:3].astype(np.float32)
             distance = float(np.linalg.norm(p1 - p0))
             step_m = float(max(getattr(args, "direct_release_cartesian_step_m", 0.005), 1e-3))
+            if source_name == "bi" and str(label).startswith("joint_start_lift_"):
+                step_m = max(step_m, 0.010)
             num_segments = max(2, int(np.ceil(distance / step_m)))
             print(
                 f"[joint_search] {label}: trying segmented IK lift rescue "
@@ -2636,6 +3334,204 @@ def _plan_short_world_z_lift_ik(
     return q_path
 
 
+def _plan_short_grasp_approach_retreat_ik(
+    planner,
+    demo,
+    args,
+    start_q,
+    grasp_choice,
+    *,
+    label: str,
+    include_table: bool = True,
+    exclude_object_names: set[str] | None = None,
+    disabled_world_collision_links: list[str] | None = None,
+):
+    """Retreat from the grasp pose back along the validated pregrasp->grasp line."""
+
+    if grasp_choice is None:
+        return None
+    pose_start = grasp_choice.get("deferred_grasp_pose", grasp_choice.get("pose"))
+    pose_goal = grasp_choice.get("deferred_pregrasp_pose", grasp_choice.get("pregrasp_pose"))
+    if pose_start is None or pose_goal is None:
+        print(f"[joint_search] {label}: no deferred pregrasp pose available for approach-line retreat")
+        return None
+
+    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    targeted.base.sync_demo_arm_qpos(demo, start_q)
+    p0 = _get_pose_position(pose_start)
+    p1 = _get_pose_position(pose_goal)
+    distance = float(np.linalg.norm(p1 - p0))
+    if distance <= 1e-5:
+        print(f"[joint_search] {label}: approach-line retreat distance is too small")
+        return None
+
+    _refresh_curobo_world(
+        planner,
+        demo,
+        args,
+        label=f"{label}_world",
+        include_active_object=False,
+        include_table=include_table,
+        exclude_object_names=exclude_object_names,
+    )
+    requested_disabled_links = _normalize_disabled_world_collision_links(planner, disabled_world_collision_links)
+    restore_attached_spheres = "attached_object" in set(requested_disabled_links or [])
+    if restore_attached_spheres:
+        _cache_attached_spheres_for_contact(planner)
+    disabled_world_collision_links = _set_world_collision_for_links(
+        planner,
+        requested_disabled_links,
+        enabled=False,
+        label=label,
+    )
+    q_path = None
+    try:
+        print(
+            f"[joint_search] {label}: trying cuRobo constrained retreat along grasp approach line "
+            f"(distance={distance:.3f}m)"
+        )
+        q_path = _plan_constrained_linear_segment(
+            planner,
+            demo,
+            args,
+            start_q,
+            pose_start,
+            pose_goal,
+            label=label,
+            validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
+        )
+    finally:
+        _set_world_collision_for_links(
+            planner,
+            disabled_world_collision_links,
+            enabled=True,
+            label=label,
+        )
+        if restore_attached_spheres:
+            _restore_attached_spheres_after_contact(planner)
+
+    if q_path is None:
+        print(f"[joint_search] {label}: constrained approach-line retreat failed")
+        return None
+    if not _validate_candidate_joint_path_with_demo_planner(
+        demo,
+        start_q,
+        q_path,
+        use_attach=True,
+        label=f"{label}_approach_retreat",
+    ):
+        return None
+    return q_path
+
+
+def _plan_short_tcp_up_axis_lift_ik(
+    planner,
+    demo,
+    args,
+    start_q,
+    grasp_choice,
+    *,
+    lift_m: float,
+    label: str,
+    include_table: bool = True,
+    exclude_object_names: set[str] | None = None,
+    disabled_world_collision_links: list[str] | None = None,
+):
+    """Lift along the TCP axis that points most upward, keeping PoseCostMetric single-axis."""
+
+    pose_start = None if grasp_choice is None else grasp_choice.get("deferred_grasp_pose", grasp_choice.get("pose"))
+    if pose_start is None:
+        targeted.base.sync_demo_arm_qpos(demo, np.asarray(start_q, dtype=np.float32).reshape(-1)[:7])
+        pose_start = demo.tcp.pose
+
+    lift_m = float(max(lift_m, 0.0))
+    if lift_m <= 1e-5:
+        return None
+    T_start = targeted.base.pose_to_matrix(
+        targeted.base.flatten_np(pose_start.p)[:3],
+        targeted.base.flatten_np(pose_start.q)[:4],
+    ).astype(np.float32)
+    axes = T_start[:3, :3]
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    dots = axes.T @ world_up
+    axis_idx = int(np.argmax(np.abs(dots)))
+    signed_axis = axes[:, axis_idx].astype(np.float32)
+    axis_dot = float(dots[axis_idx])
+    if axis_dot < 0.0:
+        signed_axis = -signed_axis
+        axis_dot = -axis_dot
+    if axis_dot <= 1e-4:
+        print(f"[joint_search] {label}: no TCP axis has upward component for single-axis lift")
+        return None
+    distance = lift_m / max(axis_dot, 0.35)
+    distance = float(min(max(distance, lift_m), max(lift_m + 0.03, 0.12)))
+    p_start = _get_pose_position(pose_start)
+    pose_goal = targeted.base.make_pose_with_position(
+        pose_start,
+        (p_start + signed_axis * distance).astype(np.float32),
+    )
+
+    _refresh_curobo_world(
+        planner,
+        demo,
+        args,
+        label=f"{label}_world",
+        include_active_object=False,
+        include_table=include_table,
+        exclude_object_names=exclude_object_names,
+    )
+    requested_disabled_links = _normalize_disabled_world_collision_links(planner, disabled_world_collision_links)
+    restore_attached_spheres = "attached_object" in set(requested_disabled_links or [])
+    if restore_attached_spheres:
+        _cache_attached_spheres_for_contact(planner)
+    disabled_world_collision_links = _set_world_collision_for_links(
+        planner,
+        requested_disabled_links,
+        enabled=False,
+        label=label,
+    )
+    q_path = None
+    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    try:
+        print(
+            f"[joint_search] {label}: trying cuRobo constrained TCP-up lift "
+            f"(axis={axis_idx}, axis_world_z={axis_dot:.3f}, distance={distance:.3f}m, "
+            f"world_z_gain={distance * axis_dot:.3f}m)"
+        )
+        q_path = _plan_constrained_linear_segment(
+            planner,
+            demo,
+            args,
+            start_q,
+            pose_start,
+            pose_goal,
+            label=label,
+            validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
+        )
+    finally:
+        _set_world_collision_for_links(
+            planner,
+            disabled_world_collision_links,
+            enabled=True,
+            label=label,
+        )
+        if restore_attached_spheres:
+            _restore_attached_spheres_after_contact(planner)
+
+    if q_path is None:
+        print(f"[joint_search] {label}: constrained TCP-up lift failed")
+        return None
+    if not _validate_candidate_joint_path_with_demo_planner(
+        demo,
+        start_q,
+        q_path,
+        use_attach=True,
+        label=f"{label}_tcp_up_lift",
+    ):
+        return None
+    return q_path
+
+
 def _single_obstacle_start_collision_relief(planner, start_q, *, already_excluded: set[str] | None = None) -> str | None:
     try:
         start_diag = planner.diagnose_start_state_world_collision(np.asarray(start_q, dtype=np.float32).reshape(-1)[:7])
@@ -2676,6 +3572,53 @@ def _validate_candidate_joint_path_with_demo_planner(demo, start_q, q_path, *, u
     return bool(ok)
 
 
+def _start_state_is_world_collision(
+    planner,
+    demo,
+    args,
+    start_q,
+    *,
+    label: str,
+    include_table: bool,
+    exclude_object_names: set[str] | None,
+    disabled_world_collision_links: list[str] | None,
+) -> bool:
+    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    _refresh_curobo_world(
+        planner,
+        demo,
+        args,
+        label=f"{label}_start_precheck_world",
+        include_active_object=False,
+        include_table=include_table,
+        exclude_object_names=exclude_object_names,
+    )
+    disabled = _set_world_collision_for_links(
+        planner,
+        disabled_world_collision_links,
+        enabled=False,
+        label=f"{label}_start_precheck",
+    )
+    try:
+        diag = planner.diagnose_start_state_world_collision(start_q)
+    except Exception as exc:
+        print(f"[curobo] {label}: start-state world-collision precheck failed: {exc}")
+        return False
+    finally:
+        _set_world_collision_for_links(
+            planner,
+            disabled,
+            enabled=True,
+            label=f"{label}_start_precheck",
+        )
+    valid = bool(diag.get("valid", False))
+    status = str(diag.get("status", ""))
+    if (not valid) and status == "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION":
+        print(f"[curobo] {label}: start state is already in world collision; skipping direct transport batch")
+        return True
+    return False
+
+
 def _plan_and_execute_return_to_cycle_start(
     demo,
     bridge_mod,
@@ -2689,7 +3632,11 @@ def _plan_and_execute_return_to_cycle_start(
     profile_start_t = time.perf_counter()
     label = "return_to_cycle_start"
     start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
-    q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+    q_current = _clip_arm_q_to_joint_limits(
+        demo,
+        np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
+        label=label,
+    )
     target_pose = _get_demo_tcp_pose_for_joint_q(demo, start_q)
 
     planner = curobo_wrapper._get_or_create_curobo_planner(args)
@@ -2721,7 +3668,11 @@ def _plan_and_execute_return_to_cycle_start(
                 use_attach=False,
             )
             if ok:
-                q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                q_current = _clip_arm_q_to_joint_limits(
+                    demo,
+                    np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
+                    label=label,
+                )
                 print(f"[planner] {label}: lifted empty gripper by {clearance_lift_m:.3f}m before return planning")
             else:
                 print(f"[warn] {label}: prelift execution failed; trying direct return anyway")
@@ -3532,6 +4483,58 @@ def _evaluate_curobo_pose_candidates_multi_start(
     chunk_size = int(getattr(args, "curobo_batch_chunk_size", 64))
     if chunk_size <= 0:
         chunk_size = len(remaining)
+    stage_size = int(getattr(args, "curobo_multistart_stage_size", 128) or 0)
+    if (
+        stage_size > 0
+        and max_winners is not None
+        and use_max_winners > 0
+        and use_max_winners < len(remaining)
+        and len(remaining) > stage_size
+    ):
+        staged_args = SimpleNamespace(**vars(args))
+        staged_args.curobo_multistart_stage_size = 0
+        staged_winners = []
+        total_stages = int(np.ceil(float(len(remaining)) / float(stage_size)))
+        for stage_idx, start_idx in enumerate(range(0, len(remaining), stage_size), start=1):
+            if len(staged_winners) >= use_max_winners:
+                break
+            stage_candidates = remaining[start_idx : start_idx + stage_size]
+            needed = max(1, use_max_winners - len(staged_winners))
+            print(
+                f"[curobo] {label} staged multi-start {stage_idx}/{total_stages}: "
+                f"testing {len(stage_candidates)} candidate(s), need {needed} more winner(s)"
+            )
+            stage_winners = _evaluate_curobo_pose_candidates_multi_start(
+                planner,
+                demo,
+                staged_args,
+                stage_candidates,
+                label=f"{label}_stage{stage_idx}",
+                use_attach=use_attach,
+                timeout=timeout,
+                max_attempts=max_attempts,
+                num_ik_seeds=num_ik_seeds,
+                num_trajopt_seeds=num_trajopt_seeds,
+                num_graph_seeds=num_graph_seeds,
+                enable_graph=enable_graph,
+                max_winners=needed,
+                include_active_object=include_active_object,
+                include_table=include_table,
+                exclude_object_names=exclude_object_names,
+                disabled_world_collision_links=disabled_world_collision_links,
+            )
+            staged_winners.extend(stage_winners)
+        if staged_winners:
+            staged_winners.sort(key=_candidate_sort_key)
+            best = staged_winners[0]
+            print(
+                f"[curobo] selected {best['label']} from staged {label}: "
+                f"score={best['score']:.3f}, tcp_verticality={float(best.get('tcp_verticality', 0.0)):.3f}, "
+                f"waypoints={best['metrics']['waypoint_count']}"
+            )
+        else:
+            print(f"[curobo] {label} staged multi-start found no winner after {total_stages} stage(s)")
+        return staged_winners[:use_max_winners]
     ik_prefilter_pos_thresh = float(getattr(args, "curobo_ik_prefilter_position_threshold", 0.01) or 0.0)
     ik_prefilter_rot_thresh = float(getattr(args, "curobo_ik_prefilter_rotation_threshold", 0.25) or 0.0)
     use_soft_prefilter = ik_prefilter_pos_thresh > 0 and ik_prefilter_rot_thresh > 0
@@ -3849,7 +4852,14 @@ def _evaluate_curobo_pose_candidates_multi_start(
     return winners
 
 
-def _build_direct_grasp_candidates(demo, args):
+def _build_direct_grasp_candidates(
+    demo,
+    args,
+    *,
+    bridge_mod=None,
+    scene_capture_cache=None,
+    place_state_cache=None,
+):
     raw_grasp_pose = demo.build_topdown_grasp_pose()
     obj_p0, obj_q0 = demo.get_obj_pose()
     T_world_obj0 = targeted.base.pose_to_matrix(obj_p0, obj_q0)
@@ -3958,6 +4968,7 @@ def _build_direct_grasp_candidates(demo, args):
             seen.add(key)
             variants.append((str(label), pose))
 
+        base_orientation_variants: list[tuple[str, object]] = []
         if use_rule_bias_variants:
             for bias in rule_grasp_bias_variants:
                 pose = raw_grasp_pose
@@ -3980,6 +4991,19 @@ def _build_direct_grasp_candidates(demo, args):
                 _append(label, pose)
         else:
             for label, pose in targeted.base.build_grasp_pose_variants(demo, raw_grasp_pose, grasp_variant_args):
+                _append(label, pose)
+            base_orientation_variants = list(variants)
+
+        if source_name == "lvmukuai":
+            for label, pose in _build_lvmukuai_vertical_gripper_pose_variants(
+                demo,
+                args,
+                place_rule,
+                bridge_mod,
+                scene_capture_cache,
+                place_state_cache,
+                T_world_obj0,
+            ):
                 _append(label, pose)
 
         if use_rule_bias_variants:
@@ -4019,6 +5043,22 @@ def _build_direct_grasp_candidates(demo, args):
                     base_label += f"_shift_{int(round(1000.0 * float(shift_d)))}mm"
                 _append(base_label, shifted_pose)
 
+        if source_name == "shuazi" and not use_rule_bias_variants:
+            shuazi_tilt_degs = [
+                float(v)
+                for v in _unique_finite_float_list(getattr(args, "shuazi_tilted_yaw_grasp_deg", [30.0]))
+                if abs(float(v)) > 1e-6
+            ]
+            for yaw_label, yaw_pose in base_orientation_variants:
+                yaw_label_text = str(yaw_label or "")
+                if "yaw" not in yaw_label_text.lower():
+                    continue
+                for tilt_deg in shuazi_tilt_degs:
+                    tilted_pose = targeted.base.tilt_pose_toward_robot(demo, yaw_pose, float(tilt_deg))
+                    if tilted_pose is None:
+                        continue
+                    _append(f"{yaw_label_text}_tilt_{int(round(abs(float(tilt_deg))))}deg", tilted_pose)
+
         return variants
 
     grasp_variants = _build_pose_variants()
@@ -4055,6 +5095,8 @@ def _build_direct_grasp_candidates(demo, args):
                 approach_roll_values = [0.0]
                 if source_name == "bi":
                     approach_roll_values = _bi_direct_grasp_approach_roll_degs(args)
+                elif source_name == "shuazi":
+                    approach_roll_values = _shuazi_direct_grasp_approach_roll_degs(args)
                 for approach_roll_deg in approach_roll_values:
                     current_grasp_pose = _roll_pose_about_tcp_approach(base_grasp_pose, float(approach_roll_deg))
                     current_pregrasp_pose = demo.build_pregrasp_pose(current_grasp_pose)
@@ -4136,6 +5178,50 @@ def _build_direct_grasp_candidates(demo, args):
                 interleaved.append(tilt_cands[ti])
                 ti += 1
         candidates = interleaved
+    if source_name == "lvmukuai":
+        def _lvmukuai_candidate_order(item):
+            label = str(item.get("label", "")).lower()
+            is_vertical_helper = "lvmukuai_vertical_gripper" in label
+            is_tilted = "tilt" in label
+            z_lift = max(float(item.get("grasp_z_lift_m", 0.0) or 0.0), 0.0)
+            tilt_mag = 0.0
+            tilt_match = re.search(r"tilt_(?:toward|away)_robot_([-+]?\d+(?:\.\d+)?)deg", label)
+            if tilt_match:
+                tilt_mag = abs(float(tilt_match.group(1)))
+            is_plain_direct = (not is_tilted) and z_lift <= 1e-4 and "lift" not in label
+            if is_vertical_helper:
+                relation_class = 5
+            elif is_tilted and abs(tilt_mag - 20.0) <= 1.0:
+                relation_class = 0
+            elif is_plain_direct:
+                relation_class = 1
+            elif is_tilted:
+                relation_class = 2
+            elif z_lift >= 0.005 or "lift_" in label:
+                relation_class = 3
+            else:
+                relation_class = 4
+            return (
+                relation_class,
+                0 if "toward_robot" in label else 1,
+                abs(tilt_mag - 20.0) if is_tilted else 999.0,
+                z_lift,
+                str(item.get("label", "")),
+            )
+
+        candidates.sort(
+            key=_lvmukuai_candidate_order
+        )
+        print(
+            "[direct_grasp] lvmukuai priority candidate labels: "
+            + ", ".join(str(c.get("label", "?")) for c in candidates[:12])
+        )
+    if source_name == "shuazi":
+        candidates.sort(key=_shuazi_grasp_label_priority)
+        print(
+            "[direct_grasp] shuazi priority candidate labels: "
+            + ", ".join(str(c.get("label", "?")) for c in candidates[:12])
+        )
     print(
         f"[direct_grasp] built {len(candidates)} grasp candidate(s) "
         f"from {len(grasp_variants)} pose variant(s)"
@@ -4251,6 +5337,21 @@ def _lift_pose_world_z(pose, dz: float):
     return targeted.base.make_pose_with_position(pose, p.astype(np.float32))
 
 
+def _extend_hover_pose_along_release_approach(release_pose, hover_pose, extra_distance: float):
+    extra_distance = float(extra_distance)
+    if extra_distance <= 1e-8:
+        return hover_pose
+    release_p = _get_pose_position(release_pose)
+    hover_p = _get_pose_position(hover_pose)
+    approach_dir = _normalize((hover_p - release_p).astype(np.float32))
+    if approach_dir is None:
+        return _lift_pose_world_z(hover_pose, extra_distance)
+    return targeted.base.make_pose_with_position(
+        hover_pose,
+        (hover_p + approach_dir * extra_distance).astype(np.float32),
+    )
+
+
 def classify_object_category(args, rule, object_dims=None) -> str:
     """Coarse object category used to choose grasp/place primitives."""
     primitive = str(getattr(rule, "primitive", "") or "")
@@ -4303,6 +5404,13 @@ def _skip_joint_search_for_current_object(args) -> bool:
 def _bi_direct_grasp_approach_roll_degs(args) -> list[float]:
     values = _unique_finite_float_list(
         getattr(args, "bi_direct_grasp_approach_roll_degs", [0.0, 180.0]),
+    )
+    return values or [0.0]
+
+
+def _shuazi_direct_grasp_approach_roll_degs(args) -> list[float]:
+    values = _unique_finite_float_list(
+        getattr(args, "shuazi_direct_grasp_approach_roll_degs", [0.0, 90.0, 180.0, 270.0]),
     )
     return values or [0.0]
 
@@ -4804,7 +5912,11 @@ def set_payload_collision_mode(
     return []
 
 
-def _retreat_pose_for_place_mode(demo, place_mode: str, args):
+def _retreat_pose_for_place_mode(demo, place_mode: str, args, place_choice=None):
+    if isinstance(place_choice, dict):
+        hover_pose = place_choice.get("hover_pose") or place_choice.get("pre_place_pose")
+        if hover_pose is not None:
+            return hover_pose
     if place_mode in {"surface_place", "vertical_place"}:
         distance = 0.08 if place_mode == "vertical_place" else 0.06
         p = targeted.base.flatten_np(demo.tcp.pose.p)[:3].astype(np.float32)
@@ -5025,6 +6137,14 @@ def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, 
         )
         if not hover_extra_heights:
             hover_extra_heights = [0.0]
+    insert_release_height_offsets = [0.0]
+    if place_mode == "insert_place" and source_name == "bi":
+        insert_release_height_offsets = _unique_finite_float_list(
+            getattr(args, "bi_insert_release_height_offsets_m", [0.0]),
+            min_value=0.0,
+        )
+        if not insert_release_height_offsets:
+            insert_release_height_offsets = [0.0]
     for candidate in place_plan_candidates:
         raw_release_pose = candidate.place_pose
         object_center_p = None
@@ -5046,88 +6166,110 @@ def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, 
             else [(None, raw_release_pose)]
         )
         for release_variant_label, base_release_pose in release_pose_variants:
-            release_pose = base_release_pose
-            combined_variant_parts = [part for part in (candidate.variant_label, release_variant_label) if part]
-            combined_variant_label = "+".join(combined_variant_parts) if combined_variant_parts else None
-            if release_lift > 1e-6:
-                release_pose = _lift_pose_world_z(release_pose, release_lift)
-            if place_mode == "insert_place" and target_axis is not None:
-                base_hover_entries = []
-                release_p = _get_pose_position(release_pose)
-                for approach_distance in insert_approach_distances:
-                    approach_pose = targeted.base.make_pose_with_position(
+            for insert_release_offset in insert_release_height_offsets:
+                release_pose = base_release_pose
+                release_height_label = None
+                if float(insert_release_offset) > 1e-6:
+                    offset_axis = target_axis
+                    if offset_axis is None:
+                        offset_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                    release_pose = targeted.base.make_pose_with_position(
                         release_pose,
-                        (release_p + target_axis * float(approach_distance)).astype(np.float32),
+                        (_get_pose_position(release_pose) + offset_axis * float(insert_release_offset)).astype(np.float32),
                     )
-                    base_hover_entries.append(
-                        (
-                            f"approach_{int(round(float(approach_distance) * 1000.0))}mm",
-                            approach_pose,
-                        )
-                    )
-            else:
-                base_hover_entries = [
-                    (
-                        None,
-                        build_hover_pose(
-                            release_pose,
-                            place_mode,
-                            args,
-                            rule,
-                            candidate_pre_place_pose=candidate.pre_place_pose,
-                        ),
-                    )
+                    release_height_label = f"release_up_{int(round(float(insert_release_offset) * 1000.0))}mm"
+                combined_variant_parts = [
+                    part for part in (candidate.variant_label, release_variant_label, release_height_label) if part
                 ]
-            pad_tilt = _tcp_pad_tilt_z(release_pose)
-            place_z = float(_get_pose_position(release_pose)[2])
-            if place_z < min_place_tcp_z:
-                continue
-            for hover_variant_label, base_hover_pose in base_hover_entries:
-                label_parts = [combined_variant_label, hover_variant_label]
-                hover_variant = "+".join([part for part in label_parts if part]) or None
-                label = "transport_hover" if hover_variant is None else f"transport_hover_{hover_variant}"
-                if max_abs_yaw > 0.0:
-                    ydeg = _variant_abs_yaw_deg_from_labels(hover_variant, label)
-                    if ydeg > max_abs_yaw + 1e-4:
-                        continue
-                for hover_extra in hover_extra_heights:
-                    hover_pose = base_hover_pose
-                    if float(hover_extra) > 1e-6:
-                        hover_pose = _lift_pose_world_z(base_hover_pose, float(hover_extra))
-                    hover_label = label
-                    if float(hover_extra) > 1e-6:
-                        hover_label = f"{hover_label}_hover_plus_{int(round(float(hover_extra) * 1000.0))}mm"
-                    item = {
-                        "label": hover_label,
-                        "pose": hover_pose,
-                        "hover_pose": hover_pose,
-                        "pre_place_pose": hover_pose,
-                        "place_pose": release_pose,
-                        "release_pose": release_pose,
-                        "raw_release_pose": raw_release_pose,
-                        "retreat_pose": hover_pose,
-                        "target_name": candidate.target_name,
-                        "slot_name": candidate.slot_name,
-                        "variant_label": hover_variant,
-                        "tcp_verticality": float(candidate.tcp_verticality),
-                        "pad_tilt": float(pad_tilt),
-                        "place_plan": candidate,
-                        "place_mode": place_mode,
-                        "object_category": object_category,
-                        "direct_place_mode": False,
-                        "transport_to_hover": True,
-                        "release_lift_m": float(release_lift),
-                        "hover_extra_height_m": float(hover_extra),
-                    }
-                    all_candidates.append(item)
-                    if pad_tilt <= max_pad_tilt:
-                        level_candidates.append(item)
+                combined_variant_label = "+".join(combined_variant_parts) if combined_variant_parts else None
+                if release_lift > 1e-6:
+                    release_pose = _lift_pose_world_z(release_pose, release_lift)
+                if place_mode == "insert_place" and target_axis is not None:
+                    base_hover_entries = []
+                    release_p = _get_pose_position(release_pose)
+                    for approach_distance in insert_approach_distances:
+                        approach_pose = targeted.base.make_pose_with_position(
+                            release_pose,
+                            (release_p + target_axis * float(approach_distance)).astype(np.float32),
+                        )
+                        base_hover_entries.append(
+                            (
+                                f"approach_{int(round(float(approach_distance) * 1000.0))}mm",
+                                approach_pose,
+                            )
+                        )
+                else:
+                    base_hover_entries = [
+                        (
+                            None,
+                            build_hover_pose(
+                                release_pose,
+                                place_mode,
+                                args,
+                                rule,
+                                candidate_pre_place_pose=candidate.pre_place_pose,
+                            ),
+                        )
+                    ]
+                pad_tilt = _tcp_pad_tilt_z(release_pose)
+                place_z = float(_get_pose_position(release_pose)[2])
+                if place_z < min_place_tcp_z:
+                    continue
+                for hover_variant_label, base_hover_pose in base_hover_entries:
+                    label_parts = [combined_variant_label, hover_variant_label]
+                    hover_variant = "+".join([part for part in label_parts if part]) or None
+                    label = "transport_hover" if hover_variant is None else f"transport_hover_{hover_variant}"
+                    if max_abs_yaw > 0.0:
+                        ydeg = _variant_abs_yaw_deg_from_labels(hover_variant, label)
+                        if ydeg > max_abs_yaw + 1e-4:
+                            continue
+                    for hover_extra in hover_extra_heights:
+                        hover_pose = base_hover_pose
+                        if float(hover_extra) > 1e-6:
+                            # Keep hover_plus on the same release->hover approach line.  Adding
+                            # world-z here makes the final-contact delta multi-axis in the goal
+                            # frame, which defeats cuRobo's constrained approach metric.
+                            hover_pose = _extend_hover_pose_along_release_approach(
+                                release_pose,
+                                base_hover_pose,
+                                float(hover_extra),
+                            )
+                        hover_label = label
+                        if float(hover_extra) > 1e-6:
+                            hover_label = f"{hover_label}_hover_plus_{int(round(float(hover_extra) * 1000.0))}mm"
+                        item = {
+                            "label": hover_label,
+                            "pose": hover_pose,
+                            "hover_pose": hover_pose,
+                            "pre_place_pose": hover_pose,
+                            "place_pose": release_pose,
+                            "release_pose": release_pose,
+                            "raw_release_pose": raw_release_pose,
+                            "retreat_pose": hover_pose,
+                            "target_name": candidate.target_name,
+                            "slot_name": candidate.slot_name,
+                            "variant_label": hover_variant,
+                            "tcp_verticality": float(candidate.tcp_verticality),
+                            "pad_tilt": float(pad_tilt),
+                            "place_plan": candidate,
+                            "place_mode": place_mode,
+                            "object_category": object_category,
+                            "direct_place_mode": False,
+                            "transport_to_hover": True,
+                            "release_lift_m": float(release_lift),
+                            "insert_release_height_offset_m": float(insert_release_offset),
+                            "hover_extra_height_m": float(hover_extra),
+                        }
+                        all_candidates.append(item)
+                        if pad_tilt <= max_pad_tilt:
+                            level_candidates.append(item)
     if level_candidates:
-        candidates = _dedupe_place_candidates(level_candidates)
+        candidates = _dedupe_place_candidates(all_candidates)
         candidates.sort(key=_pre_place_screen_sort_key)
         print(
             f"[place_state] built {len(candidates)} transport hover candidate(s) "
-            f"(pad-level filter kept {len(level_candidates)}/{len(all_candidates)}, max_pad_tilt={max_pad_tilt:.2f})"
+            f"(pad-level filter would keep {len(level_candidates)}/{len(all_candidates)}, "
+            f"but retaining tilted variants too; max_pad_tilt={max_pad_tilt:.2f})"
         )
     elif all_candidates:
         all_candidates.sort(key=lambda c: float(c["pad_tilt"]))
@@ -5262,19 +6404,30 @@ def plan_final_contact_approach(
         label=final_label,
     )
     source_name = _current_source_object_name(args)
-    use_segmented_final_contact = bool(getattr(args, "final_contact_segmented_ik_fallback", False)) or bool(
-        getattr(args, "allow_segmented_ik_rescue", False)
+    strict_linear_final_contact = bool(getattr(args, "strict_final_contact_linear", True))
+    use_segmented_final_contact = (
+        bool(getattr(args, "final_contact_segmented_ik_first", False))
+        or bool(getattr(args, "final_contact_segmented_ik_fallback", False))
+        or bool(getattr(args, "allow_segmented_ik_rescue", False))
     )
-    force_segmented_final_contact = False
-    if source_name == "carriot":
-        use_segmented_final_contact = True
-        force_segmented_final_contact = True
-    if place_mode == "insert_place":
-        use_segmented_final_contact = True
-        force_segmented_final_contact = True
-    if verticality_target is not None and verticality_target < 0.5:
-        use_segmented_final_contact = True
-        force_segmented_final_contact = True
+    force_segmented_final_contact = bool(getattr(args, "final_contact_segmented_ik_first", False))
+    if (
+        bool(getattr(args, "curobo_debug", False))
+        and not use_segmented_final_contact
+        and (source_name == "carriot" or place_mode == "insert_place" or (verticality_target is not None and verticality_target < 0.5))
+    ):
+        print(
+            f"[place_state] {final_label}: using cuRobo MotionGen approach metric for short contact "
+            "(segmented IK is opt-in only)"
+        )
+    if bool(getattr(args, "curobo_debug", False)) and strict_linear_final_contact:
+        start_p = _get_pose_position(hover_pose)
+        goal_p = _get_pose_position(release_pose)
+        print(
+            f"[place_state] {final_label}: using cuRobo PoseCostMetric constrained final contact "
+            f"(distance={float(np.linalg.norm(goal_p - start_p)):.4f} m, "
+            "segmented_ik=disabled, curved_path_rejected=yes)"
+        )
     try:
         if use_segmented_final_contact:
             release_q_path = _plan_short_curobo_cartesian_descent(
@@ -5319,6 +6472,33 @@ def plan_final_contact_approach(
         )
         return None
     release_q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in release_q_path]
+    final_contact_backtrack_tol_m = float(
+        max(getattr(args, "strict_final_contact_waypoint_backtrack_tol_m", 0.008), 0.0)
+    )
+    if source_name == "carriot":
+        # Carriot final-contact plans sometimes add a small same-line pre-lift
+        # before the descent.  Keep lateral straight-line validation unchanged,
+        # but avoid rejecting safe vertical/axis-aligned contacts by a 1-2mm
+        # tolerance artifact.
+        final_contact_backtrack_tol_m = max(final_contact_backtrack_tol_m, 0.012)
+    if strict_linear_final_contact and not _validate_strict_linear_waypoints(
+        demo,
+        args,
+        release_q_path,
+        hover_pose,
+        release_pose,
+        label=final_label,
+        max_backtrack_m=final_contact_backtrack_tol_m,
+    ):
+        _record_profile(
+            args,
+            "final_contact",
+            success=False,
+            status="STRICT_LINEAR_VALIDATE_FAIL",
+            elapsed_ms=round((time.perf_counter() - start_t) * 1000.0, 3),
+            path_waypoints=len(release_q_path),
+        )
+        return None
     if not _validate_candidate_joint_path_with_demo_planner(
         demo,
         final_start_q,
@@ -5379,6 +6559,212 @@ def _joint_chain_sort_key(item):
     )
 
 
+def _grasp_chain_eval_sort_key(item, rule):
+    base_key = _candidate_sort_key(item)
+    if not bool(getattr(rule, "preserve_long_axis_vertical", False)):
+        return base_key
+    label = str(item.get("label", "")).lower()
+    is_vertical_relation = "vertical" in label
+    is_tilted_relation = "tilt" in label
+    axis_shift = abs(float(item.get("grasp_axis_shift_m", 0.0) or 0.0))
+    z_lift = max(float(item.get("grasp_z_lift_m", 0.0) or 0.0), 0.0)
+    return (
+        0 if is_vertical_relation else 1,
+        1 if is_tilted_relation else 0,
+        axis_shift,
+        z_lift,
+        base_key,
+    )
+
+
+def _lvmukuai_grasp_chain_eval_sort_key(item) -> tuple:
+    base_key = _candidate_sort_key(item)
+    label = str(item.get("label", "")).lower()
+    is_vertical_helper = "lvmukuai_vertical_gripper" in label
+    is_tilted = "tilt" in label
+    z_lift = max(float(item.get("grasp_z_lift_m", 0.0) or 0.0), 0.0)
+    is_plain_direct = (not is_tilted) and z_lift <= 1e-4 and "lift" not in label
+    tilt_mag = 0.0
+    tilt_match = re.search(r"tilt_(?:toward|away)_robot_([-+]?\d+(?:\.\d+)?)deg", label)
+    if tilt_match:
+        tilt_mag = abs(float(tilt_match.group(1)))
+    if is_vertical_helper:
+        # Target-derived vertical-helper grasps are useful fallback branches,
+        # but random scenes show they can starve the stable topdown/tilt
+        # relations and then all transport goals fail.
+        relation_class = 5
+    elif is_tilted and abs(tilt_mag - 20.0) <= 1.0:
+        relation_class = 0
+    elif is_plain_direct:
+        relation_class = 1
+    elif is_tilted:
+        relation_class = 2
+    elif z_lift >= 0.005 or "lift_10mm" in label:
+        relation_class = 3
+    else:
+        relation_class = 4
+    toward_pref = 0 if "toward_robot" in label else 1
+    lift_pref = 0 if z_lift >= 0.005 or "lift_10mm" in label else 1
+    return (
+        relation_class,
+        lift_pref,
+        toward_pref,
+        abs(tilt_mag - 20.0) if is_tilted else 999.0,
+        abs(float(item.get("grasp_axis_shift_m", 0.0) or 0.0)),
+        base_key,
+    )
+
+
+def _hongshupian_grasp_chain_eval_sort_key(item) -> tuple:
+    """Order chip-box grasps without changing the candidate set.
+
+    Random-scene logs show the center vertical branch is often the fastest
+    winner, but when it fails the shallow top-bias tilt branch is the next
+    reliable branch.  Keeping all other vertical offsets as fallback avoids
+    trading success rate for speed.
+    """
+    base_key = _candidate_sort_key(item)
+    label = str(item.get("label", "")).lower()
+    is_center_vertical = "top_bias_center_vertical" in label
+    is_neg10_tilt15_away = (
+        "top_bias_neg10" in label
+        and "tilt15_away" in label
+        and "axis_-10mm" in label
+    )
+    is_neg2_vertical = "top_bias_neg2_vertical" in label
+    is_neg6_vertical = "top_bias_neg6_vertical" in label
+    is_vertical = "vertical" in label
+    is_tilt = "tilt" in label
+    if is_center_vertical:
+        relation_class = 0
+    elif is_neg10_tilt15_away:
+        relation_class = 1
+    elif is_neg2_vertical:
+        relation_class = 2
+    elif is_neg6_vertical:
+        relation_class = 3
+    elif is_vertical:
+        relation_class = 4
+    elif is_tilt:
+        relation_class = 5
+    else:
+        relation_class = 6
+    return (
+        relation_class,
+        abs(float(item.get("grasp_axis_shift_m", 0.0) or 0.0)),
+        max(float(item.get("grasp_z_lift_m", 0.0) or 0.0), 0.0),
+        base_key,
+    )
+
+
+def _bi_grasp_chain_eval_sort_key(item) -> tuple:
+    """Prefer pen grasp branches that consistently validate insertion fastest."""
+    base_key = _candidate_sort_key(item)
+    label = str(item.get("label", "")).lower()
+    is_tilted = "tilt" in label
+    roll_deg = abs(float(item.get("grasp_approach_roll_deg", 0.0) or 0.0))
+    if not is_tilted and abs(roll_deg - 90.0) <= 1.0:
+        relation_class = 0
+    elif not is_tilted and abs(roll_deg) <= 1.0:
+        relation_class = 1
+    elif not is_tilted and abs(roll_deg - 180.0) <= 1.0:
+        relation_class = 2
+    elif not is_tilted:
+        relation_class = 3
+    elif abs(roll_deg - 180.0) <= 1.0:
+        relation_class = 4
+    elif abs(roll_deg - 90.0) <= 1.0:
+        relation_class = 5
+    else:
+        relation_class = 6
+    return (
+        relation_class,
+        roll_deg,
+        base_key,
+    )
+
+
+def _shuazi_grasp_label_priority(item) -> tuple:
+    label = str(item.get("label", "")).lower()
+    tilt_deg = 0.0
+    tilt_match = re.search(r"tilt_([-+]?\d+(?:\.\d+)?)deg", label)
+    if tilt_match:
+        tilt_deg = abs(float(tilt_match.group(1)))
+    has_yaw = "yaw" in label
+    roll_deg = abs(float(item.get("grasp_approach_roll_deg", 0.0) or 0.0))
+    has_roll = roll_deg > 1e-5 or "roll_" in label
+    has_shift_20 = "shift_20mm" in label
+    axis_shift = abs(float(item.get("grasp_axis_shift_m", 0.0) or 0.0))
+    z_lift = max(float(item.get("grasp_z_lift_m", 0.0) or 0.0), 0.0)
+    has_extra_axis_or_lift = axis_shift > 1e-5 or z_lift > 1e-5
+    is_direct_axis_lift20 = "grasp_tilt" not in label and "axis_12mm_lift_20mm" in label
+    is_direct_axis_lift10 = "grasp_tilt" not in label and "axis_12mm_lift_10mm" in label
+    is_direct_axis = "grasp_tilt" not in label and "axis_12mm" in label
+
+    is_tilt30_roll180 = (
+        (has_yaw or has_roll)
+        and abs(tilt_deg - 30.0) <= 1.0
+        and abs(roll_deg - 180.0) <= 1.0
+        and not has_extra_axis_or_lift
+    )
+    is_tilt30_roll_other = (
+        (has_yaw or has_roll)
+        and abs(tilt_deg - 30.0) <= 1.0
+        and not is_tilt30_roll180
+        and not has_extra_axis_or_lift
+    )
+
+    if is_tilt30_roll180:
+        relation_class = 0
+    elif is_direct_axis_lift20:
+        # Crowded desk scenes can block the shallow tilted brush transport
+        # branches after nearby objects are placed. Keep the proven 30deg/180
+        # branch first, but try lifted direct-axis 90/270 before spending all
+        # downstream checks on other tilted rolls.
+        relation_class = 1
+    elif has_shift_20 and abs(tilt_deg - 30.0) <= 1.0 and not has_extra_axis_or_lift:
+        relation_class = 2
+    elif is_direct_axis_lift10:
+        relation_class = 3
+    elif is_tilt30_roll_other:
+        relation_class = 4
+    elif is_direct_axis:
+        relation_class = 5
+    elif has_shift_20 and abs(tilt_deg - 30.0) <= 1.0:
+        relation_class = 6
+    elif has_shift_20 and abs(tilt_deg - 20.0) <= 1.0 and not has_extra_axis_or_lift:
+        relation_class = 7
+    elif "tilt" in label:
+        relation_class = 8
+    else:
+        relation_class = 9
+
+    if relation_class in {0, 2, 4, 6, 7, 8}:
+        roll_pref = 0 if abs(roll_deg - 180.0) <= 1.0 else 1
+    else:
+        # For direct-axis lifted shuazi grasps, 90/270 have remained the faster
+        # reachable branches in the gluestick-regression jitter scenes.
+        roll_pref = 0 if abs(roll_deg - 90.0) <= 1.0 or abs(roll_deg - 270.0) <= 1.0 else 1
+
+    return (
+        relation_class,
+        abs(tilt_deg - 30.0) if tilt_deg > 0.0 else 999.0,
+        roll_pref,
+        roll_deg,
+        axis_shift,
+        z_lift,
+        str(item.get("label", "")),
+    )
+
+
+def _shuazi_grasp_chain_eval_sort_key(item) -> tuple:
+    base_key = _candidate_sort_key(item)
+    return (
+        *_shuazi_grasp_label_priority(item),
+        base_key,
+    )
+
+
 def _evaluate_joint_grasp_place_chains(
     planner,
     demo,
@@ -5414,22 +6800,88 @@ def _evaluate_joint_grasp_place_chains(
             f"{max_grasp_candidates}->5 so final-approach can test deeper axis biases"
         )
         max_grasp_candidates = 5
-    if source_name == "bi" and max_grasp_candidates > 0 and max_grasp_candidates < 12:
+    bi_min_grasp_candidates = max(1, min(4, len(_bi_direct_grasp_approach_roll_degs(args))))
+    if source_name == "bi" and max_grasp_candidates > 0 and max_grasp_candidates < bi_min_grasp_candidates:
         print(
             "[joint_search] bi insert: increasing downstream grasp expansion "
-            f"{max_grasp_candidates}->12 to test equivalent wrist-roll branches"
+            f"{max_grasp_candidates}->{bi_min_grasp_candidates} to test equivalent wrist-roll branches"
         )
-        max_grasp_candidates = 12
+        max_grasp_candidates = bi_min_grasp_candidates
+    if source_name == "lvmukuai" and max_grasp_candidates > 0 and max_grasp_candidates < 6:
+        print(
+            "[joint_search] lvmukuai: increasing downstream grasp expansion "
+            f"{max_grasp_candidates}->6 so lifted/tilted flat-place relations are evaluated"
+        )
+        max_grasp_candidates = 6
+    # Some jittered desk poses need the 180deg approach-roll branch for a
+    # release pose whose final straight contact is IK-feasible.  The first four
+    # prioritized winners can be only 90/270deg roll variants, so keep a small
+    # six-branch floor instead of falling back to an expensive full search.
+    shuazi_min_grasp_candidates = 6
+    if source_name == "shuazi" and max_grasp_candidates > 0 and max_grasp_candidates < shuazi_min_grasp_candidates:
+        print(
+            "[joint_search] shuazi: increasing downstream grasp expansion "
+            f"{max_grasp_candidates}->{shuazi_min_grasp_candidates} so approach-roll grasp relations are evaluated"
+        )
+        max_grasp_candidates = shuazi_min_grasp_candidates
+    if bool(getattr(rule, "preserve_long_axis_vertical", False)):
+        before_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        grasp_candidates.sort(key=lambda item: _grasp_chain_eval_sort_key(item, rule))
+        after_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        if after_labels != before_labels:
+            print(
+                "[joint_search] vertical long-axis placement: trying vertical grasp relations first "
+                f"(order={after_labels})"
+            )
+    if source_name == "bi":
+        before_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        grasp_candidates.sort(key=_bi_grasp_chain_eval_sort_key)
+        after_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        if after_labels != before_labels:
+            print(
+                "[joint_search] bi: trying raw roll insertion-proven grasp relations first "
+                f"(order={after_labels})"
+            )
+    if source_name == "lvmukuai":
+        before_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        grasp_candidates.sort(key=_lvmukuai_grasp_chain_eval_sort_key)
+        after_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        if after_labels != before_labels:
+            print(
+                "[joint_search] lvmukuai: trying stable topdown/tilt flat-place relations before vertical helpers "
+                f"(order={after_labels})"
+            )
+    if source_name == "hongshupian":
+        before_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        grasp_candidates.sort(key=_hongshupian_grasp_chain_eval_sort_key)
+        after_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        if after_labels != before_labels:
+            print(
+                f"[joint_search] {source_name}: trying center vertical then shallow top-bias tilt before other offsets "
+                f"(order={after_labels})"
+            )
+    if source_name == "shuazi":
+        before_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        grasp_candidates.sort(key=_shuazi_grasp_chain_eval_sort_key)
+        after_labels = [str(c.get("label", "?")) for c in grasp_candidates]
+        if after_labels != before_labels:
+            print(
+                "[joint_search] shuazi: trying transport-proven tilted/shifted grasp relations first "
+                f"(order={after_labels})"
+            )
     if max_grasp_candidates > 0 and len(grasp_candidates) > max_grasp_candidates:
-        non_tilt = [c for c in grasp_candidates if "tilt" not in str(c.get("label", "")).lower()]
-        tilted = [c for c in grasp_candidates if "tilt" in str(c.get("label", "")).lower()]
-        min_tilt_slots = min(max(max_grasp_candidates // 3, 1), len(tilted))
-        non_tilt_slots = max_grasp_candidates - min_tilt_slots
-        selected = non_tilt[:non_tilt_slots] + tilted[:min_tilt_slots]
-        if len(selected) < max_grasp_candidates:
-            remaining_pool = [c for c in grasp_candidates if c not in selected]
-            selected.extend(remaining_pool[: max_grasp_candidates - len(selected)])
-        grasp_candidates = selected
+        if source_name == "shuazi" or source_name == "hongshupian":
+            grasp_candidates = grasp_candidates[:max_grasp_candidates]
+        else:
+            non_tilt = [c for c in grasp_candidates if "tilt" not in str(c.get("label", "")).lower()]
+            tilted = [c for c in grasp_candidates if "tilt" in str(c.get("label", "")).lower()]
+            min_tilt_slots = min(max(max_grasp_candidates // 3, 1), len(tilted))
+            non_tilt_slots = max_grasp_candidates - min_tilt_slots
+            selected = non_tilt[:non_tilt_slots] + tilted[:min_tilt_slots]
+            if len(selected) < max_grasp_candidates:
+                remaining_pool = [c for c in grasp_candidates if c not in selected]
+                selected.extend(remaining_pool[: max_grasp_candidates - len(selected)])
+            grasp_candidates = selected
     all_labels = [str(c.get("label", "?")) for c in grasp_candidates]
     tilt_count = sum(1 for l in all_labels if "tilt" in l.lower())
     print(
@@ -5633,11 +7085,298 @@ def _evaluate_joint_grasp_place_chains(
                     needed_winners = None
                     if max_feasible_chains > 0:
                         needed_winners = max(1, max_feasible_chains - len(chains))
+                    place_modes_in_pass = {
+                        str(item.get("place_mode", "drop_place"))
+                        for item in direct_place_candidates
+                    }
+                    validate_final_contact_in_joint_search = any(
+                        mode != "drop_place" for mode in place_modes_in_pass
+                    )
+                    final_contact_check_limit = None
+                    transport_max_winners = needed_winners
+                    if validate_final_contact_in_joint_search:
+                        final_contact_check_limit = _joint_search_final_contact_check_limit(
+                            args,
+                            source_name,
+                            place_modes_in_pass,
+                        )
+                        winner_floor = int(final_contact_check_limit or 6)
+                        transport_max_winners = max(int(transport_max_winners or 1), winner_floor)
                     print(
                         f"[joint_search] transport-hover pair candidate count for {grasp_label} "
                         f"({pass_label}): {len(direct_pair_candidates)}"
                         + (f", needed_winners={needed_winners}" if needed_winners is not None else "")
+                        + (
+                            f", transport_max_winners={transport_max_winners}"
+                            if transport_max_winners is not None
+                            else ""
+                        )
+                        + (
+                            ", final_contact_precheck=yes"
+                            if validate_final_contact_in_joint_search
+                            else ""
+                        )
                     )
+
+                    def _accept_direct_place_successes(successes) -> bool:
+                        accepted_any = False
+                        ordered_successes = list(successes or [])
+                        if validate_final_contact_in_joint_search:
+                            final_contact_sort_key = _final_contact_validation_sort_key
+                            if source_name == "bi" or any(
+                                str(item.get("place_mode", "")) == "insert_place"
+                                for item in ordered_successes
+                            ):
+                                final_contact_sort_key = _bi_final_contact_validation_sort_key
+                            elif source_name in {"gluestick", "hongshupian"}:
+                                final_contact_sort_key = lambda item: _vertical_long_axis_final_contact_sort_key(
+                                    item,
+                                    source_name,
+                                )
+                            if source_name == "bi" or source_name in {"gluestick", "hongshupian"} or any(
+                                str(item.get("place_mode", "")) == "insert_place"
+                                for item in ordered_successes
+                            ):
+                                ordered_successes = sorted(
+                                    ordered_successes,
+                                    key=final_contact_sort_key,
+                                )
+                            if final_contact_check_limit is not None and len(ordered_successes) > final_contact_check_limit:
+                                print(
+                                    "[joint_search] final-contact precheck limited to "
+                                    f"{final_contact_check_limit}/{len(ordered_successes)} ordered transport winner(s); "
+                                    "remaining winners deferred to fallback search"
+                                )
+                                ordered_successes = ordered_successes[:final_contact_check_limit]
+                        for candidate in ordered_successes:
+                            q_direct_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in candidate["q_path"]]
+                            pre_transport_lift_path = [
+                                np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                                for q in list(candidate.get("pre_transport_lift_path") or [])
+                            ]
+                            if pre_transport_lift_path:
+                                q_direct_place_path = pre_transport_lift_path + q_direct_place_path[1:]
+                            validated_place_choice = None
+                            if validate_final_contact_in_joint_search:
+                                contact_candidate = dict(candidate)
+                                contact_candidate["q_path"] = q_direct_place_path
+                                print(
+                                    f"[joint_search] validating final contact before accepting chain: "
+                                    f"hover={candidate['label']}"
+                                )
+                                validated_place_choice = plan_final_contact_approach(
+                                    planner,
+                                    demo,
+                                    args,
+                                    grasp_terminal_q,
+                                    contact_candidate,
+                                    disabled_world_collision_links=direct_place_disabled_links,
+                                )
+                                if validated_place_choice is None:
+                                    print(
+                                        f"[joint_search] rejected {candidate['label']}: "
+                                        "transport succeeded but final contact failed"
+                                    )
+                                    continue
+                                q_direct_place_path = [
+                                    np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                                    for q in validated_place_choice.get("q_pre_place_path", q_direct_place_path)
+                                ]
+                            release_metrics, release_score = _path_metrics_and_score(
+                                grasp_terminal_q,
+                                q_direct_place_path,
+                            )
+                            total_score = float(grasp_choice["score"]) + float(candidate["score"]) + float(release_score)
+                            chain = {
+                                "grasp_choice": grasp_choice,
+                                "pre_place_choice": candidate,
+                                "q_pre_place_path": q_direct_place_path,
+                                "q_place_path": [
+                                    np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                                    for q in (
+                                        list(validated_place_choice.get("q_place_path") or [])
+                                        if validated_place_choice is not None
+                                        else [np.asarray(q_direct_place_path[-1], dtype=np.float32).reshape(-1)[:7]]
+                                    )
+                                ],
+                                "release_metrics": release_metrics,
+                                "release_score": float(release_score),
+                                "total_score": total_score,
+                                "direct_place_mode": True,
+                                "joint_search_validated_final_contact": bool(validated_place_choice is not None),
+                            }
+                            print(
+                                f"[joint_search] feasible transport-hover chain: grasp={grasp_label}, "
+                                f"hover={candidate['label']}, total_score={total_score:.3f}, "
+                                f"waypoints={len(q_direct_place_path)}"
+                            )
+                            chains.append(chain)
+                            accepted_any = True
+                            if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
+                                return True
+                        return accepted_any
+
+                    direct_place_successes = []
+                    accepted_chain_this_pass = False
+                    skip_direct_transport_batch = False
+                    skip_direct_transport_reason = "SKIPPED_INVALID_START_WORLD_COLLISION"
+                    if (
+                        source_name == "bi"
+                        and pass_label == "primary"
+                        and bool(getattr(args, "curobo_attach_object", True))
+                    ):
+                        skip_direct_transport_batch = _start_state_is_world_collision(
+                            planner,
+                            demo,
+                            transport_screen_args,
+                            grasp_terminal_q,
+                            label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}",
+                            include_table=True,
+                            exclude_object_names=exclude_names,
+                            disabled_world_collision_links=direct_place_disabled_links,
+                        )
+                    if (
+                        source_name == "lvmukuai"
+                        and pass_label == "primary"
+                        and not skip_direct_transport_batch
+                        and max(float(grasp_choice.get("grasp_z_lift_m", 0.0) or 0.0), 0.0) >= 0.005
+                    ):
+                        skip_direct_transport_batch = True
+                        skip_direct_transport_reason = "SKIPPED_LVMUKUAI_LIFTED_GRASP_START_LIFT_FIRST"
+                        print(
+                            f"[joint_search] {grasp_label} {pass_label}: "
+                            "skipping direct transport and using cuRobo straight-lift first "
+                            "for lifted lvmukuai grasp"
+                        )
+                    if (
+                        source_name in {"gluestick", "hongshupian"}
+                        and pass_label == "primary"
+                        and validate_final_contact_in_joint_search
+                        and not skip_direct_transport_batch
+                    ):
+                        fast_lane_candidates = _vertical_long_axis_transport_fast_lane_candidates(
+                            direct_pair_candidates,
+                            source_name,
+                            args,
+                            label=f"{grasp_label}_{pass_label}",
+                        )
+                        if fast_lane_candidates:
+                            fast_lane_successes = []
+                            fast_lane_max_winners = max(
+                                int(transport_max_winners or 1),
+                                int(final_contact_check_limit or 4),
+                            )
+                            with _profile_stage(
+                                args,
+                                "joint_search_transport_hover",
+                                candidate_count=len(fast_lane_candidates),
+                                status="vertical_long_axis_fast_lane",
+                                max_attempts=int(getattr(args, "curobo_max_attempts", 2) if pass_max_attempts is None else pass_max_attempts),
+                                num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if pass_num_ik_seeds is None else pass_num_ik_seeds),
+                                num_trajopt_seeds=int(
+                                    getattr(args, "curobo_num_trajopt_seeds", 1)
+                                    if pass_num_trajopt_seeds is None
+                                    else pass_num_trajopt_seeds
+                                ),
+                                enable_graph=bool(getattr(args, "curobo_enable_graph", False) if pass_enable_graph is None else pass_enable_graph),
+                            ) as prof:
+                                fast_lane_successes = _evaluate_curobo_pose_candidates_multi_start(
+                                    planner,
+                                    demo,
+                                    transport_screen_args,
+                                    fast_lane_candidates,
+                                    label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}_vertical_fast_lane",
+                                    use_attach=True,
+                                    timeout=pass_timeout,
+                                    max_attempts=pass_max_attempts,
+                                    num_ik_seeds=pass_num_ik_seeds,
+                                    num_trajopt_seeds=pass_num_trajopt_seeds,
+                                    num_graph_seeds=pass_num_graph_seeds,
+                                    enable_graph=pass_enable_graph,
+                                    max_winners=fast_lane_max_winners,
+                                    include_table=True,
+                                    exclude_object_names=exclude_names,
+                                    disabled_world_collision_links=direct_place_disabled_links,
+                                )
+                                prof["winner_count"] = len(fast_lane_successes)
+                                prof["success"] = bool(fast_lane_successes)
+                                prof["status"] = "Success" if fast_lane_successes else "NO_WINNERS_VERTICAL_FAST_LANE"
+                                prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
+                                prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
+                                if fast_lane_successes:
+                                    prof["path_waypoints"] = int((fast_lane_successes[0].get("metrics") or {}).get("waypoint_count", 0) or 0)
+                                    prof["path_score"] = float(fast_lane_successes[0].get("score", 0.0) or 0.0)
+                            if fast_lane_successes:
+                                accepted_chain_this_pass = _accept_direct_place_successes(fast_lane_successes)
+                                if accepted_chain_this_pass:
+                                    print(
+                                        f"[joint_search] {grasp_label} {pass_label}: "
+                                        f"accepted {source_name} vertical-long-axis fast-lane transport/final-contact chain"
+                                    )
+                    if (
+                        source_name == "carriot"
+                        and pass_label == "primary"
+                        and validate_final_contact_in_joint_search
+                        and not skip_direct_transport_batch
+                    ):
+                        fast_lane_candidates = _carriot_transport_fast_lane_candidates(
+                            direct_pair_candidates,
+                            args,
+                            label=f"{grasp_label}_{pass_label}",
+                        )
+                        if fast_lane_candidates:
+                            fast_lane_successes = []
+                            with _profile_stage(
+                                args,
+                                "joint_search_transport_hover",
+                                candidate_count=len(fast_lane_candidates),
+                                status="carriot_fast_lane",
+                                max_attempts=int(getattr(args, "curobo_max_attempts", 2) if pass_max_attempts is None else pass_max_attempts),
+                                num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if pass_num_ik_seeds is None else pass_num_ik_seeds),
+                                num_trajopt_seeds=int(
+                                    getattr(args, "curobo_num_trajopt_seeds", 1)
+                                    if pass_num_trajopt_seeds is None
+                                    else pass_num_trajopt_seeds
+                                ),
+                                enable_graph=bool(getattr(args, "curobo_enable_graph", False) if pass_enable_graph is None else pass_enable_graph),
+                            ) as prof:
+                                fast_lane_successes = _evaluate_curobo_pose_candidates_multi_start(
+                                    planner,
+                                    demo,
+                                    transport_screen_args,
+                                    fast_lane_candidates,
+                                    label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}_carriot_fast_lane",
+                                    use_attach=True,
+                                    timeout=pass_timeout,
+                                    max_attempts=pass_max_attempts,
+                                    num_ik_seeds=pass_num_ik_seeds,
+                                    num_trajopt_seeds=pass_num_trajopt_seeds,
+                                    num_graph_seeds=pass_num_graph_seeds,
+                                    enable_graph=pass_enable_graph,
+                                    max_winners=1,
+                                    include_table=True,
+                                    exclude_object_names=exclude_names,
+                                    disabled_world_collision_links=direct_place_disabled_links,
+                                )
+                                prof["winner_count"] = len(fast_lane_successes)
+                                prof["success"] = bool(fast_lane_successes)
+                                prof["status"] = "Success" if fast_lane_successes else "NO_WINNERS_CARRIOT_FAST_LANE"
+                                prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
+                                prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
+                                if fast_lane_successes:
+                                    prof["path_waypoints"] = int((fast_lane_successes[0].get("metrics") or {}).get("waypoint_count", 0) or 0)
+                                    prof["path_score"] = float(fast_lane_successes[0].get("score", 0.0) or 0.0)
+                            if fast_lane_successes:
+                                accepted_chain_this_pass = _accept_direct_place_successes(fast_lane_successes)
+                                if accepted_chain_this_pass:
+                                    print(
+                                        f"[joint_search] {grasp_label} {pass_label}: "
+                                        "accepted carriot fast-lane transport/final-contact chain"
+                                    )
+                    if accepted_chain_this_pass:
+                        if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
+                            break
+                        continue
                     with _profile_stage(
                         args,
                         "joint_search_transport_hover",
@@ -5650,34 +7389,48 @@ def _evaluate_joint_grasp_place_chains(
                             else pass_num_trajopt_seeds
                         ),
                         enable_graph=bool(getattr(args, "curobo_enable_graph", False) if pass_enable_graph is None else pass_enable_graph),
+                        skipped_invalid_start=bool(skip_direct_transport_batch),
                     ) as prof:
-                        direct_place_successes = _evaluate_curobo_pose_candidates_multi_start(
-                            planner,
-                            demo,
-                            transport_screen_args,
-                            direct_pair_candidates,
-                            label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}",
-                            use_attach=True,
-                            timeout=pass_timeout,
-                            max_attempts=pass_max_attempts,
-                            num_ik_seeds=pass_num_ik_seeds,
-                            num_trajopt_seeds=pass_num_trajopt_seeds,
-                            num_graph_seeds=pass_num_graph_seeds,
-                            enable_graph=pass_enable_graph,
-                            max_winners=needed_winners,
-                            include_table=True,
-                            exclude_object_names=exclude_names,
-                            disabled_world_collision_links=direct_place_disabled_links,
+                        if skip_direct_transport_batch:
+                            prof["winner_count"] = 0
+                            prof["success"] = False
+                            prof["status"] = skip_direct_transport_reason
+                            prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
+                            prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
+                        else:
+                            direct_place_successes = _evaluate_curobo_pose_candidates_multi_start(
+                                planner,
+                                demo,
+                                transport_screen_args,
+                                direct_pair_candidates,
+                                label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}",
+                                use_attach=True,
+                                timeout=pass_timeout,
+                                max_attempts=pass_max_attempts,
+                                num_ik_seeds=pass_num_ik_seeds,
+                                num_trajopt_seeds=pass_num_trajopt_seeds,
+                                num_graph_seeds=pass_num_graph_seeds,
+                                enable_graph=pass_enable_graph,
+                                max_winners=transport_max_winners,
+                                include_table=True,
+                                exclude_object_names=exclude_names,
+                                disabled_world_collision_links=direct_place_disabled_links,
+                            )
+                            prof["winner_count"] = len(direct_place_successes)
+                            prof["success"] = bool(direct_place_successes)
+                            prof["status"] = "Success" if direct_place_successes else "NO_WINNERS"
+                            prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
+                            prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
+                            if direct_place_successes:
+                                prof["path_waypoints"] = int((direct_place_successes[0].get("metrics") or {}).get("waypoint_count", 0) or 0)
+                                prof["path_score"] = float(direct_place_successes[0].get("score", 0.0) or 0.0)
+                    if direct_place_successes and validate_final_contact_in_joint_search:
+                        accepted_chain_this_pass = (
+                            _accept_direct_place_successes(direct_place_successes)
+                            or accepted_chain_this_pass
                         )
-                        prof["winner_count"] = len(direct_place_successes)
-                        prof["success"] = bool(direct_place_successes)
-                        prof["status"] = "Success" if direct_place_successes else "NO_WINNERS"
-                        prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
-                        prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
-                        if direct_place_successes:
-                            prof["path_waypoints"] = int((direct_place_successes[0].get("metrics") or {}).get("waypoint_count", 0) or 0)
-                            prof["path_score"] = float(direct_place_successes[0].get("score", 0.0) or 0.0)
-                    if not direct_place_successes:
+                        direct_place_successes = []
+                    if not direct_place_successes and not accepted_chain_this_pass:
                         lift_m = float(max(getattr(args, "joint_search_start_collision_lift_m", 0.030), 0.0))
                         lift_exclude_names = set(exclude_names or set())
                         lift_disabled_links = _post_grasp_lift_disabled_world_links(
@@ -5695,41 +7448,60 @@ def _evaluate_joint_grasp_place_chains(
                                 f"[joint_search] {grasp_label} {pass_label}: "
                                 f"straight-lift fallback will temporarily exclude start-collision obstacle {relief_name!r}"
                             )
+                        lift_path_kind = "TCP-up straight lift"
                         with _profile_stage(args, "joint_search_start_lift", candidate_count=1) as prof:
-                            lift_path = _plan_short_world_z_lift_ik(
+                            lift_path = _plan_short_tcp_up_axis_lift_ik(
                                 planner,
                                 demo,
                                 args,
                                 grasp_terminal_q,
+                                grasp_choice,
                                 lift_m=lift_m,
-                                label=f"joint_start_lift_{safe_label}_{pass_label}",
+                                label=f"joint_start_tcp_up_lift_{safe_label}_{pass_label}",
                                 include_table=True,
                                 exclude_object_names=lift_exclude_names,
                                 disabled_world_collision_links=lift_disabled_links,
                             )
+                            if lift_path is None:
+                                lift_path_kind = "approach-line retreat"
+                                lift_path = _plan_short_grasp_approach_retreat_ik(
+                                    planner,
+                                    demo,
+                                    args,
+                                    grasp_terminal_q,
+                                    grasp_choice,
+                                    label=f"joint_start_retreat_{safe_label}_{pass_label}",
+                                    include_table=True,
+                                    exclude_object_names=lift_exclude_names,
+                                    disabled_world_collision_links=lift_disabled_links,
+                                )
+                            if lift_path is None:
+                                lift_path_kind = f"{lift_m:.3f}m straight world-Z lift"
+                                lift_path = _plan_short_world_z_lift_ik(
+                                    planner,
+                                    demo,
+                                    args,
+                                    grasp_terminal_q,
+                                    lift_m=lift_m,
+                                    label=f"joint_start_lift_{safe_label}_{pass_label}",
+                                    include_table=True,
+                                    exclude_object_names=lift_exclude_names,
+                                    disabled_world_collision_links=lift_disabled_links,
+                                )
                             prof["success"] = lift_path is not None
                             prof["status"] = "Success" if lift_path is not None else "PLAN_FAIL"
+                            prof["lift_kind"] = lift_path_kind
                             prof["path_waypoints"] = len(lift_path or [])
-                        if lift_path is not None and len(lift_path) >= 2:
-                            lifted_start_q = np.asarray(lift_path[-1], dtype=np.float32).reshape(-1)[:7]
-                            lifted_pair_candidates = []
-                            for candidate in direct_place_candidates:
-                                pair_item = dict(candidate)
-                                pair_item["start_q"] = lifted_start_q
-                                pair_item["grasp_choice"] = grasp_choice
-                                pair_item["pre_transport_lift_path"] = [
-                                    np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in lift_path
-                                ]
-                                lifted_pair_candidates.append(pair_item)
+                        if lift_path is None and skip_direct_transport_batch:
                             print(
-                                f"[joint_search] retrying transport-hover after {lift_m:.3f}m straight lift "
-                                f"for {grasp_label} ({pass_label})"
+                                f"[joint_search] {grasp_label} {pass_label}: straight lift failed after "
+                                "start-collision skip; running the skipped direct transport batch as fallback"
                             )
                             with _profile_stage(
                                 args,
                                 "joint_search_transport_hover",
-                                candidate_count=len(lifted_pair_candidates),
-                                status="after_lift",
+                                candidate_count=len(direct_pair_candidates),
+                                status="fallback_after_lift_fail",
                                 max_attempts=int(getattr(args, "curobo_max_attempts", 2) if pass_max_attempts is None else pass_max_attempts),
                                 num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if pass_num_ik_seeds is None else pass_num_ik_seeds),
                                 num_trajopt_seeds=int(
@@ -5743,8 +7515,8 @@ def _evaluate_joint_grasp_place_chains(
                                     planner,
                                     demo,
                                     transport_screen_args,
-                                    lifted_pair_candidates,
-                                    label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}_after_lift",
+                                    direct_pair_candidates,
+                                    label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}_fallback_after_lift_fail",
                                     use_attach=True,
                                     timeout=pass_timeout,
                                     max_attempts=pass_max_attempts,
@@ -5752,50 +7524,166 @@ def _evaluate_joint_grasp_place_chains(
                                     num_trajopt_seeds=pass_num_trajopt_seeds,
                                     num_graph_seeds=pass_num_graph_seeds,
                                     enable_graph=pass_enable_graph,
-                                    max_winners=needed_winners,
+                                    max_winners=transport_max_winners,
                                     include_table=True,
-                                    exclude_object_names=lift_exclude_names,
+                                    exclude_object_names=exclude_names,
                                     disabled_world_collision_links=direct_place_disabled_links,
                                 )
                                 prof["winner_count"] = len(direct_place_successes)
                                 prof["success"] = bool(direct_place_successes)
-                                prof["status"] = "Success" if direct_place_successes else "NO_WINNERS_AFTER_LIFT"
+                                prof["status"] = "Success" if direct_place_successes else "NO_WINNERS_FALLBACK_AFTER_LIFT_FAIL"
                                 prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
                                 prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
                                 if direct_place_successes:
                                     prof["path_waypoints"] = int((direct_place_successes[0].get("metrics") or {}).get("waypoint_count", 0) or 0)
                                     prof["path_score"] = float(direct_place_successes[0].get("score", 0.0) or 0.0)
-                    for candidate in direct_place_successes:
-                        q_direct_place_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in candidate["q_path"]]
-                        pre_transport_lift_path = [
-                            np.asarray(q, dtype=np.float32).reshape(-1)[:7]
-                            for q in list(candidate.get("pre_transport_lift_path") or [])
-                        ]
-                        if pre_transport_lift_path:
-                            q_direct_place_path = pre_transport_lift_path + q_direct_place_path[1:]
-                        release_metrics, release_score = _path_metrics_and_score(
-                            grasp_terminal_q,
-                            q_direct_place_path,
+                            if not direct_place_successes:
+                                with _profile_stage(
+                                    args,
+                                    "joint_search_start_lift",
+                                    candidate_count=1,
+                                    status="retry_after_direct_fallback",
+                                ) as prof:
+                                    lift_path_kind = "TCP-up straight lift"
+                                    lift_path = _plan_short_tcp_up_axis_lift_ik(
+                                        planner,
+                                        demo,
+                                        args,
+                                        grasp_terminal_q,
+                                        grasp_choice,
+                                        lift_m=lift_m,
+                                        label=f"joint_start_tcp_up_lift_{safe_label}_{pass_label}_retry_after_direct_fallback",
+                                        include_table=True,
+                                        exclude_object_names=lift_exclude_names,
+                                        disabled_world_collision_links=lift_disabled_links,
+                                    )
+                                    if lift_path is None:
+                                        lift_path_kind = "approach-line retreat"
+                                        lift_path = _plan_short_grasp_approach_retreat_ik(
+                                            planner,
+                                            demo,
+                                            args,
+                                            grasp_terminal_q,
+                                            grasp_choice,
+                                            label=f"joint_start_retreat_{safe_label}_{pass_label}_retry_after_direct_fallback",
+                                            include_table=True,
+                                            exclude_object_names=lift_exclude_names,
+                                            disabled_world_collision_links=lift_disabled_links,
+                                        )
+                                    if lift_path is None:
+                                        lift_path_kind = f"{lift_m:.3f}m straight world-Z lift"
+                                        lift_path = _plan_short_world_z_lift_ik(
+                                            planner,
+                                            demo,
+                                            args,
+                                            grasp_terminal_q,
+                                            lift_m=lift_m,
+                                            label=f"joint_start_lift_{safe_label}_{pass_label}_retry_after_direct_fallback",
+                                            include_table=True,
+                                            exclude_object_names=lift_exclude_names,
+                                            disabled_world_collision_links=lift_disabled_links,
+                                        )
+                                    prof["success"] = lift_path is not None
+                                    prof["status"] = "Success" if lift_path is not None else "PLAN_FAIL_RETRY_AFTER_DIRECT_FALLBACK"
+                                    prof["path_waypoints"] = len(lift_path or [])
+                        if lift_path is not None and len(lift_path) >= 2:
+                            lifted_start_q = np.asarray(lift_path[-1], dtype=np.float32).reshape(-1)[:7]
+                            lifted_pair_candidates = []
+                            for candidate in direct_place_candidates:
+                                pair_item = dict(candidate)
+                                pair_item["start_q"] = lifted_start_q
+                                pair_item["grasp_choice"] = grasp_choice
+                                pair_item["pre_transport_lift_path"] = [
+                                    np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in lift_path
+                                ]
+                                lifted_pair_candidates.append(pair_item)
+                            print(
+                                f"[joint_search] retrying transport-hover after {lift_path_kind} "
+                                f"for {grasp_label} ({pass_label})"
+                            )
+                            lifted_candidate_passes = [("after_lift", lifted_pair_candidates)]
+                            if source_name == "bi" and pass_label == "primary":
+                                fast_lane = _bi_insert_fast_lane_candidates(
+                                    lifted_pair_candidates,
+                                    label=f"{grasp_label}_{pass_label}_after_lift",
+                                )
+                                if fast_lane and len(fast_lane) < len(lifted_pair_candidates):
+                                    fast_ids = {id(item) for item in fast_lane}
+                                    remaining_candidates = [
+                                        item for item in lifted_pair_candidates if id(item) not in fast_ids
+                                    ]
+                                    lifted_candidate_passes = [("after_lift_fast_lane", fast_lane)]
+                                    if remaining_candidates:
+                                        lifted_candidate_passes.append(
+                                            ("after_lift_remaining", remaining_candidates)
+                                        )
+                            for lifted_pass_label, lifted_eval_candidates in lifted_candidate_passes:
+                                lifted_max_winners = transport_max_winners
+                                if validate_final_contact_in_joint_search:
+                                    # Only collect as many transport winners as we are willing to
+                                    # validate with expensive sequential final-contact MotionGen.
+                                    lifted_max_winners = max(
+                                        int(lifted_max_winners or 1),
+                                        int(final_contact_check_limit or 6),
+                                    )
+                                with _profile_stage(
+                                    args,
+                                    "joint_search_transport_hover",
+                                    candidate_count=len(lifted_eval_candidates),
+                                    status=lifted_pass_label,
+                                    max_attempts=int(getattr(args, "curobo_max_attempts", 2) if pass_max_attempts is None else pass_max_attempts),
+                                    num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if pass_num_ik_seeds is None else pass_num_ik_seeds),
+                                    num_trajopt_seeds=int(
+                                        getattr(args, "curobo_num_trajopt_seeds", 1)
+                                        if pass_num_trajopt_seeds is None
+                                        else pass_num_trajopt_seeds
+                                    ),
+                                    enable_graph=bool(getattr(args, "curobo_enable_graph", False) if pass_enable_graph is None else pass_enable_graph),
+                                ) as prof:
+                                    direct_place_successes = _evaluate_curobo_pose_candidates_multi_start(
+                                        planner,
+                                        demo,
+                                        transport_screen_args,
+                                        lifted_eval_candidates,
+                                        label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}_{lifted_pass_label}",
+                                        use_attach=True,
+                                        timeout=pass_timeout,
+                                        max_attempts=pass_max_attempts,
+                                        num_ik_seeds=pass_num_ik_seeds,
+                                        num_trajopt_seeds=pass_num_trajopt_seeds,
+                                        num_graph_seeds=pass_num_graph_seeds,
+                                        enable_graph=pass_enable_graph,
+                                        max_winners=lifted_max_winners,
+                                        include_table=True,
+                                        exclude_object_names=lift_exclude_names,
+                                        disabled_world_collision_links=direct_place_disabled_links,
+                                    )
+                                    prof["winner_count"] = len(direct_place_successes)
+                                    prof["success"] = bool(direct_place_successes)
+                                    prof["status"] = "Success" if direct_place_successes else f"NO_WINNERS_{lifted_pass_label.upper()}"
+                                    prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
+                                    prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
+                                    if direct_place_successes:
+                                        prof["path_waypoints"] = int((direct_place_successes[0].get("metrics") or {}).get("waypoint_count", 0) or 0)
+                                        prof["path_score"] = float(direct_place_successes[0].get("score", 0.0) or 0.0)
+                                if direct_place_successes:
+                                    if validate_final_contact_in_joint_search:
+                                        accepted_chain_this_pass = (
+                                            _accept_direct_place_successes(direct_place_successes)
+                                            or accepted_chain_this_pass
+                                        )
+                                        direct_place_successes = []
+                                        if accepted_chain_this_pass or (
+                                            max_feasible_chains > 0 and len(chains) >= max_feasible_chains
+                                        ):
+                                            break
+                                        continue
+                                    break
+                    if direct_place_successes:
+                        accepted_chain_this_pass = (
+                            _accept_direct_place_successes(direct_place_successes)
+                            or accepted_chain_this_pass
                         )
-                        total_score = float(grasp_choice["score"]) + float(candidate["score"]) + float(release_score)
-                        chain = {
-                            "grasp_choice": grasp_choice,
-                            "pre_place_choice": candidate,
-                            "q_pre_place_path": q_direct_place_path,
-                            "q_place_path": [np.asarray(q_direct_place_path[-1], dtype=np.float32).reshape(-1)[:7]],
-                            "release_metrics": release_metrics,
-                            "release_score": float(release_score),
-                            "total_score": total_score,
-                            "direct_place_mode": True,
-                        }
-                        print(
-                            f"[joint_search] feasible transport-hover chain: grasp={grasp_label}, "
-                            f"hover={candidate['label']}, total_score={total_score:.3f}, "
-                            f"waypoints={len(q_direct_place_path)}"
-                        )
-                        chains.append(chain)
-                        if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
-                            break
                     if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
                         break
                 if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
@@ -5886,7 +7774,13 @@ def run_targeted_place_episode_curobo_direct(
 
     print("\n[move to grasp with two-step approach]")
     with _profile_stage(args, "build_grasp_candidates") as prof:
-        grasp_candidates = _build_direct_grasp_candidates(demo, args)
+        grasp_candidates = _build_direct_grasp_candidates(
+            demo,
+            args,
+            bridge_mod=bridge_mod,
+            scene_capture_cache=scene_capture_cache,
+            place_state_cache=place_state_cache,
+        )
         prof["candidate_count"] = len(grasp_candidates)
         prof["success"] = bool(grasp_candidates)
         prof["status"] = "Success" if grasp_candidates else "NO_CANDIDATES"
@@ -5906,17 +7800,34 @@ def run_targeted_place_episode_curobo_direct(
             f"{direct_grasp_max_winners}->5 so downstream final-approach can test deeper axis biases"
         )
         direct_grasp_max_winners = 5
-    if source_name == "bi" and direct_grasp_max_winners > 0 and direct_grasp_max_winners < 12:
+    bi_min_pregrasp_winners = max(1, min(4, len(_bi_direct_grasp_approach_roll_degs(args))))
+    if source_name == "bi" and direct_grasp_max_winners > 0 and direct_grasp_max_winners < bi_min_pregrasp_winners:
         print(
             "[direct_grasp] bi insert: increasing pregrasp winners "
-            f"{direct_grasp_max_winners}->12 to test equivalent wrist-roll branches"
+            f"{direct_grasp_max_winners}->{bi_min_pregrasp_winners} to test equivalent wrist-roll branches"
         )
-        direct_grasp_max_winners = 12
+        direct_grasp_max_winners = bi_min_pregrasp_winners
+    if source_name == "lvmukuai" and direct_grasp_max_winners > 0 and direct_grasp_max_winners < 6:
+        print(
+            "[direct_grasp] lvmukuai: increasing pregrasp winners "
+            f"{direct_grasp_max_winners}->6 to test lifted/tilted flat-place relations"
+        )
+        direct_grasp_max_winners = 6
+    # Match the downstream shuazi floor above so the pregrasp goalset keeps the
+    # 180deg approach-roll branch available for grasp->place screening.
+    shuazi_min_pregrasp_winners = 6
+    if source_name == "shuazi" and direct_grasp_max_winners > 0 and direct_grasp_max_winners < shuazi_min_pregrasp_winners:
+        print(
+            "[direct_grasp] shuazi: increasing pregrasp winners "
+            f"{direct_grasp_max_winners}->{shuazi_min_pregrasp_winners} so downstream transport can test approach-roll grasp relations"
+        )
+        direct_grasp_max_winners = shuazi_min_pregrasp_winners
+    grasp_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     two_step_pregrasp_successes = _evaluate_two_step_grasp_candidates(
         planner,
         demo,
         args,
-        np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
+        grasp_start_q,
         grasp_candidates,
         label="two_step_grasp",
         max_winners=direct_grasp_max_winners,
@@ -5976,23 +7887,107 @@ def run_targeted_place_episode_curobo_direct(
             grasp_successes,
         )
         if not joint_chains:
-            print("[FAIL] no grasp candidate yielded a complete grasp->pre_place->release chain")
-            failed_place_pose = getattr(demo, "_last_joint_chain_failed_pose", None)
-            failed_place_label = str(getattr(demo, "_last_joint_chain_failed_label", "") or "place")
-            failed_place_candidates = list(getattr(demo, "_last_joint_chain_failed_candidate_poses", []) or [])
-            failed_start_q = getattr(demo, "_last_joint_chain_failed_start_q", None)
-            targeted.base.inspect_failed_pose(
-                demo,
-                bridge_mod,
-                failed_place_label if failed_place_pose is not None else "grasp",
-                args,
-                pose=failed_place_pose if failed_place_pose is not None else grasp_choice["pose"],
-                q_target=failed_start_q if failed_place_pose is not None else None,
-                gripper_closed=True if failed_place_pose is not None else False,
-                use_attach=True if failed_place_pose is not None else False,
-                candidate_poses=failed_place_candidates if failed_place_pose is not None else [item["pose"] for item in grasp_candidates],
-            )
-            return False
+            fallback_grasp_successes = []
+            if direct_grasp_max_winners == 1 and len(grasp_candidates) > 1:
+                fallback_winners = min(2, len(grasp_candidates))
+                print(
+                    "[joint_search] first grasp winner produced no complete chain; "
+                    f"expanding grasp goalset winners 1->{fallback_winners} before failing"
+                )
+                targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
+                fallback_grasp_successes = _evaluate_two_step_grasp_candidates(
+                    planner,
+                    demo,
+                    args,
+                    grasp_start_q,
+                    grasp_candidates,
+                    label="two_step_grasp_fallback",
+                    max_winners=fallback_winners,
+                    include_active_object=True,
+                    disabled_world_collision_links=direct_grasp_disabled_links,
+                )
+                merged_by_label = {str(item.get("label", "")): item for item in grasp_successes}
+                for item in list(fallback_grasp_successes or []):
+                    merged_by_label[str(item.get("label", ""))] = item
+                if len(merged_by_label) > len(grasp_successes):
+                    grasp_successes = list(merged_by_label.values())
+                    grasp_successes.sort(key=_candidate_sort_key)
+                    two_step_pregrasp_lookup.update(
+                        {str(item.get("label", "")): item for item in list(fallback_grasp_successes or [])}
+                    )
+                    joint_chains = _evaluate_joint_grasp_place_chains(
+                        planner,
+                        demo,
+                        bridge_mod,
+                        args,
+                        scene_capture_cache,
+                        place_state_cache,
+                        rule,
+                        grasp_successes,
+                    )
+            if (
+                not joint_chains
+                and source_name == "bi"
+                and rule is not None
+                and getattr(rule, "primitive", None) == "insert_vertical"
+            ):
+                base_offsets = _unique_finite_float_list(
+                    getattr(args, "bi_insert_release_height_offsets_m", [0.0]),
+                    min_value=0.0,
+                )
+                fallback_offsets = _unique_finite_float_list(
+                    getattr(args, "bi_insert_release_fallback_height_offsets_m", [0.01]),
+                    min_value=0.0,
+                )
+                fallback_offsets = [
+                    float(v)
+                    for v in fallback_offsets
+                    if float(v) > 1e-6 and all(abs(float(v) - float(base)) > 1e-6 for base in base_offsets)
+                ]
+                if fallback_offsets:
+                    print(
+                        "[joint_search] bi insert: original release depth failed; "
+                        "retrying with shallower release offset(s) "
+                        f"{[round(v, 4) for v in fallback_offsets]}"
+                    )
+                    fallback_args = SimpleNamespace(**vars(args))
+                    fallback_args.bi_insert_release_height_offsets_m = fallback_offsets
+                    targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
+                    with _profile_stage(
+                        args,
+                        "joint_search_bi_release_up_fallback",
+                        candidate_count=len(fallback_offsets),
+                    ) as prof:
+                        joint_chains = _evaluate_joint_grasp_place_chains(
+                            planner,
+                            demo,
+                            bridge_mod,
+                            fallback_args,
+                            scene_capture_cache,
+                            place_state_cache,
+                            rule,
+                            grasp_successes,
+                        )
+                        prof["success"] = bool(joint_chains)
+                        prof["status"] = "Success" if joint_chains else "NO_CHAIN"
+            if not joint_chains:
+                print("[FAIL] no grasp candidate yielded a complete grasp->pre_place->release chain")
+                failed_place_pose = getattr(demo, "_last_joint_chain_failed_pose", None)
+                failed_place_label = str(getattr(demo, "_last_joint_chain_failed_label", "") or "place")
+                failed_place_candidates = list(getattr(demo, "_last_joint_chain_failed_candidate_poses", []) or [])
+                failed_start_q = getattr(demo, "_last_joint_chain_failed_start_q", None)
+                targeted.base.inspect_failed_pose(
+                    demo,
+                    bridge_mod,
+                    failed_place_label if failed_place_pose is not None else "grasp",
+                    args,
+                    pose=failed_place_pose if failed_place_pose is not None else grasp_choice["pose"],
+                    q_target=failed_start_q if failed_place_pose is not None else None,
+                    gripper_closed=True if failed_place_pose is not None else False,
+                    use_attach=True if failed_place_pose is not None else False,
+                    candidate_poses=failed_place_candidates if failed_place_pose is not None else [item["pose"] for item in grasp_candidates],
+                )
+                return False
         selected_joint_chain = joint_chains[0]
         grasp_choice = selected_joint_chain["grasp_choice"]
 
@@ -6098,9 +8093,38 @@ def run_targeted_place_episode_curobo_direct(
         _attach_transport_payload_to_curobo(planner, demo, args, label="transport")
 
     with _profile_stage(args, "post_grasp_lift") as prof:
-        post_lift_ok = _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, "post_grasp_lift", use_attach=True)
-        prof["success"] = bool(post_lift_ok)
-        prof["status"] = "Success" if post_lift_ok else "PLAN_OR_EXEC_FAIL"
+        post_lift_ok = True
+        planned_transport_path = []
+        if selected_joint_chain is not None and bool(getattr(args, "reuse_joint_search_chain", True)):
+            planned_transport_path = [
+                np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                for q in list(selected_joint_chain.get("q_pre_place_path") or [])
+            ]
+        current_after_grasp_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+        skip_independent_post_lift = False
+        if len(planned_transport_path) >= 2:
+            reuse_tol = float(max(getattr(args, "joint_search_reuse_start_q_tolerance", 0.03), 0.0))
+            start_delta = float(np.max(np.abs(current_after_grasp_q - planned_transport_path[0])))
+            if start_delta <= reuse_tol:
+                skip_independent_post_lift = True
+                print(
+                    "[post_grasp_lift] skipped independent lift; "
+                    "joint_search transport chain already starts at the executed grasp state "
+                    f"(start_delta={start_delta:.4f} <= tol={reuse_tol:.4f})"
+                )
+            else:
+                print(
+                    "[post_grasp_lift] cannot skip independent lift; "
+                    f"joint_search chain start_delta={start_delta:.4f} > tol={reuse_tol:.4f}"
+                )
+        if skip_independent_post_lift:
+            prof["success"] = True
+            prof["status"] = "SKIPPED_REUSE_JOINT_SEARCH_CHAIN"
+            prof["path_waypoints"] = 0
+        else:
+            post_lift_ok = _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, "post_grasp_lift", use_attach=True)
+            prof["success"] = bool(post_lift_ok)
+            prof["status"] = "Success" if post_lift_ok else "PLAN_OR_EXEC_FAIL"
     if not post_lift_ok:
         print("[warn] post-grasp lift failed; continuing to transport from current pose")
 
@@ -6177,6 +8201,7 @@ def run_targeted_place_episode_curobo_direct(
     place_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     transport_screen_args = _transport_screen_args_for_object(args, _current_source_object_name(args))
     transport_successes = None
+    joint_search_validated_place_choice = None
     if selected_joint_chain is not None and bool(getattr(args, "reuse_joint_search_chain", True)):
         planned_path = [
             np.asarray(q, dtype=np.float32).reshape(-1)[:7]
@@ -6196,6 +8221,30 @@ def run_targeted_place_episode_curobo_direct(
                 reused_choice["start_q"] = place_start_q.copy()
                 reused_choice["reused_joint_search_chain"] = True
                 transport_successes = [reused_choice]
+                validated_q_place_path = [
+                    np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                    for q in list(selected_joint_chain.get("q_place_path") or [])
+                ]
+                if (
+                    bool(selected_joint_chain.get("joint_search_validated_final_contact", False))
+                    and len(validated_q_place_path) >= 2
+                    and np.allclose(reused_path[-1], validated_q_place_path[0], atol=0.03, rtol=0.0)
+                ):
+                    combined_path = reused_path + validated_q_place_path[1:]
+                    combined_metrics, combined_score = _path_metrics_and_score(place_start_q, combined_path)
+                    joint_search_validated_place_choice = dict(reused_choice)
+                    joint_search_validated_place_choice["label"] = f"{reused_choice['label']}_final_contact"
+                    joint_search_validated_place_choice["q_path"] = combined_path
+                    joint_search_validated_place_choice["q_pre_place_path"] = reused_path
+                    joint_search_validated_place_choice["q_place_path"] = validated_q_place_path
+                    joint_search_validated_place_choice["two_stage_place"] = True
+                    joint_search_validated_place_choice["final_contact_policy"] = "joint_search_validated_reuse"
+                    joint_search_validated_place_choice["metrics"] = combined_metrics
+                    joint_search_validated_place_choice["score"] = float(combined_score)
+                    print(
+                        "[place] reusing joint_search-validated final contact path "
+                        f"(place_waypoints={len(validated_q_place_path)}, total_waypoints={len(combined_path)})"
+                    )
                 print(
                     f"[place] reusing joint_search transport path "
                     f"(start_delta={start_delta:.4f} <= tol={reuse_tol:.4f}, waypoints={len(reused_path)})"
@@ -6299,18 +8348,19 @@ def run_targeted_place_episode_curobo_direct(
         )
         return False
 
-    place_choice = None
-    for transport_choice in transport_successes:
-        place_choice = plan_final_contact_approach(
-            planner,
-            demo,
-            args,
-            place_start_q,
-            transport_choice,
-            disabled_world_collision_links=direct_place_disabled_links,
-        )
-        if place_choice is not None:
-            break
+    place_choice = joint_search_validated_place_choice
+    if place_choice is None:
+        for transport_choice in transport_successes:
+            place_choice = plan_final_contact_approach(
+                planner,
+                demo,
+                args,
+                place_start_q,
+                transport_choice,
+                disabled_world_collision_links=direct_place_disabled_links,
+            )
+            if place_choice is not None:
+                break
     if place_choice is None and any(bool(item.get("reused_joint_search_chain", False)) for item in transport_successes):
         print(
             "[place] reused joint_search hover failed final_contact; "
@@ -6436,6 +8486,11 @@ def run_targeted_place_episode_curobo_direct(
             targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
         return False
 
+    if targeted.base.force_active_object_to_attached_pose(demo):
+        print("[direct_pre_place] synchronized active object to attached release pose before opening gripper")
+    else:
+        print("[direct_pre_place] release-pose active object sync skipped; no attached TCP transform available")
+
     print("\n[open gripper at place]")
     if not targeted.base.confirm_simple_action("open the real gripper at the targeted place", args, bridge_mod=bridge_mod, env=demo.env, repeats=6):
         print("[abort] user cancelled before opening the real gripper at the targeted place")
@@ -6457,11 +8512,31 @@ def run_targeted_place_episode_curobo_direct(
     demo._attached_box_visual_visible = False
     demo._attached_object_visual_active = False
     targeted.base.update_attached_box_visual(demo, visible=False)
+    place_mode_name = str(place_choice.get("place_mode", "drop_place"))
+    settled_before_clearance = False
+    if place_mode_name == "insert_place":
+        # For insertion tasks the retreat path can pull the released item out of
+        # the holder in dry-run sim. Cache the released pose before moving the
+        # empty gripper away so the scene state represents the intended place.
+        targeted.base.settle_released_active_object_for_scene_cache(demo, args)
+        settled_before_clearance = True
     clearance_pose = _retreat_pose_for_place_mode(
         demo,
-        str(place_choice.get("place_mode", "drop_place")),
+        place_mode_name,
         args,
+        place_choice,
     )
+    q_clearance_path = None
+    skip_clearance_requested = bool(getattr(args, "skip_post_place_clearance", False))
+    force_clearance_after_insert = (
+        skip_clearance_requested
+        and place_mode_name == "insert_place"
+    )
+    if force_clearance_after_insert:
+        print(
+            "[place] post_place_clearance requested to skip, but insert_place requires "
+            "a short retreat so the next object does not start from the insertion pose"
+        )
     with _profile_stage(
         args,
         "post_place_clearance",
@@ -6470,35 +8545,80 @@ def run_targeted_place_episode_curobo_direct(
         num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
         enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
     ) as prof:
-        _refresh_curobo_world(
-            planner,
-            demo,
-            args,
-            label="post_place_clearance",
-            include_active_object=False,
-            include_table=bool(getattr(args, "curobo_table_collision", True)),
-        )
-        q_clearance_path = _plan_with_official_approach_metric(
-            planner,
-            demo,
-            args,
-            np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
-            demo.tcp.pose,
-            clearance_pose,
-            label="post_place_clearance",
-        )
-        if not q_clearance_path and bool(getattr(args, "allow_demo_planner_rescue", False)):
-            _, q_clearance_path = targeted.base.plan_post_place_clearance_path(
-                demo,
-                retreat_distance=0.05,
-                label="post_place_clearance",
+        if skip_clearance_requested and not force_clearance_after_insert:
+            print("[place] skipped post_place_clearance by request")
+            prof["success"] = True
+            prof["status"] = "SKIPPED_BY_REQUEST"
+            prof["path_waypoints"] = 0
+        else:
+            current_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+            current_pose = demo.tcp.pose
+            clearance_delta_m = float(np.linalg.norm(_get_pose_position(clearance_pose) - _get_pose_position(current_pose)))
+            clearance_rot_delta_deg = float(
+                np.degrees(
+                    _quat_angle_rad_wxyz(
+                        targeted.base.flatten_np(current_pose.q)[:4],
+                        targeted.base.flatten_np(clearance_pose.q)[:4],
+                    )
+                )
             )
-        prof["success"] = bool(q_clearance_path)
-        prof["status"] = "Success" if q_clearance_path else "PLAN_FAIL"
-        prof["path_waypoints"] = len(q_clearance_path or [])
-        prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
-        prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
-    if not q_clearance_path:
+            reverse_place_path = [
+                np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                for q in list(place_choice.get("q_place_path") or [])
+            ] if place_mode_name != "insert_place" else []
+            if clearance_delta_m <= 1e-5 and clearance_rot_delta_deg <= 0.05:
+                q_clearance_path = [current_q.copy()]
+                print("[place] post_place_clearance is already at clearance pose; using zero-length path")
+                prof["success"] = True
+                prof["status"] = "ZERO_LENGTH"
+                prof["path_waypoints"] = 1
+                prof["world_changed"] = False
+                prof["cache_hit"] = True
+            elif len(reverse_place_path) >= 2:
+                q_clearance_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7].copy() for q in reversed(reverse_place_path)]
+                q_clearance_path[0] = current_q.copy()
+                print(
+                    "[place] post_place_clearance reusing reversed final-contact path "
+                    f"({len(q_clearance_path)} waypoint(s))"
+                )
+                prof["success"] = True
+                prof["status"] = "REUSED_FINAL_CONTACT_REVERSE"
+                prof["path_waypoints"] = len(q_clearance_path)
+                prof["world_changed"] = False
+                prof["cache_hit"] = True
+            else:
+                _refresh_curobo_world(
+                    planner,
+                    demo,
+                    args,
+                    label="post_place_clearance",
+                    include_active_object=False,
+                    include_table=bool(getattr(args, "curobo_table_collision", True)),
+                )
+                q_clearance_path = _plan_constrained_linear_segment(
+                    planner,
+                    demo,
+                    args,
+                    np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
+                    demo.tcp.pose,
+                    clearance_pose,
+                    label="post_place_clearance",
+                    validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
+                )
+            if not q_clearance_path and bool(getattr(args, "allow_demo_planner_rescue", False)):
+                _, q_clearance_path = targeted.base.plan_post_place_clearance_path(
+                    demo,
+                    retreat_distance=0.05,
+                    label="post_place_clearance",
+                )
+            if str(prof.get("status", "")) not in {"REUSED_FINAL_CONTACT_REVERSE", "ZERO_LENGTH"}:
+                prof["success"] = bool(q_clearance_path)
+                prof["status"] = "Success" if q_clearance_path else "PLAN_FAIL"
+                prof["path_waypoints"] = len(q_clearance_path or [])
+                prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
+                prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
+    skipped_clearance_by_request = skip_clearance_requested and not force_clearance_after_insert
+    if not q_clearance_path and not skipped_clearance_by_request:
         print("[place] skipped legacy post_place_clearance planner; enable --allow-demo-planner-rescue to use it")
     clearance_executed = False
     if q_clearance_path:
@@ -6522,26 +8642,59 @@ def run_targeted_place_episode_curobo_direct(
                 "[place] post_place_clearance final q:",
                 np.round(np.asarray(q_clearance_path[-1], dtype=np.float32).reshape(-1)[:7], 5).tolist(),
             )
-    else:
+    elif not skipped_clearance_by_request:
         print("[warn] post-place clearance planning failed after release; settling the object without moving the arm away first")
 
-    targeted.base.settle_released_active_object_for_scene_cache(demo, args)
+    if not settled_before_clearance:
+        targeted.base.settle_released_active_object_for_scene_cache(demo, args)
     targeted._mark_place_rule_success(rule, place_state_cache, place_choice["slot_name"])
 
     if relaxed_target_collision:
         targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
         relaxed_target_collision = False
+    if bool(getattr(args, "skip_return_to_cycle_start", False)):
+        if force_clearance_after_insert and not clearance_executed:
+            print(
+                "[place] insert post_place_clearance failed; falling back to return_to_cycle_start "
+                "despite --skip-return-to-cycle-start so the next object does not start from insertion"
+            )
+            return_ok = _plan_and_execute_return_to_cycle_start(
+                demo,
+                bridge_mod,
+                real_exec,
+                args,
+                start_q,
+            )
+            if not return_ok and not bool(getattr(args, "strict_return_to_cycle_start", False)):
+                print(
+                    "[warn] return_to_cycle_start failed after completed place; "
+                    "treating pick-place as successful and continuing from the current arm pose"
+                )
+                return True
+            return return_ok
+        if clearance_executed:
+            print("[place] completed targeted place and clearance; skipping return_to_cycle_start by request")
+        else:
+            print("[place] completed targeted place without clearance; skipping return_to_cycle_start by request")
+        return True
     if clearance_executed:
         print("[place] completed targeted place and clearance; returning to the cycle start pose")
     else:
         print("[place] completed targeted place without clearance; returning to the cycle start pose from the current release state")
-    return _plan_and_execute_return_to_cycle_start(
+    return_ok = _plan_and_execute_return_to_cycle_start(
         demo,
         bridge_mod,
         real_exec,
         args,
         start_q,
     )
+    if not return_ok and not bool(getattr(args, "strict_return_to_cycle_start", False)):
+        print(
+            "[warn] return_to_cycle_start failed after completed place; "
+            "treating pick-place as successful and continuing from the current arm pose"
+        )
+        return True
+    return return_ok
 
 
 def main():

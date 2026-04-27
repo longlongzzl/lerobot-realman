@@ -215,16 +215,14 @@ def make_vertical_long_axis_grasp_bias_variants() -> tuple[GraspBiasVariant, ...
 
 
 def make_pen_insert_grasp_bias_variants() -> tuple[GraspBiasVariant, ...]:
-    # For the pen, avoid tilted pickup branches: after attach they often start
-    # transport in collision with nearby tabletop objects.  Bias the TCP along
-    # the pen's long axis instead, so insertion keeps a usable TCP<->pen frame.
+    # Keep the pen grasp centered on the raw target pose.  Axis-shifted picks
+    # changed the TCP<->pen frame and made downstream insertion expensive to
+    # validate.  Small tilt-only variants preserve the target point while giving
+    # cuRobo extra IK branches around the same physical grasp.
     return (
-        GraspBiasVariant(axis_shift_m=-0.018, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="pen_bias_neg18"),
-        GraspBiasVariant(axis_shift_m=-0.014, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="pen_bias_neg14"),
-        GraspBiasVariant(axis_shift_m=-0.010, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="pen_bias_neg10"),
-        GraspBiasVariant(axis_shift_m=-0.006, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="pen_bias_neg6"),
-        GraspBiasVariant(axis_shift_m=-0.014, tilt_toward_robot_deg=0.0, z_lift_m=0.006, label="pen_bias_neg14_lift6"),
-        GraspBiasVariant(axis_shift_m=-0.010, tilt_toward_robot_deg=0.0, z_lift_m=0.006, label="pen_bias_neg10_lift6"),
+        GraspBiasVariant(axis_shift_m=0.000, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="pen_raw"),
+        GraspBiasVariant(axis_shift_m=0.000, tilt_toward_robot_deg=12.0, tilt_direction="toward_robot", z_lift_m=0.000, label="pen_tilt_toward_12deg"),
+        GraspBiasVariant(axis_shift_m=0.000, tilt_toward_robot_deg=12.0, tilt_direction="away_robot", z_lift_m=0.000, label="pen_tilt_away_12deg"),
     )
 
 
@@ -318,6 +316,7 @@ PLACE_RULES["hongshupian"] = apply_vertical_long_axis_rule_overrides(
 PLACE_RULES["lvmukuai"] = PlaceRule(
     **{
         **PLACE_RULES["lvmukuai"].__dict__,
+        "allow_tabletop_yaw_variants": True,
         "tabletop_axial_spin_deg": (0.0, 90.0, 180.0, 270.0),
     }
 )
@@ -325,6 +324,15 @@ PLACE_RULES["carriot"] = PlaceRule(
     **{
         **PLACE_RULES["carriot"].__dict__,
         "allow_tabletop_yaw_variants": False,
+    }
+)
+PLACE_RULES["shuazi"] = PlaceRule(
+    **{
+        **PLACE_RULES["shuazi"].__dict__,
+        # Brush placement only requires a flat footprint at the selected desk
+        # slot. In-plane yaw does not move the slot center or lift/tilt the
+        # object, but it gives the grasp-coupled release TCP reachable branches.
+        "allow_tabletop_yaw_variants": True,
     }
 )
 PLACE_RULES["tennis"] = PlaceRule(

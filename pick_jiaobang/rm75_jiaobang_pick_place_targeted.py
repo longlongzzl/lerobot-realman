@@ -93,7 +93,7 @@ def build_arg_parser():
         type=float,
         nargs="*",
         default=[0.0],
-        help="For place_on_slots rules, also try these tabletop place tilt angles toward the robot. Default keeps the final object pose fixed.",
+        help="For place_on_slots rules, also try these tabletop place tilt angles. Default keeps the final object pose fixed.",
     )
     parser.add_argument(
         "--tabletop-place-yaw-variant-deg",
@@ -121,6 +121,12 @@ def build_arg_parser():
         type=float,
         default=0.55,
         help="For tabletop place_on_slots rules, when any candidate keeps the TCP approach axis at least this aligned with the tabletop normal, reject flatter/horizontal TCP candidates and try the more vertical ones first.",
+    )
+    parser.add_argument(
+        "--target-selection-order",
+        choices=("random", "risk_aware"),
+        default="random",
+        help="How to choose among rule-enabled targets. risk_aware keeps randomness inside priority groups but tries small/easily-blocked objects before bulky placed obstacles.",
     )
     parser.add_argument(
         "--targeted-place-hover-extra-height-m",
@@ -580,7 +586,12 @@ def _make_tabletop_place_world_pose_variants(
         yaw_bottom_along_up = float(np.min((yaw_world_points - plane_origin) @ up_axis))
 
         for tilt_deg in tilt_degs:
-            tilt_label = None if abs(tilt_deg) <= 1e-6 else f"tilt_toward_robot_{int(round(tilt_deg))}deg"
+            if abs(tilt_deg) <= 1e-6:
+                tilt_label = None
+            elif tilt_deg > 0.0:
+                tilt_label = f"tilt_toward_robot_{int(round(abs(tilt_deg)))}deg"
+            else:
+                tilt_label = f"tilt_away_robot_{int(round(abs(tilt_deg)))}deg"
             labels = [label for label in (yaw_label, tilt_label) if label]
             label = "+".join(labels) if labels else None
             T_variant = T_yaw.copy()
@@ -1496,6 +1507,7 @@ def _select_random_cycle_target(
     scene_capture_cache,
     available_rule_names,
     failed_targets_this_cycle: set[str],
+    deferred_failed_targets: set[str] | None,
     cycle_idx: int,
 ) -> tuple[str | None, list[str], list[str]]:
     pool = _random_target_pool_for_cycle(
@@ -1505,9 +1517,34 @@ def _select_random_cycle_target(
         available_rule_names,
         cycle_idx,
     )
-    candidates = [name for name in pool if name not in failed_targets_this_cycle]
+    deferred = set(deferred_failed_targets or set())
+    candidates = [
+        name for name in pool
+        if name not in failed_targets_this_cycle and name not in deferred
+    ]
+    if not candidates:
+        candidates = [name for name in pool if name not in failed_targets_this_cycle]
     if not candidates:
         return None, pool, []
+    if str(getattr(base_args, "target_selection_order", "random")) == "risk_aware":
+        priority = {
+            # Remove the pen first so it no longer blocks nearby small long-axis
+            # sources.  Place lvmukuai early: it needs an upright gripper relation
+            # and becomes much harder once bulky tabletop objects consume slots.
+            "bi": 0,
+            "lvmukuai": 1,
+            # Brush transport is sensitive to nearby tall tabletop objects;
+            # place it before the glue stick so its target path is not blocked
+            # by an already-placed vertical cylinder.
+            "shuazi": 2,
+            "gluestick": 3,
+            "hongshupian": 4,
+            "carriot": 4,
+            "tennis": 5,
+        }
+        best_priority = min(priority.get(name, 10) for name in candidates)
+        priority_candidates = [name for name in candidates if priority.get(name, 10) == best_priority]
+        return random.choice(priority_candidates), pool, candidates
     return random.choice(candidates), pool, candidates
 
 
@@ -1557,6 +1594,7 @@ def main():
     place_state_cache: dict = {"used_slots_by_target": {}}
     previous_cycle_final_q: np.ndarray | None = None
     failed_targets_this_cycle: set[str] = set()
+    deferred_failed_targets: set[str] = set()
     try:
         if args.execute_real:
             real_exec = base.RealmanJointExecutor(args)
@@ -1579,6 +1617,7 @@ def main():
                 scene_capture_cache,
                 available_rule_names,
                 failed_targets_this_cycle,
+                deferred_failed_targets,
                 cycle_idx,
             )
             if selected_name is None:
@@ -1594,7 +1633,13 @@ def main():
             if failed_targets_this_cycle:
                 print(
                     f"\n[cycle {cycle_idx}] random target pool after failures: {target_candidates}; "
-                    f"failed_this_cycle={sorted(failed_targets_this_cycle)}"
+                    f"failed_this_cycle={sorted(failed_targets_this_cycle)}, "
+                    f"deferred_failed={sorted(deferred_failed_targets)}"
+                )
+            elif deferred_failed_targets:
+                print(
+                    f"\n[cycle {cycle_idx}] random target pool: {target_candidates}; "
+                    f"deferred_failed={sorted(deferred_failed_targets)}"
                 )
             else:
                 print(f"\n[cycle {cycle_idx}] random target pool: {target_candidates}")
@@ -1643,6 +1688,7 @@ def main():
             if not ok:
                 if bool(getattr(base_args, "reselect_target_on_planning_failure", True)):
                     failed_targets_this_cycle.add(selected_name)
+                    deferred_failed_targets.add(selected_name)
                     print(
                         f"[cycle {cycle_idx}] planning/execution failed; "
                         "keeping the current cached scene and trying a different target."
@@ -1652,6 +1698,7 @@ def main():
                 final_ok = False
                 break
             failed_targets_this_cycle.clear()
+            deferred_failed_targets.discard(selected_name)
             if final_sim_arm_q is not None:
                 previous_cycle_final_q = final_sim_arm_q
             base.cache_successfully_placed_object_world_pose(demo, cycle_args.object_name, cycle_args)
