@@ -19,6 +19,16 @@ import rm75_jiaobang_pick_place_targeted_curobo as curobo_wrapper
 _PROFILE_RECORDS: list[dict] = []
 _PROFILE_PATH: Path | None = None
 _PROFILE_REGISTERED = False
+_PROFILE_COUNTERS: Counter = Counter()
+_PROFILE_COUNTER_FIELDS = (
+    "ik_batch_call_count",
+    "motiongen_call_count",
+    "graph_call_count",
+    "timeout_count",
+    "fallback_count",
+    "world_refresh_count",
+    "attach_object_count",
+)
 
 
 def _jsonable(value):
@@ -35,6 +45,103 @@ def _jsonable(value):
 
 def _profile_enabled(args) -> bool:
     return bool(getattr(args, "planning_profile_enabled", True))
+
+
+def _bump_profile_counter(name: str, amount: int = 1) -> None:
+    if not name or amount == 0:
+        return
+    _PROFILE_COUNTERS[str(name)] += int(amount)
+
+
+def _snapshot_profile_counters() -> Counter:
+    return Counter(_PROFILE_COUNTERS)
+
+
+def _profile_counter_delta(start: Counter) -> dict[str, int]:
+    return {
+        key: int(_PROFILE_COUNTERS.get(key, 0) - start.get(key, 0))
+        for key in _PROFILE_COUNTER_FIELDS
+    }
+
+
+def _copy_last_candidate_counts_to_profile(prof: dict, planner) -> None:
+    for attr, field in (
+        ("_last_candidate_count_in", "candidate_count_in"),
+        ("_last_candidate_count_after_ik", "candidate_count_after_ik"),
+        ("_last_candidate_count_motiongen", "candidate_count_motiongen"),
+    ):
+        value = getattr(planner, attr, None)
+        if value is not None:
+            prof[field] = int(value)
+
+
+def _status_indicates_timeout(status) -> bool:
+    return "TIMEOUT" in str(status).upper()
+
+
+def _count_motiongen_status(status) -> None:
+    if _status_indicates_timeout(status):
+        _bump_profile_counter("timeout_count")
+
+
+def _count_motiongen_result(result) -> None:
+    _count_motiongen_status(getattr(result, "status", ""))
+
+
+def _graph_enabled_from_kwargs(kwargs: dict) -> bool:
+    return bool(kwargs.get("enable_graph", False))
+
+
+def _profile_solve_batch_start_goal_ik(planner, *args, **kwargs):
+    _bump_profile_counter("ik_batch_call_count")
+    return planner.solve_batch_start_goal_ik(*args, **kwargs)
+
+
+def _profile_plan_to_pose(planner, *args, **kwargs):
+    _bump_profile_counter("motiongen_call_count")
+    if _graph_enabled_from_kwargs(kwargs):
+        _bump_profile_counter("graph_call_count")
+    result = planner.plan_to_pose(*args, **kwargs)
+    _count_motiongen_result(result)
+    return result
+
+
+def _profile_plan_to_joint_state(planner, *args, **kwargs):
+    _bump_profile_counter("motiongen_call_count")
+    if _graph_enabled_from_kwargs(kwargs):
+        _bump_profile_counter("graph_call_count")
+    result = planner.plan_to_joint_state(*args, **kwargs)
+    _count_motiongen_result(result)
+    return result
+
+
+def _profile_plan_goalset_to_poses(planner, *args, **kwargs):
+    _bump_profile_counter("motiongen_call_count")
+    if _graph_enabled_from_kwargs(kwargs):
+        _bump_profile_counter("graph_call_count")
+    result = planner.plan_goalset_to_poses(*args, **kwargs)
+    _count_motiongen_result(result)
+    return result
+
+
+def _profile_plan_batch_to_poses(planner, *args, **kwargs):
+    _bump_profile_counter("motiongen_call_count")
+    if _graph_enabled_from_kwargs(kwargs):
+        _bump_profile_counter("graph_call_count")
+    results = planner.plan_batch_to_poses(*args, **kwargs)
+    for result in list(results or []):
+        _count_motiongen_result(result)
+    return results
+
+
+def _profile_plan_batch_start_goal_pairs(planner, *args, **kwargs):
+    _bump_profile_counter("motiongen_call_count")
+    if _graph_enabled_from_kwargs(kwargs):
+        _bump_profile_counter("graph_call_count")
+    results = planner.plan_batch_start_goal_pairs(*args, **kwargs)
+    for result in list(results or []):
+        _count_motiongen_result(result)
+    return results
 
 
 def _profile_object_name(args) -> str:
@@ -78,6 +185,7 @@ def _record_profile(args, stage_name: str, **fields) -> None:
 @contextmanager
 def _profile_stage(args, stage_name: str, **fields):
     start_t = time.perf_counter()
+    counter_start = _snapshot_profile_counters()
     rec = dict(fields)
     try:
         yield rec
@@ -88,6 +196,10 @@ def _profile_stage(args, stage_name: str, **fields):
         raise
     finally:
         rec["elapsed_ms"] = round((time.perf_counter() - start_t) * 1000.0, 3)
+        for key, value in _profile_counter_delta(counter_start).items():
+            rec.setdefault(key, value)
+        if "candidate_count" in rec and "candidate_count_in" not in rec:
+            rec["candidate_count_in"] = rec.get("candidate_count")
         _record_profile(args, stage_name, **rec)
 
 
@@ -121,7 +233,13 @@ def _print_profile_summary() -> None:
 
 
 def _configure_curobo_torch_extensions(args) -> None:
-    ext_dir = Path(getattr(args, "curobo_torch_extensions_dir", Path("/tmp/curobo_torch_extensions"))).expanduser().resolve()
+    ext_dir = Path(
+        getattr(
+            args,
+            "curobo_torch_extensions_dir",
+            curobo_wrapper.DEFAULT_TORCH_EXTENSIONS_DIR,
+        )
+    ).expanduser().resolve()
     ext_dir.mkdir(parents=True, exist_ok=True)
     prev = os.environ.get("TORCH_EXTENSIONS_DIR")
     os.environ["TORCH_EXTENSIONS_DIR"] = str(ext_dir)
@@ -230,6 +348,33 @@ def build_arg_parser():
             "For bi insert placement, retry these shallower release offsets only if the original release depth "
             "does not produce a complete grasp->place chain."
         ),
+    )
+    parser.add_argument(
+        "--bi-fast-insert-spin-deg",
+        type=float,
+        nargs="*",
+        default=[0.0, -15.0, 15.0, -90.0, 90.0, -120.0, -135.0, -150.0],
+        help=(
+            "Small first-pass axial spin set for bi insert placement. The full "
+            "--insert-vertical-axial-spin-deg set remains fallback if this lane fails."
+        ),
+    )
+    parser.add_argument(
+        "--bi-fast-insert-approach-distances",
+        type=float,
+        nargs="*",
+        default=[0.05],
+        help=(
+            "Small first-pass approach distances for bi insert placement. "
+            "Default 50mm matches the most reliable straight insertion contact."
+        ),
+    )
+    parser.add_argument(
+        "--bi-fast-insert-hover-extra-heights-m",
+        type=float,
+        nargs="*",
+        default=[0.0, 0.03],
+        help="Small first-pass hover-extra heights for bi insert placement.",
     )
     parser.add_argument(
         "--direct-pre-place-z-offsets",
@@ -434,6 +579,76 @@ def build_arg_parser():
         type=float,
         default=8.0,
         help="Timeout in seconds for the generic joint-search fallback pass.",
+    )
+    parser.add_argument(
+        "--fast-chain-screening",
+        dest="fast_chain_screening",
+        action="store_true",
+        default=True,
+        help=(
+            "Use the integrated fast path: batched IK ranks grasp->place pairs, reuses "
+            "the IK results in transport prefilter, and tries the top pair before the "
+            "full fallback search."
+        ),
+    )
+    parser.add_argument(
+        "--no-fast-chain-screening",
+        dest="fast_chain_screening",
+        action="store_false",
+        help="Disable the integrated fast-chain IK ranking path.",
+    )
+    parser.add_argument(
+        "--fast-chain-top-pairs",
+        type=int,
+        default=1,
+        help="Number of IK-ranked grasp->place pairs to try in the fast-chain pass.",
+    )
+    parser.add_argument(
+        "--fast-chain-initial-grasp-winners",
+        type=int,
+        default=1,
+        help=(
+            "When fast-chain is enabled, only this many pregrasp winners are planned "
+            "before the first winner-chain attempt. If it fails, the original expanded "
+            "grasp winner count is used as fallback."
+        ),
+    )
+    parser.add_argument(
+        "--fast-chain-preselect-grasp-candidates",
+        type=int,
+        default=6,
+        help=(
+            "Maximum grasp candidates to check in the cheap winner-chain IK preselect. "
+            "Set <=0 to check every generated grasp candidate."
+        ),
+    )
+    parser.add_argument(
+        "--fast-chain-preselect-first-valid",
+        dest="fast_chain_preselect_first_valid",
+        action="store_true",
+        default=True,
+        help="Stop cheap winner-chain preselect at the first ordered grasp with a valid place IK pair.",
+    )
+    parser.add_argument(
+        "--no-fast-chain-preselect-first-valid",
+        dest="fast_chain_preselect_first_valid",
+        action="store_false",
+        help="Rank all cheap winner-chain preselect pairs instead of stopping at the first valid pair.",
+    )
+    parser.add_argument(
+        "--fast-chain-max-ik-candidates",
+        type=int,
+        default=0,
+        help=(
+            "Maximum place candidates to IK-rank in the fast-chain pass. "
+            "Set <=0 to rank every generated place candidate."
+        ),
+    )
+    parser.add_argument(
+        "--fast-chain-ik-seeds",
+        type=int,
+        default=32,
+        help="IK seeds used by the fast-chain ranking pass.",
     )
     parser.add_argument(
         "--joint-search-start-collision-lift-m",
@@ -700,31 +915,6 @@ def build_arg_parser():
         default=[0.0, -45.0, 45.0, -90.0, 90.0, 180.0],
         help="Extra wrist-roll candidates around the tennis release approach axis. "
         "This does not change the target ball center, but gives cuRobo more IK/collision branches.",
-    )
-    parser.add_argument(
-        "--carriot-direct-place-tilt-toward-robot-degs",
-        type=float,
-        nargs="*",
-        default=[0.0, 15.0, -15.0, 30.0, -30.0],
-        help="Center-preserving carriot release TCP-body tilt candidates in degrees. "
-        "The object center target is unchanged; only equivalent gripper orientations are searched.",
-    )
-    parser.add_argument(
-        "--carriot-direct-place-axial-roll-degs",
-        type=float,
-        nargs="*",
-        default=[0.0, -45.0, 45.0, -90.0, 90.0, 180.0],
-        help="Extra wrist-roll candidates around the carriot release approach axis.",
-    )
-    parser.add_argument(
-        "--carriot-transport-fast-lane-max-candidates",
-        type=int,
-        default=48,
-        help=(
-            "For carriot joint-search transport, try this many preferred candidates first "
-            "with cuRobo goalset max_winners=1. If that fast lane fails final contact, "
-            "the full candidate set remains fallback."
-        ),
     )
     parser.add_argument(
         "--direct-place-contact-lift-m",
@@ -1304,6 +1494,7 @@ def _attached_sphere_bottom_z(planner, q) -> float | None:
 
 def _attach_transport_payload_to_curobo(planner, demo, args, *, label: str) -> bool:
     start_t = time.perf_counter()
+    counter_start = _snapshot_profile_counters()
     profile_success = False
     profile_status = "disabled"
     if not bool(getattr(args, "curobo_attach_object", True)):
@@ -1313,6 +1504,7 @@ def _attach_transport_payload_to_curobo(planner, demo, args, *, label: str) -> b
             success=False,
             status=profile_status,
             elapsed_ms=round((time.perf_counter() - start_t) * 1000.0, 3),
+            **_profile_counter_delta(counter_start),
         )
         return False
     try:
@@ -1353,6 +1545,7 @@ def _attach_transport_payload_to_curobo(planner, demo, args, *, label: str) -> b
                 f"base_p={np.round(obj_pose_attach_for_curobo[:3], 4).tolist()}"
             )
         base_z_offset = float(getattr(args, "curobo_attach_world_z_offset_m", 0.002))
+        _bump_profile_counter("attach_object_count")
         ok = planner.attach_object_box_to_robot(
             current_q,
             attach_box_dims,
@@ -1381,6 +1574,7 @@ def _attach_transport_payload_to_curobo(planner, demo, args, *, label: str) -> b
                     f"reattaching with world_z_offset={adjusted_offset:.4f}m"
                 )
                 planner.detach_object_from_robot()
+                _bump_profile_counter("attach_object_count")
                 ok = planner.attach_object_box_to_robot(
                     current_q,
                     attach_box_dims,
@@ -1415,6 +1609,7 @@ def _attach_transport_payload_to_curobo(planner, demo, args, *, label: str) -> b
             success=profile_success,
             status=profile_status,
             elapsed_ms=round((time.perf_counter() - start_t) * 1000.0, 3),
+            **_profile_counter_delta(counter_start),
         )
 
 
@@ -1495,6 +1690,7 @@ def _apply_deferred_two_step_final_approach(planner, demo, args, grasp_choice, p
                     f"[two_step_grasp] official final approach failed for {grasp_choice.get('label', '?')}; "
                     "retrying with gripper world collision relaxed"
                 )
+                _bump_profile_counter("fallback_count")
                 final_approach_path = _plan_constrained_linear_segment(
                     planner,
                     demo,
@@ -1543,6 +1739,7 @@ def _apply_deferred_two_step_final_approach(planner, demo, args, grasp_choice, p
                 f"[two_step_grasp] official final approach failed for {grasp_choice.get('label', '?')}; "
                 "trying bounded segmented IK fallback"
             )
+            _bump_profile_counter("fallback_count")
             final_approach_path = _plan_short_curobo_cartesian_descent(
                 planner,
                 demo,
@@ -1579,6 +1776,8 @@ def _apply_deferred_two_step_final_approach(planner, demo, args, grasp_choice, p
     upgraded["pose"] = grasp_pose
     upgraded["q_path"] = list(pregrasp_success["q_path"]) + list(final_approach_path[1:])
     upgraded["two_step_grasp"] = True
+    upgraded["q_pregrasp"] = pregrasp_q
+    upgraded["q_grasp"] = np.asarray(final_approach_path[-1], dtype=np.float32).reshape(-1)[:7]
     upgraded["pregrasp_waypoints"] = len(pregrasp_success["q_path"])
     upgraded["approach_waypoints"] = len(final_approach_path)
     upgraded["approach_distance_m"] = float(pregrasp_success.get("approach_distance_m", 0.0))
@@ -1803,6 +2002,7 @@ def _refresh_curobo_world(
     planner, demo, args, *, label: str, include_active_object: bool = False, include_table: bool = False,
     exclude_object_names: set[str] | None = None,
 ) -> None:
+    _bump_profile_counter("world_refresh_count")
     if planner.collision_enabled:
         requested_excludes = {
             curobo_wrapper.normalize_object_name(x)
@@ -2038,7 +2238,6 @@ def _candidate_place_orientation_penalty(candidate, demo, args) -> float:
 def _candidate_sort_key(item):
     metrics = item["metrics"]
     return (
-        *_carriot_place_variant_preference(item.get("variant_label"), item.get("label")),
         float(item["score"]),
         float(metrics["total_motion"]),
         float(metrics["joint7_total_motion"]),
@@ -2064,48 +2263,12 @@ def _variant_abs_yaw_deg_from_labels(variant_label: str | None, label: str | Non
     return abs(_variant_yaw_deg_from_labels(variant_label, label))
 
 
-def _carriot_place_variant_preference(variant_label: str | None, label: str | None = None) -> tuple[int, int, float]:
-    """Prefer cariot release variants that consistently pass final contact.
-
-    The full candidate set is still evaluated as fallback. This only changes
-    ordering so the search does not spend most of the budget validating
-    free-roll poses that are reachable in transport but frequently fail descent.
-    """
-    text = " ".join(str(x).lower() for x in (variant_label, label) if x is not None)
-    if "free_roll" not in text and "tilt_body_" not in text:
-        return (0, 3, 0.0)
-
-    free_roll_penalty = 1 if "free_roll" in text else 0
-    roll_abs = 0.0
-    roll_match = re.search(r"free_roll_([-+]?\d+(?:\.\d+)?)deg", text)
-    if roll_match:
-        roll_abs = abs(float(roll_match.group(1)))
-
-    tilt_pref = 3
-    tilt_match = re.search(r"tilt_body_(toward|away)_robot_([-+]?\d+(?:\.\d+)?)deg", text)
-    if tilt_match:
-        direction = tilt_match.group(1)
-        deg = abs(float(tilt_match.group(2)))
-        if direction == "toward":
-            if abs(deg - 15.0) <= 1.0:
-                tilt_pref = 0
-            elif abs(deg - 30.0) <= 1.0:
-                tilt_pref = 1
-            else:
-                tilt_pref = 2
-        else:
-            tilt_pref = 5
-
-    return (free_roll_penalty, tilt_pref, roll_abs)
-
-
 def _pre_place_screen_sort_key(item):
     label = "" if item.get("label") is None else str(item.get("label"))
     variant = "" if item.get("variant_label") is None else str(item.get("variant_label"))
     pose_z = float(_get_pose_position(item["pose"])[2]) if "pose" in item else 0.0
     place_z = float(_get_pose_position(item["place_pose"])[2]) if "place_pose" in item else 0.0
     yaw_abs = _variant_abs_yaw_deg_from_labels(variant, label)
-    carriot_pref = _carriot_place_variant_preference(variant, label)
     hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
     verticality_target = _candidate_tcp_verticality_target(item)
     axis_vertical_target = _candidate_tcp_axis_vertical_target(item)
@@ -2121,7 +2284,6 @@ def _pre_place_screen_sort_key(item):
             axis_delta,
             verticality_delta,
             yaw_abs,
-            carriot_pref,
             hover_extra,
             -place_z,
             -pose_z,
@@ -2130,7 +2292,6 @@ def _pre_place_screen_sort_key(item):
         )
     return (
         yaw_abs,
-        carriot_pref,
         hover_extra,
         -float(item.get("tcp_verticality", 0.0)),
         -place_z,
@@ -2297,10 +2458,92 @@ def _select_diverse_place_candidates(candidates, max_count: int, *, label: str) 
     return selected
 
 
-def _bi_insert_fast_lane_candidates(candidates, *, label: str) -> list:
+def _bi_fast_insert_values(args):
+    spin_degs = _unique_finite_float_list(
+        getattr(args, "bi_fast_insert_spin_deg", [0.0, -15.0, 15.0, -90.0, 90.0, -120.0, -135.0, -150.0]),
+    )
+    if not spin_degs:
+        spin_degs = [0.0]
+    approach_distances = _unique_finite_float_list(
+        getattr(args, "bi_fast_insert_approach_distances", [0.05]),
+        min_value=0.005,
+    )
+    if not approach_distances:
+        approach_distances = [0.05]
+    hover_extra_heights = _unique_finite_float_list(
+        getattr(args, "bi_fast_insert_hover_extra_heights_m", [0.0, 0.03]),
+        min_value=0.0,
+    )
+    if not hover_extra_heights:
+        hover_extra_heights = [0.0]
+    return spin_degs, approach_distances, hover_extra_heights
+
+
+def _bi_fast_insert_screen_args(args):
+    spin_degs, approach_distances, hover_extra_heights = _bi_fast_insert_values(args)
+    adjusted = SimpleNamespace(**vars(args))
+    adjusted.insert_vertical_axial_spin_deg = list(spin_degs)
+    adjusted.direct_release_approach_distances = list(approach_distances)
+    adjusted.direct_release_approach_distance = float(approach_distances[0])
+    adjusted.transport_hover_extra_heights_m = list(hover_extra_heights)
+    adjusted.bi_insert_release_height_offsets_m = [0.0]
+    adjusted.targeted_place_allow_insert_axis_flip = False
+    return adjusted
+
+
+def _bi_insert_small_lane_candidates(candidates, args, *, label: str) -> list:
     ordered = sorted(list(candidates or []), key=_pre_place_screen_sort_key)
     if not ordered:
         return []
+    spin_degs, approach_distances, hover_extra_heights = _bi_fast_insert_values(args)
+    max_count = max(1, len(spin_degs) * len(approach_distances) * len(hover_extra_heights))
+    fast = []
+    for item in ordered:
+        if str(item.get("place_mode", "")) != "insert_place":
+            continue
+        item_label = str(item.get("label", ""))
+        approach_match = re.search(r"approach_([-+]?\d+(?:\.\d+)?)mm", item_label.lower())
+        approach_m = float(approach_match.group(1)) / 1000.0 if approach_match else 0.0
+        if all(abs(approach_m - float(target)) > 0.0015 for target in approach_distances):
+            continue
+        spin_deg = _variant_yaw_deg_from_labels(item.get("variant_label"), item.get("label"))
+        if all(_yaw_distance_deg(spin_deg, preferred) > 1.0 for preferred in spin_degs):
+            continue
+        hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
+        if all(abs(hover_extra - float(target)) > 0.0015 for target in hover_extra_heights):
+            continue
+        release_offset = float(item.get("insert_release_height_offset_m", 0.0) or 0.0)
+        if release_offset > 1e-6:
+            continue
+        fast.append(item)
+    if not fast:
+        return []
+    fast = fast[:max_count]
+    selected_spins = [
+        int(round(_variant_yaw_deg_from_labels(item.get("variant_label"), item.get("label"))))
+        for item in fast
+    ]
+    selected_approach = []
+    for item in fast:
+        m = re.search(r"approach_([-+]?\d+(?:\.\d+)?)mm", str(item.get("label", "")).lower())
+        selected_approach.append(int(round(float(m.group(1)))) if m else 0)
+    selected_hover_mm = [int(round(float(item.get("hover_extra_height_m", 0.0) or 0.0) * 1000.0)) for item in fast]
+    print(
+        f"[joint_search] {label} bi small insert lane kept {len(fast)}/{len(ordered)} "
+        f"candidate(s): spin_deg={selected_spins}, approach_mm={selected_approach}, "
+        f"hover_extra_mm={selected_hover_mm}; full set remains fallback"
+    )
+    return fast
+
+
+def _bi_insert_fast_lane_candidates(candidates, args=None, *, label: str) -> list:
+    ordered = sorted(list(candidates or []), key=_pre_place_screen_sort_key)
+    if not ordered:
+        return []
+    if args is not None:
+        small = _bi_insert_small_lane_candidates(ordered, args, label=label)
+        if small:
+            return small
     preferred_spins = (0.0, -15.0, 15.0, -90.0, 90.0, -105.0, -120.0, -135.0, -150.0)
     fast = []
     for item in ordered:
@@ -2325,47 +2568,6 @@ def _bi_insert_fast_lane_candidates(candidates, *, label: str) -> list:
         f"[joint_search] {label} bi insert fast lane kept {len(fast)}/{len(ordered)} "
         f"candidate(s): approach_50mm, hover_extra<=30mm, preferred raw/no-spin first, spin_deg={selected_spins}; "
         "full set remains fallback"
-    )
-    return fast
-
-
-def _carriot_transport_fast_lane_candidates(candidates, args, *, label: str) -> list:
-    """Preferred carriot transport candidates for a cheap goalset-first probe.
-
-    This is an ordering-only optimization: callers must keep the full candidate
-    set as fallback if the fast lane does not produce an accepted chain.
-    """
-    ordered = sorted(list(candidates or []), key=_pre_place_screen_sort_key)
-    if not ordered:
-        return []
-    max_count = int(getattr(args, "carriot_transport_fast_lane_max_candidates", 48) or 0)
-    if max_count <= 0:
-        return []
-
-    preferred = []
-    fallback = []
-    for item in ordered:
-        text = " ".join(
-            str(item.get(k, ""))
-            for k in ("label", "variant_label", "slot_name")
-        ).lower()
-        hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
-        has_free_roll = "free_roll" in text
-        has_body_tilt = "tilt_body_" in text
-        body_toward_15 = "tilt_body_toward_robot_15deg" in text
-        body_away = "tilt_body_away_robot" in text
-
-        if hover_extra <= 0.031 and not has_free_roll and not body_away and (body_toward_15 or not has_body_tilt):
-            preferred.append(item)
-        else:
-            fallback.append(item)
-
-    fast = (preferred + fallback)[:max_count]
-    if not fast or len(fast) >= len(ordered):
-        return []
-    print(
-        f"[joint_search] {label} carriot transport fast lane kept {len(fast)}/{len(ordered)} "
-        "preferred candidate(s); full set remains fallback"
     )
     return fast
 
@@ -2450,7 +2652,6 @@ def _final_contact_validation_sort_key(item) -> tuple:
     return (
         1 if hover_extra > 1e-6 else 0,
         hover_extra,
-        _carriot_place_variant_preference(item.get("variant_label"), item.get("label")),
         float(item.get("score", 0.0) or 0.0),
         float(metrics.get("total_motion", 0.0) or 0.0),
         _yaw_distance_deg(spin_deg, -90.0),
@@ -2730,6 +2931,118 @@ def _pose_to_matrix_from_pose_obj(pose) -> np.ndarray:
     return targeted.base.pose_to_matrix(p, q)
 
 
+def _pose_from_world_matrix(T_world_pose: np.ndarray):
+    T_world_pose = np.asarray(T_world_pose, dtype=np.float32).reshape(4, 4)
+    return targeted.Pose.create_from_pq(
+        p=T_world_pose[:3, 3].astype(np.float32),
+        q=targeted.base.bridge_mod_mat2quat(T_world_pose[:3, :3]).astype(np.float32),
+    )
+
+
+def _hidden_visual_pose():
+    return targeted.Pose.create_from_pq(
+        p=np.asarray([0.0, 0.0, -10.0], dtype=np.float32),
+        q=np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+
+def _hide_actor_quiet(actor) -> None:
+    if actor is None:
+        return
+    try:
+        actor.set_pose(_hidden_visual_pose())
+    except Exception:
+        pass
+
+
+def _ensure_target_object_goal_visual_actor(demo, args, *, source_name: str):
+    asset_file = getattr(args, "sim_asset_file", None) or getattr(args, "mesh_file", None)
+    asset_scale = float(getattr(args, "sim_asset_scale", None) or getattr(args, "mesh_scale", None) or 1.0)
+    if not asset_file:
+        raise RuntimeError("missing sim_asset_file/mesh_file for target goal ghost")
+    key = (str(Path(str(asset_file)).expanduser()), float(asset_scale))
+    actor = getattr(demo, "_target_object_goal_visual_actor", None)
+    actor_key = getattr(demo, "_target_object_goal_visual_key", None)
+    actor_mode = getattr(demo, "_target_object_goal_visual_mode", "mesh")
+    if actor is not None and actor_key == key:
+        return actor, actor_mode
+
+    _hide_actor_quiet(actor)
+    counter = int(getattr(demo, "_target_object_goal_visual_counter", 0)) + 1
+    demo._target_object_goal_visual_counter = counter
+    safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", str(source_name or "object")).strip("_") or "object"
+    actor_name = f"target_goal_ghost_{safe_name}_{counter}"
+    color = (0.05, 0.8, 1.0, 0.55)
+    try:
+        actor = targeted.base.build_visual_obstacle_actor(
+            demo.env,
+            str(asset_file),
+            asset_scale,
+            actor_name,
+            box_size=None,
+            color=color,
+        )
+        actor_mode = "mesh"
+    except Exception as exc:
+        box_size = targeted.base.get_asset_box_size(str(asset_file), asset_scale)
+        actor = targeted.base.build_visual_box_actor(
+            demo.env,
+            box_size,
+            f"{actor_name}_box",
+            color=color,
+        )
+        actor_mode = "box"
+        print(f"[target_ghost] mesh visual failed for {source_name}, using box ghost: {exc}")
+
+    demo._target_object_goal_visual_actor = actor
+    demo._target_object_goal_visual_key = key
+    demo._target_object_goal_visual_mode = actor_mode
+    return actor, actor_mode
+
+
+def _render_current_target_object_goal_visual(
+    demo,
+    bridge_mod,
+    scene_capture_cache,
+    place_state_cache,
+    rule,
+    args,
+) -> None:
+    if rule is None:
+        _hide_actor_quiet(getattr(demo, "_target_object_goal_visual_actor", None))
+        return
+    try:
+        # Identity TCP override asks the targeted-place planner only for the
+        # desired object pose; it does not consume slots or affect planning.
+        place_plans = targeted.build_targeted_place_plan_variants(
+            demo,
+            bridge_mod,
+            scene_capture_cache,
+            rule,
+            place_state_cache,
+            args,
+            T_tcp_obj_override=np.eye(4, dtype=np.float32),
+        )
+        if not place_plans:
+            raise RuntimeError("targeted place planner returned no target pose")
+        plan = place_plans[0]
+        actor, actor_mode = _ensure_target_object_goal_visual_actor(
+            demo,
+            args,
+            source_name=str(getattr(rule, "source_object_name", None) or getattr(args, "object_name", "object")),
+        )
+        actor.set_pose(_pose_from_world_matrix(plan.T_world_obj_desired))
+        target_p = np.asarray(plan.T_world_obj_desired[:3, 3], dtype=np.float32).reshape(3)
+        label = str(getattr(plan, "variant_label", "") or getattr(plan, "slot_name", "") or "default")
+        print(
+            f"[target_ghost] rendered current target pose for {args.object_name}: "
+            f"mode={actor_mode}, variant={label}, p={np.round(target_p, 4).tolist()}, alpha=0.55"
+        )
+    except Exception as exc:
+        _hide_actor_quiet(getattr(demo, "_target_object_goal_visual_actor", None))
+        print(f"[target_ghost] failed to render target pose for {getattr(args, 'object_name', 'object')}: {exc}")
+
+
 def _get_robot_base_world_transform(demo) -> np.ndarray:
     return _pose_to_matrix_from_pose_obj(demo.robot.pose)
 
@@ -2881,7 +3194,8 @@ def _plan_with_official_approach_metric(
         f"[curobo] {label} trying official MotionGen approach metric "
         f"(free_goal_axis={free_axis}, goal_frame_delta={np.round(delta_goal, 6)})"
     )
-    result = planner.plan_to_pose(
+    result = _profile_plan_to_pose(
+        planner,
         start_q,
         planner_pose,
         enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
@@ -3218,7 +3532,8 @@ def _plan_short_world_z_lift_ik(
                 pose_goal,
                 ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
             )
-            result = planner.plan_to_pose(
+            result = _profile_plan_to_pose(
+                planner,
                 start_q,
                 planner_pose,
                 enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
@@ -3680,19 +3995,13 @@ def _plan_and_execute_return_to_cycle_start(
             print(f"[warn] {label}: prelift planning failed; trying direct return anyway")
     if planner is not None:
         _refresh_curobo_world(planner, demo, args, label=label)
-        goal_pose = _get_demo_tcp_pose_for_joint_q(demo, start_q)
-        planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
-            demo,
-            goal_pose,
-            ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
-        )
-        result = planner.plan_to_pose(
+        result = _profile_plan_to_joint_state(
+            planner,
             q_current,
-            planner_pose,
+            start_q,
             enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
             max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
             timeout=float(getattr(args, "curobo_timeout", 5.0)),
-            num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
             num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
             num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
         )
@@ -3716,11 +4025,53 @@ def _plan_and_execute_return_to_cycle_start(
                 q_path = None
             else:
                 print(
-                    f"[curobo] {label} planned successfully ({len(q_path)} waypoints), "
+                    f"[curobo] {label} joint-space plan succeeded ({len(q_path)} waypoints), "
                     f"max_joint_error={max_error:.4f} rad"
                 )
         else:
-            print(f"[curobo] {label} cuRobo failed (status={result.status}), falling back to MPLib (no RRT)")
+            print(
+                f"[curobo] {label} joint-space cuRobo failed "
+                f"(status={result.status}), falling back to TCP-pose cuRobo"
+            )
+            goal_pose = _get_demo_tcp_pose_for_joint_q(demo, start_q)
+            planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
+                demo,
+                goal_pose,
+                ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
+            )
+            pose_result = _profile_plan_to_pose(
+                planner,
+                q_current,
+                planner_pose,
+                enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+                max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
+                timeout=float(getattr(args, "curobo_timeout", 5.0)),
+                num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
+                num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+                num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
+            )
+            if pose_result.success and pose_result.joint_path is not None:
+                pose_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in pose_result.joint_path]
+                q_final = pose_path[-1]
+                joint_errors = np.abs(q_final - start_q)
+                max_joint_error_per_joint = float(getattr(args, "return_to_start_max_joint_error_rad", 0.1))
+                max_error = float(np.max(joint_errors))
+                if max_error <= max_joint_error_per_joint:
+                    q_path = pose_path
+                    print(
+                        f"[curobo] {label} TCP-pose fallback succeeded ({len(q_path)} waypoints), "
+                        f"max_joint_error={max_error:.4f} rad"
+                    )
+                else:
+                    worst_joint_idx = int(np.argmax(joint_errors))
+                    print(
+                        f"[curobo] {label} TCP-pose fallback joint[{worst_joint_idx}] error="
+                        f"{joint_errors[worst_joint_idx]:.4f} rad exceeds "
+                        f"max_allowed={max_joint_error_per_joint:.4f} rad"
+                    )
+                    print(f"[curobo] {label} all joint errors (rad): {np.round(joint_errors, 4).tolist()}")
+            else:
+                print(f"[curobo] {label} TCP-pose cuRobo failed (status={pose_result.status}), falling back to MPLib (no RRT)")
 
     if q_path is None:
         q_path = targeted.base.plan_joint_path(
@@ -3871,7 +4222,8 @@ def _evaluate_curobo_pose_candidates(
             if bool(getattr(args, "curobo_debug", False)):
                 print(f"[curobo] {candidate_label} ee_link(base) pose p: {np.round(targeted.base.flatten_np(planner_pose.p)[:3], 6)}")
                 print(f"[curobo] {candidate_label} ee_link(base) pose q: {np.round(targeted.base.flatten_np(planner_pose.q)[:4], 6)}")
-            result = planner.plan_to_pose(
+            result = _profile_plan_to_pose(
+                planner,
                 start_q,
                 planner_pose,
                 enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
@@ -4048,6 +4400,7 @@ def _evaluate_two_step_grasp_candidates(
             include_active_object=include_active_object,
             disabled_world_collision_links=disabled_world_collision_links,
         )
+        _copy_last_candidate_counts_to_profile(prof, planner)
         prof["winner_count"] = len(pregrasp_successes)
         prof["success"] = bool(pregrasp_successes)
         prof["status"] = "Success" if pregrasp_successes else "NO_WINNERS"
@@ -4078,6 +4431,75 @@ def _evaluate_two_step_grasp_candidates(
         "official final approach will be attempted only once for the final selected grasp"
     )
     return pregrasp_successes
+
+
+def _q7_or_none(q) -> np.ndarray | None:
+    if q is None:
+        return None
+    try:
+        arr = np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+    except Exception:
+        return None
+    if arr.shape[0] < 7 or not np.all(np.isfinite(arr)):
+        return None
+    return arr.astype(np.float32, copy=True)
+
+
+def _ik_debug_errors(ik_result) -> tuple[float, float]:
+    dbg = getattr(ik_result, "debug", {}) or {}
+    pos_err = float(dbg.get("position_error", np.nan))
+    rot_err = float(dbg.get("rotation_error", np.nan))
+    return pos_err, rot_err
+
+
+def _ik_score(pos_err: float, rot_err: float) -> float:
+    pos = pos_err if np.isfinite(pos_err) else 1.0
+    rot = rot_err if np.isfinite(rot_err) else 1.0
+    return float(pos + 0.05 * rot)
+
+
+def _candidate_start_matches_prefilter(candidate: dict, start_q=None) -> bool:
+    if start_q is None or "_prefilter_start_q" not in candidate:
+        return True
+    stored = _q7_or_none(candidate.get("_prefilter_start_q"))
+    current = _q7_or_none(start_q)
+    if stored is None or current is None:
+        return False
+    return bool(np.allclose(stored, current, atol=1e-5, rtol=0.0))
+
+
+def _candidate_reusable_prefilter_q(candidate: dict, *, start_q=None) -> np.ndarray | None:
+    if not _candidate_start_matches_prefilter(candidate, start_q=start_q):
+        return None
+    q = _q7_or_none(candidate.get("_prefilter_q_goal"))
+    if q is None:
+        q = _q7_or_none(candidate.get("q_hover"))
+    return q
+
+
+def _store_candidate_prefilter_record(
+    candidate: dict,
+    *,
+    q_goal,
+    start_q=None,
+    pos_err: float = np.nan,
+    rot_err: float = np.nan,
+    ik_score: float | None = None,
+    role: str | None = None,
+) -> None:
+    q = _q7_or_none(q_goal)
+    if q is None:
+        return
+    candidate["_prefilter_q_goal"] = q
+    if start_q is not None:
+        q_start = _q7_or_none(start_q)
+        if q_start is not None:
+            candidate["_prefilter_start_q"] = q_start
+    candidate["_prefilter_ik_pos_error"] = float(pos_err)
+    candidate["_prefilter_ik_rot_error"] = float(rot_err)
+    candidate["_prefilter_ik_score"] = float(_ik_score(pos_err, rot_err) if ik_score is None else ik_score)
+    if role:
+        candidate[f"q_{role}"] = q
 
 
 def _evaluate_curobo_pose_candidates_goalset(
@@ -4156,29 +4578,59 @@ def _evaluate_curobo_pose_candidates_goalset(
         ik_error_records = []
         ik_status_counts = {}
         ik_screen_total = len(remaining)
+        planner._last_candidate_count_in = int(ik_screen_total)
+        planner._last_candidate_count_after_ik = 0
+        planner._last_candidate_count_motiongen = 0
         ranked_failed_candidates = []
+        reused_prefilter_count = 0
+        strict_pass_count = 0
+        soft_pass_count = 0
+        ik_prefilter_pos_thresh = float(getattr(args, "curobo_ik_prefilter_position_threshold", 0.01) or 0.0)
+        ik_prefilter_rot_thresh = float(getattr(args, "curobo_ik_prefilter_rotation_threshold", 0.25) or 0.0)
+        use_soft_prefilter = ik_prefilter_pos_thresh > 0.0 and ik_prefilter_rot_thresh > 0.0
         for start_idx in range(0, len(remaining), chunk_size):
             chunk = remaining[start_idx : start_idx + chunk_size]
+            need_ik = []
+            for candidate in chunk:
+                reused_q = _candidate_reusable_prefilter_q(candidate, start_q=start_q)
+                if reused_q is None:
+                    need_ik.append(candidate)
+                    continue
+                reused_prefilter_count += 1
+                pos_err = float(candidate.get("_prefilter_ik_pos_error", np.nan))
+                rot_err = float(candidate.get("_prefilter_ik_rot_error", np.nan))
+                ik_error_records.append(
+                    {
+                        "label": str(candidate["label"]),
+                        "position_error": pos_err,
+                        "rotation_error": rot_err,
+                        "success": True,
+                        "reused": True,
+                    }
+                )
+                ik_screened.append(candidate)
+                strict_pass_count += 1
+            if not need_ik:
+                continue
             planner_poses = [
                 _convert_demo_tcp_pose_to_curobo_ee_pose(
                     demo,
                     item["pose"],
                     ee_link_name=ee_link_name,
                 )
-                for item in chunk
+                for item in need_ik
             ]
-            start_qs = [start_q for _ in chunk]
-            ik_results = planner.solve_batch_start_goal_ik(
+            start_qs = [start_q for _ in need_ik]
+            ik_results = _profile_solve_batch_start_goal_ik(
+                planner,
                 start_qs,
                 planner_poses,
                 num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if num_ik_seeds is None else num_ik_seeds),
             )
-            for candidate, planner_pose, ik_result in zip(chunk, planner_poses, ik_results):
+            for candidate, planner_pose, ik_result in zip(need_ik, planner_poses, ik_results):
                 status_key = str(ik_result.status)
                 ik_status_counts[status_key] = int(ik_status_counts.get(status_key, 0)) + 1
-                dbg = getattr(ik_result, "debug", {}) or {}
-                pos_err = float(dbg.get("position_error", np.nan))
-                rot_err = float(dbg.get("rotation_error", np.nan))
+                pos_err, rot_err = _ik_debug_errors(ik_result)
                 ik_error_records.append(
                     {
                         "label": str(candidate["label"]),
@@ -4194,7 +4646,32 @@ def _evaluate_curobo_pose_candidates_goalset(
                         f"pos_err={pos_err:.5f} rot_err={rot_err:.5f}"
                     )
                 if ik_result.success:
+                    _store_candidate_prefilter_record(
+                        candidate,
+                        q_goal=getattr(ik_result, "goal_joint", None),
+                        start_q=start_q,
+                        pos_err=pos_err,
+                        rot_err=rot_err,
+                    )
                     ik_screened.append(candidate)
+                    strict_pass_count += 1
+                    continue
+                if (
+                    use_soft_prefilter
+                    and pos_err is not None
+                    and rot_err is not None
+                    and float(pos_err) <= ik_prefilter_pos_thresh
+                    and float(rot_err) <= ik_prefilter_rot_thresh
+                ):
+                    _store_candidate_prefilter_record(
+                        candidate,
+                        q_goal=getattr(ik_result, "goal_joint", None),
+                        start_q=start_q,
+                        pos_err=pos_err,
+                        rot_err=rot_err,
+                    )
+                    ik_screened.append(candidate)
+                    soft_pass_count += 1
                     continue
                 rank_key = (
                     pos_err if np.isfinite(pos_err) else np.inf,
@@ -4209,10 +4686,17 @@ def _evaluate_curobo_pose_candidates_goalset(
                     }
                 )
         remaining = ik_screened
+        planner._last_candidate_count_after_ik = int(len(remaining))
         status_summary = ", ".join(f"{k}={v}" for k, v in sorted(ik_status_counts.items()))
+        soft_info = ""
+        if use_soft_prefilter:
+            soft_info = (
+                f" (strict={strict_pass_count}, soft={soft_pass_count}, "
+                f"soft_thresholds: pos<={ik_prefilter_pos_thresh:.4f} rot<={ik_prefilter_rot_thresh:.4f})"
+            )
         print(
             f"[curobo][diag] {label} IK prefilter kept {len(remaining)}/{ik_screen_total} candidate(s); "
-            f"statuses: {status_summary or 'none'}"
+            f"reused_prefilter={reused_prefilter_count}; statuses: {status_summary or 'none'}{soft_info}"
         )
         if bool(getattr(args, "curobo_debug", False)) or not remaining:
             _print_ik_error_summary(label, ik_error_records)
@@ -4235,6 +4719,7 @@ def _evaluate_curobo_pose_candidates_goalset(
             f"[curobo] {label} evaluating {len(remaining)} candidate(s) "
             f"in {num_chunks} batch chunk(s) of size <= {chunk_size}"
         )
+        planner._last_candidate_count_motiongen = int(len(remaining))
         if use_max_winners == 1 and len(remaining) > 1:
             planner_poses = [
                 _convert_demo_tcp_pose_to_curobo_ee_pose(
@@ -4245,7 +4730,8 @@ def _evaluate_curobo_pose_candidates_goalset(
                 for item in remaining
             ]
             print(f"[curobo] {label} using official goalset fast-path for {len(remaining)} candidate(s)")
-            goalset_result = planner.plan_goalset_to_poses(
+            goalset_result = _profile_plan_goalset_to_poses(
+                planner,
                 start_q,
                 planner_poses,
                 enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
@@ -4293,6 +4779,11 @@ def _evaluate_curobo_pose_candidates_goalset(
                         item["place_preference_penalty"] = place_pref_penalty
                         item["terminal_align"] = terminal_align
                         item["planner_pose"] = planner_poses[goal_idx]
+                        item["q_goal"] = q_path[-1]
+                        if "pregrasp" in str(label).lower():
+                            item["q_pregrasp"] = q_path[-1]
+                        elif "hover" in str(label).lower() or "transport" in str(label).lower():
+                            item["q_hover"] = q_path[-1]
                         winners.append(item)
                         print(
                             f"[curobo] {candidate_label} goalset success: score={score:.3f}, "
@@ -4317,7 +4808,8 @@ def _evaluate_curobo_pose_candidates_goalset(
                     f"[curobo] {label} batch chunk {chunk_idx}/{num_chunks}: "
                     f"{len(chunk)} candidate(s)"
                 )
-            batch_results = planner.plan_batch_to_poses(
+            batch_results = _profile_plan_batch_to_poses(
+                planner,
                 start_q,
                 planner_poses,
                 enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
@@ -4370,6 +4862,11 @@ def _evaluate_curobo_pose_candidates_goalset(
                 item["place_preference_penalty"] = place_pref_penalty
                 item["terminal_align"] = terminal_align
                 item["planner_pose"] = planner_pose
+                item["q_goal"] = q_path[-1]
+                if "pregrasp" in str(label).lower():
+                    item["q_pregrasp"] = q_path[-1]
+                elif "hover" in str(label).lower() or "transport" in str(label).lower():
+                    item["q_hover"] = q_path[-1]
                 print(
                     f"[curobo] {candidate_label} success: score={score:.3f}, "
                     f"selection_penalty={selection_penalty:.3f}, "
@@ -4429,6 +4926,193 @@ def _filter_pre_place_candidates_by_verticality(candidates, args):
         f"{best_verticality - band:.3f}..{best_verticality:.3f}"
     )
     return remaining
+
+
+def _fast_chain_rank_place_candidates(
+    planner,
+    demo,
+    args,
+    candidates,
+    start_q,
+    *,
+    label: str,
+    disabled_world_collision_links: list[str] | None = None,
+):
+    """Cheaply rank place candidates before the expensive transport MotionGen pass.
+
+    This is intentionally only a pre-screen: it uses batched IK for hover and
+    release poses, then returns a small ordered subset. The normal transport and
+    final-contact planners still validate the chain, and the caller falls back to
+    the full search if this subset fails.
+    """
+    top_pairs = int(getattr(args, "fast_chain_top_pairs", 3) or 0)
+    if top_pairs <= 0:
+        return []
+    remaining = sorted(list(candidates or []), key=_pre_place_screen_sort_key)
+    if not remaining:
+        return []
+    source_name = _current_source_object_name(args)
+    if source_name == "bi":
+        small_remaining = _bi_insert_small_lane_candidates(remaining, args, label=label)
+        if small_remaining:
+            remaining = small_remaining
+    max_ik_candidates = int(getattr(args, "fast_chain_max_ik_candidates", 0) or 0)
+    if max_ik_candidates > 0:
+        remaining = remaining[:max_ik_candidates]
+
+    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    chunk_size = int(getattr(args, "curobo_batch_chunk_size", 64) or 0)
+    if chunk_size <= 0:
+        chunk_size = len(remaining)
+    ik_seeds = int(getattr(args, "fast_chain_ik_seeds", 32) or 0)
+    if ik_seeds <= 0:
+        ik_seeds = int(getattr(args, "curobo_num_ik_seeds", 64) or 64)
+    ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
+
+    ranked: list[dict] = []
+    hover_status_counts: dict[str, int] = {}
+    release_status_counts: dict[str, int] = {}
+    disabled_world_collision_links = _set_world_collision_for_links(
+        planner,
+        disabled_world_collision_links,
+        enabled=False,
+        label=f"{label}_fast_chain_ik",
+    )
+    try:
+        for start_idx in range(0, len(remaining), chunk_size):
+            chunk = remaining[start_idx : start_idx + chunk_size]
+            start_qs = [start_q for _ in chunk]
+            hover_poses = [
+                _convert_demo_tcp_pose_to_curobo_ee_pose(
+                    demo,
+                    item["pose"],
+                    ee_link_name=ee_link_name,
+                )
+                for item in chunk
+            ]
+            release_poses = [
+                _convert_demo_tcp_pose_to_curobo_ee_pose(
+                    demo,
+                    item.get("release_pose", item.get("place_pose", item["pose"])),
+                    ee_link_name=ee_link_name,
+                )
+                for item in chunk
+            ]
+            hover_results = _profile_solve_batch_start_goal_ik(
+                planner,
+                start_qs,
+                hover_poses,
+                num_seeds=ik_seeds,
+            )
+            release_results = _profile_solve_batch_start_goal_ik(
+                planner,
+                start_qs,
+                release_poses,
+                num_seeds=ik_seeds,
+            )
+            for item, hover_result, release_result in zip(chunk, hover_results, release_results):
+                hover_status = str(hover_result.status)
+                release_status = str(release_result.status)
+                hover_status_counts[hover_status] = int(hover_status_counts.get(hover_status, 0)) + 1
+                release_status_counts[release_status] = int(release_status_counts.get(release_status, 0)) + 1
+                hover_pos_err, hover_rot_err = _ik_debug_errors(hover_result)
+                release_pos_err, release_rot_err = _ik_debug_errors(release_result)
+                if (
+                    not bool(hover_result.success)
+                    or hover_result.goal_joint is None
+                    or not bool(release_result.success)
+                    or release_result.goal_joint is None
+                ):
+                    continue
+                q_hover = np.asarray(hover_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
+                q_release = np.asarray(release_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
+                joint_delta = q_hover - start_q
+                release_delta = q_release - q_hover
+                transport_score = float(np.linalg.norm(joint_delta))
+                release_score = float(np.linalg.norm(release_delta))
+                joint7_score = float(abs(joint_delta[6])) if joint_delta.shape[0] >= 7 else 0.0
+                selection_penalty = float(_candidate_selection_penalty(item, args))
+                place_pref_penalty = float(_candidate_place_orientation_penalty(item, demo, args))
+                heuristic_score = (
+                    transport_score
+                    + 0.35 * release_score
+                    + 0.15 * joint7_score
+                    + selection_penalty
+                    + place_pref_penalty
+                )
+                ranked_item = dict(item)
+                max_pos_err = float(np.nanmax([hover_pos_err, release_pos_err]))
+                max_rot_err = float(np.nanmax([hover_rot_err, release_rot_err]))
+                if not np.isfinite(max_pos_err):
+                    max_pos_err = float("nan")
+                if not np.isfinite(max_rot_err):
+                    max_rot_err = float("nan")
+                pair_ik_score = float(_ik_score(max_pos_err, max_rot_err))
+                pair_score = float(heuristic_score + pair_ik_score)
+                ranked_item["fast_chain_score"] = heuristic_score
+                ranked_item["fast_chain_hover_q"] = q_hover
+                ranked_item["fast_chain_release_q"] = q_release
+                ranked_item["fast_chain_transport_joint_norm"] = transport_score
+                ranked_item["fast_chain_release_joint_norm"] = release_score
+                ranked_item["q_hover"] = q_hover
+                ranked_item["q_release"] = q_release
+                ranked_item["ik_pos_error"] = max_pos_err
+                ranked_item["ik_rot_error"] = max_rot_err
+                ranked_item["ik_score"] = pair_ik_score
+                ranked_item["pair_score"] = pair_score
+                ranked_item["fast_chain_ik_record"] = {
+                    "hover_pos_error": hover_pos_err,
+                    "hover_rot_error": hover_rot_err,
+                    "release_pos_error": release_pos_err,
+                    "release_rot_error": release_rot_err,
+                    "hover_status": hover_status,
+                    "release_status": release_status,
+                }
+                _store_candidate_prefilter_record(
+                    ranked_item,
+                    q_goal=q_hover,
+                    start_q=start_q,
+                    pos_err=hover_pos_err,
+                    rot_err=hover_rot_err,
+                    ik_score=pair_ik_score,
+                    role="hover",
+                )
+                ranked.append(ranked_item)
+    finally:
+        _set_world_collision_for_links(
+            planner,
+            disabled_world_collision_links,
+            enabled=True,
+            label=f"{label}_fast_chain_ik",
+        )
+
+    planner._last_fast_chain_prefilter_records = list(ranked)
+
+    def _fast_chain_select_key(item) -> tuple:
+        pair_score = float(item.get("pair_score", item.get("fast_chain_score", 0.0)) or 0.0)
+        label_text = " ".join(str(item.get(k, "")) for k in ("variant_label", "label")).lower()
+        if source_name == "bi":
+            # For insertion, the cheap IK distance often prefers a small axial
+            # spin that later fails the straight contact. Prefer the validated
+            # raw 50mm approach family first, then use IK distance inside that tier.
+            return (_bi_final_contact_validation_sort_key(item), pair_score, *_pre_place_screen_sort_key(item))
+        return (pair_score, *_pre_place_screen_sort_key(item))
+
+    ranked.sort(key=_fast_chain_select_key)
+    selected = ranked[:top_pairs]
+    hover_status_str = ", ".join(f"{k}={v}" for k, v in sorted(hover_status_counts.items()))
+    release_status_str = ", ".join(f"{k}={v}" for k, v in sorted(release_status_counts.items()))
+    print(
+        f"[joint_search] {label} fast-chain IK rank kept {len(ranked)}/{len(remaining)} "
+        f"candidate(s), selected {len(selected)}; "
+        f"hover_statuses: {hover_status_str}; release_statuses: {release_status_str}"
+    )
+    if selected:
+        print(
+            f"[joint_search] {label} fast-chain top labels: "
+            f"{[(item.get('label'), round(float(item.get('pair_score', item.get('fast_chain_score', 0.0))), 3)) for item in selected]}"
+        )
+    return selected
 
 
 def _evaluate_curobo_pose_candidates_multi_start(
@@ -4545,41 +5229,79 @@ def _evaluate_curobo_pose_candidates_multi_start(
     strict_pass_count = 0
     soft_pass_count = 0
     ik_screen_total = len(remaining)
+    planner._last_candidate_count_in = int(ik_screen_total)
+    planner._last_candidate_count_after_ik = 0
+    planner._last_candidate_count_motiongen = 0
+    reused_prefilter_count = 0
     for start_idx in range(0, len(remaining), chunk_size):
         chunk = remaining[start_idx : start_idx + chunk_size]
+        need_ik = []
+        for candidate in chunk:
+            candidate_start_q = np.asarray(candidate["start_q"], dtype=np.float32).reshape(-1)[:7]
+            reused_q = _candidate_reusable_prefilter_q(candidate, start_q=candidate_start_q)
+            if reused_q is None:
+                need_ik.append(candidate)
+                continue
+            reused_prefilter_count += 1
+            pos_err = candidate.get("_prefilter_ik_pos_error")
+            rot_err = candidate.get("_prefilter_ik_rot_error")
+            if pos_err is not None and np.isfinite(pos_err):
+                ik_pos_errors.append(float(pos_err))
+            if rot_err is not None and np.isfinite(rot_err):
+                ik_rot_errors.append(float(rot_err))
+            ik_screened.append(candidate)
+            strict_pass_count += 1
+        if not need_ik:
+            continue
         planner_poses = [
             _convert_demo_tcp_pose_to_curobo_ee_pose(
                 demo,
                 item["pose"],
                 ee_link_name=ee_link_name,
             )
-            for item in chunk
+            for item in need_ik
         ]
-        start_qs = [np.asarray(item["start_q"], dtype=np.float32).reshape(-1)[:7] for item in chunk]
-        ik_results = planner.solve_batch_start_goal_ik(
+        start_qs = [np.asarray(item["start_q"], dtype=np.float32).reshape(-1)[:7] for item in need_ik]
+        ik_results = _profile_solve_batch_start_goal_ik(
+            planner,
             start_qs,
             planner_poses,
             num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if num_ik_seeds is None else num_ik_seeds),
         )
-        for candidate, ik_result in zip(chunk, ik_results):
+        for candidate, ik_result in zip(need_ik, ik_results):
             status_key = str(ik_result.status)
             ik_status_counts[status_key] = ik_status_counts.get(status_key, 0) + 1
-            dbg = getattr(ik_result, "debug", {}) or {}
-            pos_err = dbg.get("position_error")
-            rot_err = dbg.get("rotation_error")
+            pos_err, rot_err = _ik_debug_errors(ik_result)
             if pos_err is not None and np.isfinite(pos_err):
                 ik_pos_errors.append(float(pos_err))
             if rot_err is not None and np.isfinite(rot_err):
                 ik_rot_errors.append(float(rot_err))
             if ik_result.success:
+                _store_candidate_prefilter_record(
+                    candidate,
+                    q_goal=getattr(ik_result, "goal_joint", None),
+                    start_q=np.asarray(candidate["start_q"], dtype=np.float32).reshape(-1)[:7],
+                    pos_err=float(pos_err),
+                    rot_err=float(rot_err),
+                    role="hover",
+                )
                 ik_screened.append(candidate)
                 strict_pass_count += 1
             elif use_soft_prefilter and pos_err is not None and rot_err is not None:
                 if float(pos_err) <= ik_prefilter_pos_thresh and float(rot_err) <= ik_prefilter_rot_thresh:
+                    _store_candidate_prefilter_record(
+                        candidate,
+                        q_goal=getattr(ik_result, "goal_joint", None),
+                        start_q=np.asarray(candidate["start_q"], dtype=np.float32).reshape(-1)[:7],
+                        pos_err=float(pos_err),
+                        rot_err=float(rot_err),
+                        role="hover",
+                    )
                     ik_screened.append(candidate)
                     soft_pass_count += 1
     remaining = ik_screened
     remaining.sort(key=_pre_place_screen_sort_key)
+    planner._last_candidate_count_after_ik = int(len(remaining))
     status_str = ", ".join(f"{k}={v}" for k, v in sorted(ik_status_counts.items()))
     soft_info = ""
     if use_soft_prefilter:
@@ -4589,7 +5311,7 @@ def _evaluate_curobo_pose_candidates_multi_start(
         )
     print(
         f"[curobo] {label} IK prefilter kept {len(remaining)}/{ik_screen_total} "
-        f"start-goal pair(s); statuses: {status_str}{soft_info}"
+        f"start-goal pair(s); reused_prefilter={reused_prefilter_count}; statuses: {status_str}{soft_info}"
     )
     if not remaining:
         if ik_pos_errors:
@@ -4614,6 +5336,7 @@ def _evaluate_curobo_pose_candidates_multi_start(
         f"[curobo] {label} evaluating {len(remaining)} start-goal pair(s) "
         f"in {num_chunks} batch chunk(s) of size <= {chunk_size}"
     )
+    planner._last_candidate_count_motiongen = int(len(remaining))
 
     if include_table and bool(getattr(args, "curobo_table_collision", True)):
         _refresh_curobo_world(
@@ -4651,7 +5374,8 @@ def _evaluate_curobo_pose_candidates_multi_start(
                     for item in remaining
                 ]
                 print(f"[curobo] {label} using goalset fast-path for {len(remaining)} same-start target(s)")
-                goalset_result = planner.plan_goalset_to_poses(
+                goalset_result = _profile_plan_goalset_to_poses(
+                    planner,
                     start_q0,
                     planner_poses,
                     enable_graph=bool(getattr(args, "curobo_enable_graph", False) if enable_graph is None else enable_graph),
@@ -4699,6 +5423,7 @@ def _evaluate_curobo_pose_candidates_multi_start(
                             item["place_preference_penalty"] = place_pref_penalty
                             item["terminal_align"] = terminal_align
                             item["planner_pose"] = planner_poses[goal_idx]
+                            item.setdefault("q_hover", q_path[-1])
                             winners.append(item)
                             print(
                                 f"[curobo] {candidate_label} goalset success: score={score:.3f}, "
@@ -4709,6 +5434,7 @@ def _evaluate_curobo_pose_candidates_multi_start(
                             return winners
                 else:
                     print(f"[curobo] {label} goalset fast-path failed with status={goalset_result.status}; falling back to pair batch")
+                    _bump_profile_counter("fallback_count")
                     if str(goalset_result.status) == "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION":
                         saw_invalid_start = True
                     elif str(goalset_result.status) == "MotionGenStatus.INVALID_START_STATE_SELF_COLLISION":
@@ -4729,7 +5455,8 @@ def _evaluate_curobo_pose_candidates_multi_start(
                     f"[curobo] {label} batch chunk {chunk_idx}/{num_chunks}: "
                     f"{len(chunk)} pair(s)"
                 )
-            batch_results = planner.plan_batch_start_goal_pairs(
+            batch_results = _profile_plan_batch_start_goal_pairs(
+                planner,
                 start_qs,
                 planner_poses,
                 enable_graph=bool(getattr(args, "curobo_enable_graph", False) if enable_graph is None else enable_graph),
@@ -4786,6 +5513,7 @@ def _evaluate_curobo_pose_candidates_multi_start(
                 item["place_preference_penalty"] = place_pref_penalty
                 item["terminal_align"] = terminal_align
                 item["planner_pose"] = planner_pose
+                item.setdefault("q_hover", q_path[-1])
                 print(
                     f"[curobo] {candidate_label} success: score={score:.3f}, "
                     f"selection_penalty={selection_penalty:.3f}, "
@@ -4879,11 +5607,13 @@ def _build_direct_grasp_candidates(
         grasp_variant_args.topdown_tilt_toward_robot_shift_m = [0.0]
     object_axis_world = None
     object_long_axis_half = None
+    object_extents = None
     try:
         extents = np.asarray(
             targeted.base.get_asset_box_size(args.sim_asset_file, args.sim_asset_scale),
             dtype=np.float32,
         ).reshape(3)
+        object_extents = extents
         axis_idx = int(np.argmax(extents))
         object_long_axis_half = float(extents[axis_idx]) * 0.5
 
@@ -4904,6 +5634,20 @@ def _build_direct_grasp_candidates(
     except Exception:
         object_axis_world = None
         is_spherical = False
+
+    fixed_tabletop_place_first_candidates: list[dict] = []
+    if _is_fixed_tabletop_source(source_name):
+        fixed_tabletop_place_first_candidates = _build_fixed_tabletop_place_first_grasp_candidates(
+            demo,
+            args,
+            place_rule,
+            bridge_mod,
+            scene_capture_cache,
+            place_state_cache,
+            T_world_obj0,
+            object_dims=object_extents,
+        )
+        return fixed_tabletop_place_first_candidates
 
     rule_grasp_bias_variants = list(getattr(place_rule, "grasp_bias_variants", ()) or []) if place_rule is not None else []
     use_rule_bias_variants = bool(rule_grasp_bias_variants) and object_axis_world is not None
@@ -4993,18 +5737,6 @@ def _build_direct_grasp_candidates(
             for label, pose in targeted.base.build_grasp_pose_variants(demo, raw_grasp_pose, grasp_variant_args):
                 _append(label, pose)
             base_orientation_variants = list(variants)
-
-        if source_name == "lvmukuai":
-            for label, pose in _build_lvmukuai_vertical_gripper_pose_variants(
-                demo,
-                args,
-                place_rule,
-                bridge_mod,
-                scene_capture_cache,
-                place_state_cache,
-                T_world_obj0,
-            ):
-                _append(label, pose)
 
         if use_rule_bias_variants:
             tilt_degs = []
@@ -5163,6 +5895,33 @@ def _build_direct_grasp_candidates(
         )
         variant_labels = [label for label, _ in grasp_variants]
         tilt_variants = []
+    if fixed_tabletop_place_first_candidates:
+        merged = []
+        merged_seen = set()
+        for item in list(candidates or []) + list(fixed_tabletop_place_first_candidates or []):
+            pose = item.get("pose")
+            try:
+                pose_key = (
+                    tuple(np.round(targeted.base.flatten_np(pose.p)[:3], 5).tolist()),
+                    tuple(np.round(targeted.base.flatten_np(pose.q)[:4], 5).tolist()),
+                )
+            except Exception:
+                pose_key = str(item.get("label", ""))
+            tcp_obj = item.get("T_tcp_obj")
+            try:
+                tcp_key = tuple(np.round(np.asarray(tcp_obj, dtype=np.float32).reshape(4, 4), 5).reshape(-1).tolist())
+            except Exception:
+                tcp_key = ()
+            key = (pose_key, tcp_key)
+            if key in merged_seen:
+                continue
+            merged_seen.add(key)
+            merged.append(item)
+        print(
+            f"[direct_grasp] {source_name}: merged {len(candidates)} raw/current-pose candidate(s) "
+            f"with {len(fixed_tabletop_place_first_candidates)} fixed-place candidate(s) -> {len(merged)} total"
+        )
+        candidates = merged
     non_tilt_cands = [c for c in candidates if "tilt" not in str(c["label"]).lower()]
     tilt_cands = [c for c in candidates if "tilt" in str(c["label"]).lower()]
     if tilt_cands and non_tilt_cands:
@@ -5181,7 +5940,7 @@ def _build_direct_grasp_candidates(
     if source_name == "lvmukuai":
         def _lvmukuai_candidate_order(item):
             label = str(item.get("label", "")).lower()
-            is_vertical_helper = "lvmukuai_vertical_gripper" in label
+            is_vertical_helper = _is_fixed_tabletop_vertical_helper_label(label, source_name)
             is_tilted = "tilt" in label
             z_lift = max(float(item.get("grasp_z_lift_m", 0.0) or 0.0), 0.0)
             tilt_mag = 0.0
@@ -5190,17 +5949,17 @@ def _build_direct_grasp_candidates(
                 tilt_mag = abs(float(tilt_match.group(1)))
             is_plain_direct = (not is_tilted) and z_lift <= 1e-4 and "lift" not in label
             if is_vertical_helper:
-                relation_class = 5
-            elif is_tilted and abs(tilt_mag - 20.0) <= 1.0:
                 relation_class = 0
-            elif is_plain_direct:
+            elif is_tilted and abs(tilt_mag - 20.0) <= 1.0:
                 relation_class = 1
-            elif is_tilted:
+            elif is_plain_direct:
                 relation_class = 2
-            elif z_lift >= 0.005 or "lift_" in label:
+            elif is_tilted:
                 relation_class = 3
-            else:
+            elif z_lift >= 0.005 or "lift_" in label:
                 relation_class = 4
+            else:
+                relation_class = 5
             return (
                 relation_class,
                 0 if "toward_robot" in label else 1,
@@ -5432,26 +6191,10 @@ def _tennis_release_axial_roll_degs(args) -> list[float]:
     return values or [0.0]
 
 
-def _carriot_release_tilt_toward_robot_degs(args) -> list[float]:
-    values = _unique_finite_float_list(
-        getattr(args, "carriot_direct_place_tilt_toward_robot_degs", [0.0, 15.0, -15.0, 30.0, -30.0]),
-    )
-    return values or [0.0]
-
-
-def _carriot_release_axial_roll_degs(args) -> list[float]:
-    values = _unique_finite_float_list(
-        getattr(args, "carriot_direct_place_axial_roll_degs", [0.0, -45.0, 45.0, -90.0, 90.0, 180.0]),
-    )
-    return values or [0.0]
-
-
 def _transport_screen_args_for_object(args, source_name: str | None):
     adjusted = SimpleNamespace(**vars(args))
     if source_name == "bi":
         adjusted.place_transport_max_winners = max(int(getattr(args, "place_transport_max_winners", 2)), 12)
-    if source_name == "carriot":
-        adjusted.place_transport_max_winners = max(int(getattr(args, "place_transport_max_winners", 2)), 3)
     if source_name != "tennis":
         return adjusted
     adjusted.curobo_ik_prefilter_position_threshold = max(
@@ -5523,7 +6266,7 @@ def _sphere_tcp_object_distance_m(T_tcp_obj_override, args) -> float:
 
 def _sphere_release_tcp_pose_from_center(demo, args, center_p: np.ndarray, tilt_deg: float, tcp_object_distance_m: float):
     center_p = np.asarray(center_p, dtype=np.float32).reshape(3)
-    if _current_source_object_name(args) in {"tennis", "carriot"}:
+    if _current_source_object_name(args) == "tennis":
         pose = _make_base_referenced_tennis_release_pose(demo, center_p, float(tilt_deg))
     else:
         pose = None
@@ -5571,59 +6314,178 @@ def _roll_pose_about_tcp_approach(pose, roll_deg: float):
         return pose
 
 
-def _make_vertical_gripper_rotation_candidates(demo, obj_position: np.ndarray) -> list[tuple[str, np.ndarray]]:
-    """Build TCP frames with a gripper body axis vertical, while the approach axis stays horizontal."""
+def _horizontal_direction_variants(
+    demo,
+    obj_position: np.ndarray,
+    *,
+    T_world_obj_goal: np.ndarray | None = None,
+    T_world_obj_current: np.ndarray | None = None,
+) -> list[tuple[str, np.ndarray]]:
     obj_position = np.asarray(obj_position, dtype=np.float32).reshape(3)
     base_p = _get_robot_base_world_transform(demo)[:3, 3].astype(np.float32)
-    to_robot = (base_p - obj_position).astype(np.float32)
-    to_robot[2] = 0.0
-    to_robot = _normalize(to_robot)
-    if to_robot is None:
-        to_robot = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
-
     variants: list[tuple[str, np.ndarray]] = []
-    for x_label, x_axis in (
-        ("x_down", np.asarray([0.0, 0.0, -1.0], dtype=np.float32)),
-        ("x_up", np.asarray([0.0, 0.0, 1.0], dtype=np.float32)),
-    ):
-        for z_label, z_axis in (
-            ("face_robot", to_robot),
-            ("away_robot", -to_robot),
-        ):
-            z_axis = _normalize(z_axis)
-            if z_axis is None:
+    seen: set[tuple[float, float, float]] = set()
+
+    def add(label: str, vec) -> None:
+        arr = np.asarray(vec, dtype=np.float32).reshape(3).copy()
+        arr[2] = 0.0
+        unit = _normalize(arr)
+        if unit is None:
+            return
+        key = tuple(np.round(unit, 4).tolist())
+        if key in seen:
+            return
+        seen.add(key)
+        variants.append((label, unit))
+
+    to_robot_goal = (base_p - obj_position).astype(np.float32)
+    add("face_robot", to_robot_goal)
+    add("away_robot", -to_robot_goal)
+    add("world_pos_x", np.asarray([1.0, 0.0, 0.0], dtype=np.float32))
+    add("world_neg_x", np.asarray([-1.0, 0.0, 0.0], dtype=np.float32))
+    add("world_pos_y", np.asarray([0.0, 1.0, 0.0], dtype=np.float32))
+    add("world_neg_y", np.asarray([0.0, -1.0, 0.0], dtype=np.float32))
+
+    if T_world_obj_current is not None:
+        T_current = np.asarray(T_world_obj_current, dtype=np.float32).reshape(4, 4)
+        to_robot_current = (base_p - T_current[:3, 3]).astype(np.float32)
+        add("current_face_robot", to_robot_current)
+        add("current_away_robot", -to_robot_current)
+
+    for prefix, T_obj in (("goal", T_world_obj_goal), ("current", T_world_obj_current)):
+        if T_obj is None:
+            continue
+        T_obj = np.asarray(T_obj, dtype=np.float32).reshape(4, 4)
+        for axis_idx in range(3):
+            axis = T_obj[:3, axis_idx].astype(np.float32)
+            if float(np.linalg.norm(axis[:2])) < 0.20:
                 continue
-            y_axis = _normalize(np.cross(z_axis, x_axis))
-            if y_axis is None:
-                continue
-            z_axis = _normalize(np.cross(x_axis, y_axis))
-            if z_axis is None:
-                continue
-            R_tcp = np.stack([x_axis, y_axis, z_axis], axis=1).astype(np.float32)
-            variants.append((f"vertical_gripper_{x_label}_{z_label}", R_tcp))
-    for y_label, y_axis in (
-        ("y_down", np.asarray([0.0, 0.0, -1.0], dtype=np.float32)),
-        ("y_up", np.asarray([0.0, 0.0, 1.0], dtype=np.float32)),
-    ):
-        for z_label, z_axis in (
-            ("face_robot", to_robot),
-            ("away_robot", -to_robot),
-        ):
-            z_axis = _normalize(z_axis)
-            if z_axis is None:
-                continue
-            x_axis = _normalize(np.cross(y_axis, z_axis))
-            if x_axis is None:
-                continue
-            z_axis = _normalize(np.cross(x_axis, y_axis))
-            if z_axis is None:
-                continue
-            R_tcp = np.stack([x_axis, y_axis, z_axis], axis=1).astype(np.float32)
-            variants.append((f"vertical_gripper_{y_label}_{z_label}", R_tcp))
+            add(f"{prefix}_axis{axis_idx}_pos", axis)
+            add(f"{prefix}_axis{axis_idx}_neg", -axis)
+
     return variants
 
 
-def _build_lvmukuai_vertical_gripper_pose_variants(
+def _fixed_tabletop_release_tilt_degs(args, source_name: str | None) -> list[float]:
+    values = getattr(args, "fixed_tabletop_release_tilt_deg", None)
+    if values is None:
+        values = [0.0, 8.0, -8.0, 20.0, -20.0, 45.0, -45.0]
+    result = _unique_finite_float_list(values)
+    return result or [0.0]
+
+
+def _make_vertical_gripper_rotation_candidates(
+    demo,
+    obj_position: np.ndarray,
+    *,
+    T_world_obj_goal: np.ndarray | None = None,
+    T_world_obj_current: np.ndarray | None = None,
+    object_dims: np.ndarray | None = None,
+    args=None,
+    source_name: str | None = None,
+) -> list[tuple[str, np.ndarray]]:
+    """Build top-down release TCP frames for fixed flat tabletop placement.
+
+    The final object pose is fixed first.  Ordinary tabletop objects do not get
+    yaw/spin/contact-point variants here: one canonical TCP frame is built from
+    the target long axis and world Z, then only small tilt variants are tried.
+    The same T_tcp_obj derived from each release pose is used for both grasp and
+    place, so the object is released with the same relation it was grasped with.
+    """
+    variants: list[tuple[str, np.ndarray]] = []
+    if T_world_obj_goal is None or object_dims is None:
+        return variants
+
+    T_world_obj_goal = np.asarray(T_world_obj_goal, dtype=np.float32).reshape(4, 4)
+    dims = np.asarray(object_dims, dtype=np.float32).reshape(3)
+    long_axis_idx = int(np.argmax(dims))
+    up_axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    # The rendered gripper and final-contact metric both expect TCP +Z to be
+    # the approach direction into the object/table for these fixed flat poses.
+    approach_axis = -up_axis
+
+    long_axis = T_world_obj_goal[:3, long_axis_idx].astype(np.float32)
+    long_axis = long_axis - float(np.dot(long_axis, up_axis)) * up_axis
+    long_axis = _normalize(long_axis)
+    if long_axis is None:
+        for axis_idx in np.argsort(dims)[::-1]:
+            axis = T_world_obj_goal[:3, int(axis_idx)].astype(np.float32)
+            axis = axis - float(np.dot(axis, up_axis)) * up_axis
+            long_axis = _normalize(axis)
+            if long_axis is not None:
+                break
+    if long_axis is None:
+        long_axis = _normalize(np.asarray([1.0, 0.0, 0.0], dtype=np.float32))
+    if long_axis is None:
+        return variants
+
+    seen: set[tuple[float, ...]] = set()
+    for long_sign in (1.0,):
+        ortho_axis = long_axis.astype(np.float32)
+        closing_axis = _normalize(np.cross(approach_axis, ortho_axis))
+        if closing_axis is None:
+            continue
+        ortho_axis = _normalize(np.cross(closing_axis, approach_axis))
+        if ortho_axis is None:
+            continue
+        if float(np.dot(ortho_axis, long_axis * float(long_sign))) < 0.0:
+            ortho_axis = -ortho_axis
+            closing_axis = -closing_axis
+        R_base = np.stack([ortho_axis, closing_axis, approach_axis], axis=1).astype(np.float32)
+        side_label = "long"
+        for tilt_deg in _fixed_tabletop_release_tilt_degs(args, source_name):
+            theta = np.deg2rad(float(tilt_deg))
+            c = float(np.cos(theta))
+            s = float(np.sin(theta))
+            R_tilt_local_y = np.array(
+                [
+                    [c, 0.0, s],
+                    [0.0, 1.0, 0.0],
+                    [-s, 0.0, c],
+                ],
+                dtype=np.float32,
+            )
+            R_tcp = (R_base @ R_tilt_local_y).astype(np.float32)
+            key = tuple(np.round(R_tcp.reshape(-1), 5).tolist())
+            if key in seen:
+                continue
+            seen.add(key)
+            if abs(float(tilt_deg)) <= 1e-6:
+                tilt_label = "tilt_0deg"
+            elif float(tilt_deg) > 0.0:
+                tilt_label = f"tilt_along_long_pos_{int(round(abs(float(tilt_deg))))}deg"
+            else:
+                tilt_label = f"tilt_along_long_neg_{int(round(abs(float(tilt_deg))))}deg"
+            variants.append((f"flat_topdown_{side_label}_{tilt_label}", R_tcp))
+    return variants
+
+
+FIXED_TABLETOP_SOURCE_NAMES = {"carriot", "shuazi", "lvmukuai"}
+
+
+def _is_fixed_tabletop_source(source_name: str | None) -> bool:
+    return str(source_name or "").strip().lower() in FIXED_TABLETOP_SOURCE_NAMES
+
+
+def _is_fixed_tabletop_vertical_helper_label(label: str, source_name: str | None = None) -> bool:
+    label_l = str(label or "").lower()
+    if "vertical_gripper" not in label_l:
+        return False
+    source = str(source_name or "").strip().lower()
+    return not source or source in label_l
+
+
+def _filter_fixed_tabletop_release_candidates(candidates, source_name: str | None, *, label: str) -> list:
+    return list(candidates or [])
+
+
+def _fixed_tabletop_contact_axis_shifts(args, object_dims: np.ndarray | None) -> list[float]:
+    # Ordinary tabletop objects keep a fixed grasp/place relation.  Do not move
+    # the contact point along the object axis; only tilt variants are allowed.
+    return [0.0]
+
+
+def _build_fixed_tabletop_place_first_grasp_candidates(
     demo,
     args,
     rule,
@@ -5631,14 +6493,21 @@ def _build_lvmukuai_vertical_gripper_pose_variants(
     scene_capture_cache,
     place_state_cache,
     T_world_obj_current: np.ndarray,
-) -> list[tuple[str, object]]:
-    """Generate grasp TCP poses that keep the fixed place object pose but make the gripper upright.
+    *,
+    object_dims: np.ndarray | None,
+) -> list[dict]:
+    """Build fixed-tabletop grasp candidates from the final object pose first.
 
-    The place code uses: T_world_tcp_place = T_world_obj_desired @ inv(T_tcp_obj).
-    So choose an upright place TCP frame first, then solve the corresponding grasp TCP frame:
-    R_grasp = R_obj_current @ R_obj_desired.T @ R_place.
+    For these objects the final object pose is non-negotiable.  We therefore
+    generate legal release TCP frames at the configured target pose, derive
+    T_tcp_obj from that release, and only then back-project the corresponding
+    grasp TCP into the current object pose.
     """
-    if bridge_mod is None or scene_capture_cache is None or place_state_cache is None or rule is None:
+    source_name = _current_source_object_name(args)
+    if not _is_fixed_tabletop_source(source_name) or rule is None:
+        return []
+    if bridge_mod is None or scene_capture_cache is None or place_state_cache is None:
+        print(f"[direct_grasp] {source_name}: place-first generation missing scene context")
         return []
     try:
         place_plans = targeted.build_targeted_place_plan_variants(
@@ -5651,43 +6520,164 @@ def _build_lvmukuai_vertical_gripper_pose_variants(
             T_tcp_obj_override=None,
         )
     except Exception as exc:
-        print(f"[direct_grasp] lvmukuai vertical-gripper place-pose lookup failed: {exc}")
+        print(f"[direct_grasp] {source_name}: place-first target lookup failed: {exc}")
         return []
     if not place_plans:
         return []
 
+    T_world_obj_current = np.asarray(T_world_obj_current, dtype=np.float32).reshape(4, 4)
     try:
-        center_p = np.asarray(demo.get_object_world_aabb_center(), dtype=np.float32).reshape(3)
+        current_center_world = np.asarray(demo.get_object_world_aabb_center(), dtype=np.float32).reshape(3)
     except Exception:
-        center_p = np.asarray(T_world_obj_current[:3, 3], dtype=np.float32).reshape(3)
+        current_center_world = T_world_obj_current[:3, 3].astype(np.float32)
+    current_center_h = np.concatenate([current_center_world.astype(np.float32), np.array([1.0], dtype=np.float32)])
+    contact_local_base = (np.linalg.inv(T_world_obj_current) @ current_center_h)[:3].astype(np.float32)
 
-    variants: list[tuple[str, object]] = []
-    seen = set()
-    for plan_idx, plan in enumerate(place_plans[:4]):
-        T_world_obj_desired = np.asarray(plan.T_world_obj_desired, dtype=np.float32).reshape(4, 4)
-        for rot_label, R_place_tcp in _make_vertical_gripper_rotation_candidates(
+    object_axis_local = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    if object_dims is not None:
+        try:
+            dims = np.asarray(object_dims, dtype=np.float32).reshape(3)
+            object_axis_local = np.zeros(3, dtype=np.float32)
+            object_axis_local[int(np.argmax(dims))] = 1.0
+        except Exception:
+            object_axis_local = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    object_axis_world = _normalize(T_world_obj_current[:3, :3] @ object_axis_local)
+
+    axis_shifts = _fixed_tabletop_contact_axis_shifts(args, object_dims)
+    z_lifts = _unique_finite_float_list(getattr(args, "direct_grasp_z_lifts_m", [0.0]), min_value=0.0)
+    if not z_lifts:
+        z_lifts = [0.0]
+
+    base_grasp_pose = demo.build_topdown_grasp_pose()
+    grasp_pose_variants: list[tuple[str, object]] = [("world_z_raw", base_grasp_pose)]
+    seen_grasp_variants = {
+        (
+            tuple(np.round(targeted.base.flatten_np(base_grasp_pose.p)[:3], 5).tolist()),
+            tuple(np.round(targeted.base.flatten_np(base_grasp_pose.q)[:4], 5).tolist()),
+        )
+    }
+    for tilt_deg in _fixed_tabletop_release_tilt_degs(args, source_name):
+        if abs(float(tilt_deg)) <= 1e-6:
+            continue
+        direction = "toward_robot" if float(tilt_deg) > 0.0 else "away_robot"
+        tilted_pose = targeted.base.tilt_pose_toward_robot(
             demo,
-            T_world_obj_desired[:3, 3],
-        ):
-            R_grasp_tcp = (
-                T_world_obj_current[:3, :3].astype(np.float32)
-                @ T_world_obj_desired[:3, :3].astype(np.float32).T
-                @ R_place_tcp.astype(np.float32)
-            ).astype(np.float32)
-            q_grasp = targeted.base.bridge_mod_mat2quat(R_grasp_tcp).astype(np.float32)
-            pose = targeted.Pose.create_from_pq(p=center_p.astype(np.float32), q=q_grasp)
-            key = (
-                tuple(np.round(targeted.base.flatten_np(pose.p)[:3], 5).tolist()),
-                tuple(np.round(targeted.base.flatten_np(pose.q)[:4], 5).tolist()),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            slot_label = f"place{plan_idx}" if plan_idx else "place"
-            variants.append((f"lvmukuai_{rot_label}_{slot_label}", pose))
-    if variants:
-        print(f"[direct_grasp] lvmukuai added {len(variants)} true vertical-gripper grasp variant(s)")
-    return variants
+            base_grasp_pose,
+            abs(float(tilt_deg)),
+            direction=direction,
+        )
+        if tilted_pose is None:
+            continue
+        key = (
+            tuple(np.round(targeted.base.flatten_np(tilted_pose.p)[:3], 5).tolist()),
+            tuple(np.round(targeted.base.flatten_np(tilted_pose.q)[:4], 5).tolist()),
+        )
+        if key in seen_grasp_variants:
+            continue
+        seen_grasp_variants.add(key)
+        label = f"world_z_tilt_{direction}_{int(round(abs(float(tilt_deg))))}deg"
+        grasp_pose_variants.append((label, tilted_pose))
+
+    unique_goals: list[tuple[str | None, np.ndarray]] = []
+    seen_goals = set()
+    for plan in place_plans:
+        T_goal = np.asarray(plan.T_world_obj_desired, dtype=np.float32).reshape(4, 4)
+        key = tuple(np.round(T_goal.reshape(-1), 5).tolist())
+        if key in seen_goals:
+            continue
+        seen_goals.add(key)
+        unique_goals.append((getattr(plan, "variant_label", None), T_goal))
+
+    candidates: list[dict] = []
+    seen = set()
+    for plan_label, T_world_obj_goal in unique_goals:
+        for grasp_label, grasp_variant_pose in grasp_pose_variants:
+            for axis_shift in axis_shifts:
+                for z_lift in z_lifts:
+                    grasp_pose = grasp_variant_pose
+                    if object_axis_world is not None and abs(float(axis_shift)) > 1e-6:
+                        shifted_p = (
+                            _get_pose_position(grasp_pose) + object_axis_world * float(axis_shift)
+                        ).astype(np.float32)
+                        grasp_pose = targeted.base.make_pose_with_position(grasp_pose, shifted_p)
+                    if float(z_lift) > 1e-6:
+                        shifted_p = (
+                            _get_pose_position(grasp_pose) + np.array([0.0, 0.0, float(z_lift)], dtype=np.float32)
+                        ).astype(np.float32)
+                        grasp_pose = targeted.base.make_pose_with_position(grasp_pose, shifted_p)
+                    T_world_tcp_grasp = _pose_to_matrix_from_pose_obj(grasp_pose)
+                    T_tcp_obj = (np.linalg.inv(T_world_tcp_grasp) @ T_world_obj_current).astype(np.float32)
+                    grasp_pose = _pose_from_world_matrix(T_world_tcp_grasp)
+                    pregrasp_pose = demo.build_pregrasp_pose(grasp_pose)
+                    grasp_pose, pregrasp_pose, geometry_grasp_raise = targeted.base.enforce_topdown_grasp_insertion_limit(
+                        demo,
+                        args,
+                        grasp_pose,
+                        pregrasp_pose,
+                    )
+                    if geometry_grasp_raise > 0:
+                        T_world_tcp_grasp = _pose_to_matrix_from_pose_obj(grasp_pose)
+                        T_tcp_obj = (np.linalg.inv(T_world_tcp_grasp) @ T_world_obj_current).astype(np.float32)
+                    grasp_pose, pregrasp_pose, grasp_tcp_raise = targeted.base.enforce_min_grasp_tcp_z(
+                        grasp_pose,
+                        pregrasp_pose,
+                        args.min_grasp_tcp_z,
+                    )
+                    if grasp_tcp_raise > 0:
+                        T_world_tcp_grasp = _pose_to_matrix_from_pose_obj(grasp_pose)
+                        T_tcp_obj = (np.linalg.inv(T_world_tcp_grasp) @ T_world_obj_current).astype(np.float32)
+                    T_release_check = (T_world_obj_goal @ np.linalg.inv(T_tcp_obj)).astype(np.float32)
+                    release_check_pose = _pose_from_world_matrix(T_release_check)
+                    label_parts = [str(source_name), "place_first", grasp_label]
+                    if plan_label:
+                        label_parts.append(str(plan_label))
+                    if abs(float(axis_shift)) > 1e-6:
+                        label_parts.append(f"axis_{int(round(float(axis_shift) * 1000.0))}mm")
+                    if float(z_lift) > 1e-6:
+                        label_parts.append(f"lift_{int(round(float(z_lift) * 1000.0))}mm")
+                    label = "grasp_direct_" + "_".join(label_parts)
+                    key = (
+                        tuple(np.round(targeted.base.flatten_np(grasp_pose.p)[:3], 5).tolist()),
+                        tuple(np.round(targeted.base.flatten_np(grasp_pose.q)[:4], 5).tolist()),
+                        tuple(np.round(T_tcp_obj.reshape(-1), 5).tolist()),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(
+                        {
+                            "label": label,
+                            "pose": grasp_pose,
+                            "pregrasp_pose": pregrasp_pose,
+                            "T_tcp_obj": T_tcp_obj.astype(np.float32),
+                            "grasp_axis_shift_m": float(axis_shift),
+                            "grasp_z_lift_m": float(z_lift),
+                            "grasp_approach_roll_deg": 0.0,
+                            "place_first": True,
+                            "fixed_tabletop_release_pose": release_check_pose,
+                        }
+                    )
+    candidates.sort(
+        key=lambda item: (
+            max(float(item.get("grasp_z_lift_m", 0.0) or 0.0), 0.0),
+            abs(float(item.get("grasp_axis_shift_m", 0.0) or 0.0)),
+            0 if "face_robot" in str(item.get("label", "")).lower() else 1,
+            0 if "x_down" in str(item.get("label", "")).lower() else 1,
+            str(item.get("label", "")),
+        )
+    )
+    print(
+        f"[direct_grasp] {source_name} place-first fixed-tabletop generated {len(candidates)} "
+        f"candidate(s) from {len(unique_goals)} fixed target pose(s), "
+        f"{len(grasp_pose_variants)} world-Z grasp tilt variant(s), "
+        f"{len(axis_shifts)} contact shift(s), {len(z_lifts)} contact z lift(s)"
+    )
+    if candidates:
+        print(
+            f"[direct_grasp] {source_name} place-first priority labels: "
+            + ", ".join(str(c.get("label", "?")) for c in candidates[:12])
+        )
+    return candidates
 
 
 def _make_sphere_free_release_pose_variants(
@@ -5712,37 +6702,6 @@ def _make_sphere_free_release_pose_variants(
         tcp_object_distance = float(max(tcp_object_distance_m or 0.0, 0.0))
         release_pose = _sphere_release_tcp_pose_from_center(demo, args, center_p, 0.0, tcp_object_distance)
     source_name = _current_source_object_name(args)
-    if source_name == "carriot":
-        variants = []
-        seen = set()
-        for tilt_deg in _carriot_release_tilt_toward_robot_degs(args):
-            base_pose = _sphere_release_tcp_pose_from_center(
-                demo,
-                args,
-                center_p,
-                float(tilt_deg),
-                tcp_object_distance,
-            )
-            if base_pose is None:
-                continue
-            tilt_suffix = None
-            if abs(float(tilt_deg)) > 1e-6:
-                dir_label = "body_toward_robot" if float(tilt_deg) >= 0.0 else "body_away_robot"
-                tilt_suffix = f"tilt_{dir_label}_{int(round(abs(float(tilt_deg))))}deg"
-            for roll_deg in _carriot_release_axial_roll_degs(args):
-                pose = _roll_pose_about_tcp_approach(base_pose, float(roll_deg))
-                roll_suffix = None if abs(float(roll_deg)) <= 1e-6 else f"free_roll_{int(round(float(roll_deg)))}deg"
-                suffix_parts = [part for part in (tilt_suffix, roll_suffix) if part]
-                suffix = "+".join(suffix_parts) if suffix_parts else None
-                key = (
-                    tuple(np.round(targeted.base.flatten_np(pose.p)[:3], 5).tolist()),
-                    tuple(np.round(targeted.base.flatten_np(pose.q)[:4], 5).tolist()),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                variants.append((suffix, pose))
-        return variants or [(None, release_pose)]
     if source_name != "tennis":
         return [(None, release_pose)]
     variants = []
@@ -6045,6 +7004,11 @@ def _build_direct_pre_place_candidates(demo, bridge_mod, scene_capture_cache, ru
         )
     else:
         candidates = []
+    candidates = _filter_fixed_tabletop_release_candidates(
+        candidates,
+        _current_source_object_name(args),
+        label="short_pre_place",
+    )
     candidates = _filter_place_candidates_by_tcp_verticality_target(candidates, args, label="short_pre_place")
     print(
         f"[direct_pre_place] built {len(candidates)} short pre-place candidate(s) "
@@ -6079,7 +7043,9 @@ def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, 
         object_dims = None
     object_category = classify_object_category(args, rule, object_dims)
     sphere_category = object_category == "sphere"
-    center_only_orientation_free = source_name == "carriot"
+    # Carriot is elongated, not orientation-free: its final object pose must
+    # follow the tabletop rule instead of targeting only the center point.
+    center_only_orientation_free = False
     if sphere_category and len(place_plan_candidates) > 1:
         place_plan_candidates = [
             min(
@@ -6284,8 +7250,224 @@ def _build_direct_place_candidates(demo, bridge_mod, scene_capture_cache, rule, 
     else:
         candidates = []
         print("[place_state] built 0 transport hover candidate(s) (all rejected by tcp_z threshold)")
+    candidates = _filter_fixed_tabletop_release_candidates(candidates, source_name, label="transport_hover")
     candidates = _filter_place_candidates_by_tcp_verticality_target(candidates, args, label="transport_hover")
     return candidates
+
+
+def _fast_chain_preselect_grasp_place_pair(
+    planner,
+    demo,
+    bridge_mod,
+    args,
+    scene_capture_cache,
+    place_state_cache,
+    rule,
+    grasp_candidates,
+    start_q,
+    *,
+    disabled_world_collision_links: list[str] | None,
+) -> dict | None:
+    """Choose one grasp-place chain with cheap IK before any candidate MotionGen.
+
+    This is the integrated fast path: it does not prove the whole trajectory is
+    safe, but it picks one grasp candidate whose pregrasp/grasp and matching
+    place hover/release poses all have IK.  The expensive MotionGen stages then
+    validate only that winner chain first.
+    """
+    if not bool(getattr(args, "fast_chain_screening", False)):
+        return None
+    candidates = [dict(item) for item in list(grasp_candidates or []) if item.get("pregrasp_pose") is not None]
+    if not candidates:
+        return None
+    max_grasps = int(getattr(args, "fast_chain_preselect_grasp_candidates", 6) or 0)
+    if max_grasps > 0:
+        candidates = candidates[:max_grasps]
+    source_name = _current_source_object_name(args)
+    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
+    place_screen_args = _transport_screen_args_for_object(args, source_name)
+    with _profile_stage(
+        args,
+        "winner_chain_ik_preselect",
+        candidate_count=len(candidates),
+        num_ik_seeds=int(getattr(args, "fast_chain_ik_seeds", 32) or getattr(args, "curobo_num_ik_seeds", 64)),
+    ) as prof:
+        _refresh_curobo_world(
+            planner,
+            demo,
+            args,
+            label="winner_chain_ik_preselect_grasp",
+            include_active_object=True,
+            include_table=False,
+        )
+        disabled = _set_world_collision_for_links(
+            planner,
+            disabled_world_collision_links,
+            enabled=False,
+            label="winner_chain_ik_preselect_grasp",
+        )
+        grasp_ik_candidates: list[dict] = []
+        try:
+            pregrasp_poses = [
+                _convert_demo_tcp_pose_to_curobo_ee_pose(
+                    demo,
+                    item["pregrasp_pose"],
+                    ee_link_name=ee_link_name,
+                )
+                for item in candidates
+            ]
+            pregrasp_results = _profile_solve_batch_start_goal_ik(
+                planner,
+                [start_q for _ in candidates],
+                pregrasp_poses,
+                num_seeds=int(getattr(args, "fast_chain_ik_seeds", 32) or getattr(args, "curobo_num_ik_seeds", 64)),
+            )
+            pregrasp_ok: list[dict] = []
+            for candidate, ik_result in zip(candidates, pregrasp_results):
+                if not bool(ik_result.success) or ik_result.goal_joint is None:
+                    continue
+                pos_err, rot_err = _ik_debug_errors(ik_result)
+                q_pregrasp = np.asarray(ik_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
+                candidate["_winner_preselect_q_pregrasp"] = q_pregrasp
+                candidate["q_pregrasp"] = q_pregrasp
+                candidate["_winner_preselect_pregrasp_ik_score"] = _ik_score(pos_err, rot_err)
+                pregrasp_ok.append(candidate)
+            if pregrasp_ok:
+                grasp_poses = [
+                    _convert_demo_tcp_pose_to_curobo_ee_pose(
+                        demo,
+                        item["pose"],
+                        ee_link_name=ee_link_name,
+                    )
+                    for item in pregrasp_ok
+                ]
+                grasp_results = _profile_solve_batch_start_goal_ik(
+                    planner,
+                    [np.asarray(item["_winner_preselect_q_pregrasp"], dtype=np.float32).reshape(-1)[:7] for item in pregrasp_ok],
+                    grasp_poses,
+                    num_seeds=int(getattr(args, "fast_chain_ik_seeds", 32) or getattr(args, "curobo_num_ik_seeds", 64)),
+                )
+                for candidate, ik_result in zip(pregrasp_ok, grasp_results):
+                    pos_err, rot_err = _ik_debug_errors(ik_result)
+                    if bool(ik_result.success) and ik_result.goal_joint is not None:
+                        q_grasp = np.asarray(ik_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
+                        grasp_score = _ik_score(pos_err, rot_err)
+                    else:
+                        # The real final approach is solved later with constrained
+                        # MotionGen/linear validation.  Do not reject a good
+                        # grasp-place pair just because this cheap one-shot grasp
+                        # IK lands poorly; use pregrasp q as a conservative
+                        # transport-start proxy and penalize the score.
+                        q_grasp = np.asarray(candidate["_winner_preselect_q_pregrasp"], dtype=np.float32).reshape(-1)[:7]
+                        grasp_score = 2.0
+                    candidate["_winner_preselect_q_grasp"] = q_grasp
+                    candidate["q_grasp"] = q_grasp
+                    candidate["_winner_preselect_grasp_ik_score"] = float(grasp_score)
+                    grasp_ik_candidates.append(candidate)
+        finally:
+            _set_world_collision_for_links(
+                planner,
+                disabled,
+                enabled=True,
+                label="winner_chain_ik_preselect_grasp",
+            )
+
+        prof["candidate_count_after_ik"] = len(grasp_ik_candidates)
+        if not grasp_ik_candidates:
+            prof["success"] = False
+            prof["status"] = "NO_GRASP_IK"
+            return None
+
+        pair_records: list[dict] = []
+        first_valid_pair = bool(getattr(args, "fast_chain_preselect_first_valid", True))
+        for grasp_candidate in grasp_ik_candidates:
+            place_build_args = _bi_fast_insert_screen_args(args) if source_name == "bi" else args
+            place_candidates = _build_direct_place_candidates(
+                demo,
+                bridge_mod,
+                scene_capture_cache,
+                rule,
+                place_state_cache,
+                place_build_args,
+                T_tcp_obj_override=grasp_candidate.get("T_tcp_obj"),
+            )
+            if getattr(rule, "primitive", None) == "insert_vertical":
+                place_candidates = _filter_pre_place_candidates_by_verticality(place_candidates, place_build_args)
+            place_candidates = sorted(list(place_candidates or []), key=_pre_place_screen_sort_key)
+            if source_name == "bi":
+                small_place_candidates = _bi_insert_small_lane_candidates(
+                    place_candidates,
+                    args,
+                    label=f"{grasp_candidate.get('label', 'grasp')}_winner_chain",
+                )
+                if small_place_candidates:
+                    place_candidates = small_place_candidates
+            if not place_candidates:
+                continue
+            q_grasp = np.asarray(grasp_candidate["_winner_preselect_q_grasp"], dtype=np.float32).reshape(-1)[:7]
+            ranked_places = _fast_chain_rank_place_candidates(
+                planner,
+                demo,
+                place_screen_args,
+                place_candidates,
+                q_grasp,
+                label=f"{grasp_candidate.get('label', 'grasp')}_winner_chain",
+                disabled_world_collision_links=_direct_place_contact_tolerant_disabled_links(planner),
+            )
+            if not ranked_places:
+                continue
+            place_candidate = dict(ranked_places[0])
+            # q_hover/q_release are target IK solutions. They remain useful even
+            # if the final MotionGen start q differs slightly from this cheap q_grasp.
+            place_candidate.pop("_prefilter_start_q", None)
+            grasp_joint_score = float(np.linalg.norm(grasp_candidate["_winner_preselect_q_pregrasp"] - start_q))
+            grasp_joint_score += 0.35 * float(
+                np.linalg.norm(grasp_candidate["_winner_preselect_q_grasp"] - grasp_candidate["_winner_preselect_q_pregrasp"])
+            )
+            score = (
+                float(place_candidate.get("pair_score", place_candidate.get("fast_chain_score", 0.0)) or 0.0)
+                + grasp_joint_score
+                + float(grasp_candidate.get("_winner_preselect_pregrasp_ik_score", 0.0) or 0.0)
+                + float(grasp_candidate.get("_winner_preselect_grasp_ik_score", 0.0) or 0.0)
+            )
+            pair_records.append(
+                {
+                    "score": float(score),
+                    "grasp_candidate": grasp_candidate,
+                    "place_candidate": place_candidate,
+                }
+            )
+            if first_valid_pair:
+                print(
+                    "[winner_chain] first-valid preselect accepted "
+                    f"grasp={grasp_candidate.get('label')} place={place_candidate.get('label')}"
+                )
+                break
+        prof["candidate_count_motiongen"] = 1 if pair_records else 0
+        prof["winner_count"] = 1 if pair_records else 0
+        if not pair_records:
+            prof["success"] = False
+            prof["status"] = "NO_PLACE_IK_PAIR"
+            return None
+        pair_records.sort(key=lambda item: float(item["score"]))
+        best = pair_records[0]
+        selected_grasp = dict(best["grasp_candidate"])
+        selected_place = dict(best["place_candidate"])
+        selected_grasp["_preselected_fast_place_candidates"] = [selected_place]
+        selected_grasp["_winner_chain_preselect_score"] = float(best["score"])
+        selected_grasp["_winner_chain_preselected_place_label"] = str(selected_place.get("label", ""))
+        prof["success"] = True
+        prof["status"] = "Success"
+        prof["selected_grasp_label"] = str(selected_grasp.get("label", ""))
+        prof["selected_place_label"] = str(selected_place.get("label", ""))
+        prof["path_score"] = float(best["score"])
+        print(
+            "[winner_chain] IK preselected grasp-place pair: "
+            f"grasp={selected_grasp.get('label')} place={selected_place.get('label')} "
+            f"score={float(best['score']):.3f}"
+        )
+        return selected_grasp
 
 
 def plan_transport_to_hover(
@@ -6328,6 +7510,7 @@ def plan_transport_to_hover(
             exclude_object_names=exclude_object_names,
             disabled_world_collision_links=disabled_world_collision_links,
         )
+        _copy_last_candidate_counts_to_profile(prof, planner)
         prof["winner_count"] = len(winners)
         prof["success"] = bool(winners)
         prof["status"] = "Success" if winners else "NO_WINNERS"
@@ -6349,6 +7532,7 @@ def plan_final_contact_approach(
     disabled_world_collision_links: list[str] | None,
 ):
     start_t = time.perf_counter()
+    counter_start = _snapshot_profile_counters()
     place_mode = str(transport_choice.get("place_mode", "drop_place"))
     pre_q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in transport_choice["q_path"]]
     hover_pose = transport_choice.get("hover_pose", transport_choice["pose"])
@@ -6370,6 +7554,7 @@ def plan_final_contact_approach(
             elapsed_ms=round((time.perf_counter() - start_t) * 1000.0, 3),
             path_waypoints=len(pre_q_path),
             path_score=float(item.get("score", 0.0) or 0.0),
+            **_profile_counter_delta(counter_start),
         )
         return item
 
@@ -6414,7 +7599,7 @@ def plan_final_contact_approach(
     if (
         bool(getattr(args, "curobo_debug", False))
         and not use_segmented_final_contact
-        and (source_name == "carriot" or place_mode == "insert_place" or (verticality_target is not None and verticality_target < 0.5))
+        and (place_mode == "insert_place" or (verticality_target is not None and verticality_target < 0.5))
     ):
         print(
             f"[place_state] {final_label}: using cuRobo MotionGen approach metric for short contact "
@@ -6469,18 +7654,13 @@ def plan_final_contact_approach(
             enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
             num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
             num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+            **_profile_counter_delta(counter_start),
         )
         return None
     release_q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in release_q_path]
     final_contact_backtrack_tol_m = float(
         max(getattr(args, "strict_final_contact_waypoint_backtrack_tol_m", 0.008), 0.0)
     )
-    if source_name == "carriot":
-        # Carriot final-contact plans sometimes add a small same-line pre-lift
-        # before the descent.  Keep lateral straight-line validation unchanged,
-        # but avoid rejecting safe vertical/axis-aligned contacts by a 1-2mm
-        # tolerance artifact.
-        final_contact_backtrack_tol_m = max(final_contact_backtrack_tol_m, 0.012)
     if strict_linear_final_contact and not _validate_strict_linear_waypoints(
         demo,
         args,
@@ -6497,6 +7677,7 @@ def plan_final_contact_approach(
             status="STRICT_LINEAR_VALIDATE_FAIL",
             elapsed_ms=round((time.perf_counter() - start_t) * 1000.0, 3),
             path_waypoints=len(release_q_path),
+            **_profile_counter_delta(counter_start),
         )
         return None
     if not _validate_candidate_joint_path_with_demo_planner(
@@ -6513,6 +7694,7 @@ def plan_final_contact_approach(
             status="DEMO_VALIDATE_FAIL",
             elapsed_ms=round((time.perf_counter() - start_t) * 1000.0, 3),
             path_waypoints=len(release_q_path),
+            **_profile_counter_delta(counter_start),
         )
         return None
     combined_path = pre_q_path + release_q_path[1:]
@@ -6546,6 +7728,7 @@ def plan_final_contact_approach(
         enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
         num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
         num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+        **_profile_counter_delta(counter_start),
     )
     return item
 
@@ -6580,7 +7763,7 @@ def _grasp_chain_eval_sort_key(item, rule):
 def _lvmukuai_grasp_chain_eval_sort_key(item) -> tuple:
     base_key = _candidate_sort_key(item)
     label = str(item.get("label", "")).lower()
-    is_vertical_helper = "lvmukuai_vertical_gripper" in label
+    is_vertical_helper = _is_fixed_tabletop_vertical_helper_label(label, "lvmukuai")
     is_tilted = "tilt" in label
     z_lift = max(float(item.get("grasp_z_lift_m", 0.0) or 0.0), 0.0)
     is_plain_direct = (not is_tilted) and z_lift <= 1e-4 and "lift" not in label
@@ -6589,20 +7772,17 @@ def _lvmukuai_grasp_chain_eval_sort_key(item) -> tuple:
     if tilt_match:
         tilt_mag = abs(float(tilt_match.group(1)))
     if is_vertical_helper:
-        # Target-derived vertical-helper grasps are useful fallback branches,
-        # but random scenes show they can starve the stable topdown/tilt
-        # relations and then all transport goals fail.
-        relation_class = 5
-    elif is_tilted and abs(tilt_mag - 20.0) <= 1.0:
         relation_class = 0
-    elif is_plain_direct:
+    elif is_tilted and abs(tilt_mag - 20.0) <= 1.0:
         relation_class = 1
-    elif is_tilted:
+    elif is_plain_direct:
         relation_class = 2
-    elif z_lift >= 0.005 or "lift_10mm" in label:
+    elif is_tilted:
         relation_class = 3
-    else:
+    elif z_lift >= 0.005 or "lift_10mm" in label:
         relation_class = 4
+    else:
+        relation_class = 5
     toward_pref = 0 if "toward_robot" in label else 1
     lift_pref = 0 if z_lift >= 0.005 or "lift_10mm" in label else 1
     return (
@@ -6686,6 +7866,7 @@ def _bi_grasp_chain_eval_sort_key(item) -> tuple:
 
 def _shuazi_grasp_label_priority(item) -> tuple:
     label = str(item.get("label", "")).lower()
+    is_vertical_helper = _is_fixed_tabletop_vertical_helper_label(label, "shuazi")
     tilt_deg = 0.0
     tilt_match = re.search(r"tilt_([-+]?\d+(?:\.\d+)?)deg", label)
     if tilt_match:
@@ -6714,32 +7895,34 @@ def _shuazi_grasp_label_priority(item) -> tuple:
         and not has_extra_axis_or_lift
     )
 
-    if is_tilt30_roll180:
+    if is_vertical_helper:
         relation_class = 0
+    elif is_tilt30_roll180:
+        relation_class = 1
     elif is_direct_axis_lift20:
         # Crowded desk scenes can block the shallow tilted brush transport
         # branches after nearby objects are placed. Keep the proven 30deg/180
         # branch first, but try lifted direct-axis 90/270 before spending all
         # downstream checks on other tilted rolls.
-        relation_class = 1
-    elif has_shift_20 and abs(tilt_deg - 30.0) <= 1.0 and not has_extra_axis_or_lift:
         relation_class = 2
-    elif is_direct_axis_lift10:
+    elif has_shift_20 and abs(tilt_deg - 30.0) <= 1.0 and not has_extra_axis_or_lift:
         relation_class = 3
-    elif is_tilt30_roll_other:
+    elif is_direct_axis_lift10:
         relation_class = 4
-    elif is_direct_axis:
+    elif is_tilt30_roll_other:
         relation_class = 5
-    elif has_shift_20 and abs(tilt_deg - 30.0) <= 1.0:
+    elif is_direct_axis:
         relation_class = 6
-    elif has_shift_20 and abs(tilt_deg - 20.0) <= 1.0 and not has_extra_axis_or_lift:
+    elif has_shift_20 and abs(tilt_deg - 30.0) <= 1.0:
         relation_class = 7
-    elif "tilt" in label:
+    elif has_shift_20 and abs(tilt_deg - 20.0) <= 1.0 and not has_extra_axis_or_lift:
         relation_class = 8
-    else:
+    elif "tilt" in label:
         relation_class = 9
+    else:
+        relation_class = 10
 
-    if relation_class in {0, 2, 4, 6, 7, 8}:
+    if relation_class in {1, 3, 5, 7, 8, 9}:
         roll_pref = 0 if abs(roll_deg - 180.0) <= 1.0 else 1
     else:
         # For direct-axis lifted shuazi grasps, 90/270 have remained the faster
@@ -6807,10 +7990,10 @@ def _evaluate_joint_grasp_place_chains(
             f"{max_grasp_candidates}->{bi_min_grasp_candidates} to test equivalent wrist-roll branches"
         )
         max_grasp_candidates = bi_min_grasp_candidates
-    if source_name == "lvmukuai" and max_grasp_candidates > 0 and max_grasp_candidates < 6:
+    if _is_fixed_tabletop_source(source_name) and max_grasp_candidates > 0 and max_grasp_candidates < 6:
         print(
-            "[joint_search] lvmukuai: increasing downstream grasp expansion "
-            f"{max_grasp_candidates}->6 so lifted/tilted flat-place relations are evaluated"
+            "[joint_search] fixed-tabletop: increasing downstream grasp expansion "
+            f"{max_grasp_candidates}->6 so fixed-pose vertical-gripper relations are evaluated"
         )
         max_grasp_candidates = 6
     # Some jittered desk poses need the 180deg approach-roll branch for a
@@ -6848,7 +8031,7 @@ def _evaluate_joint_grasp_place_chains(
         after_labels = [str(c.get("label", "?")) for c in grasp_candidates]
         if after_labels != before_labels:
             print(
-                "[joint_search] lvmukuai: trying stable topdown/tilt flat-place relations before vertical helpers "
+                "[joint_search] lvmukuai: trying fixed-pose vertical-gripper relations first "
                 f"(order={after_labels})"
             )
     if source_name == "hongshupian":
@@ -6958,8 +8141,6 @@ def _evaluate_joint_grasp_place_chains(
             max_place_candidates = int(getattr(args, "joint_search_max_pre_place_candidates", 16))
             if sphere_category and max_place_candidates > 0:
                 max_place_candidates = max(max_place_candidates, 12)
-            if _current_source_object_name(args) == "carriot" and max_place_candidates > 0:
-                max_place_candidates = max(max_place_candidates, 8)
             per_grasp_payload_state = _snapshot_transport_payload_state(demo)
             try:
                 if grasp_choice.get("T_tcp_obj") is None:
@@ -7016,6 +8197,40 @@ def _evaluate_joint_grasp_place_chains(
                     continue
 
                 candidate_passes = []
+                fast_candidates = []
+                preselected_fast_candidates = [
+                    dict(item) for item in list(grasp_choice.get("_preselected_fast_place_candidates") or [])
+                ]
+                if preselected_fast_candidates:
+                    fast_candidates = preselected_fast_candidates[: max(1, int(getattr(args, "fast_chain_top_pairs", 1) or 1))]
+                    print(
+                        f"[joint_search] {grasp_label}: using {len(fast_candidates)} "
+                        "IK-preselected place candidate(s) for winner-chain fast pass"
+                    )
+                    candidate_passes.append(("fast_ik", fast_candidates))
+                elif bool(getattr(args, "fast_chain_screening", False)):
+                    with _profile_stage(
+                        args,
+                        "joint_search_fast_chain_ik_screen",
+                        candidate_count=len(all_direct_place_candidates),
+                    ) as prof:
+                        fast_candidates = _fast_chain_rank_place_candidates(
+                            planner,
+                            demo,
+                            transport_screen_args,
+                            all_direct_place_candidates,
+                            grasp_terminal_q,
+                            label=f"{grasp_label}_fast_chain",
+                            disabled_world_collision_links=direct_place_disabled_links,
+                        )
+                        fast_records = list(getattr(planner, "_last_fast_chain_prefilter_records", []) or [])
+                        prof["candidate_count_after_ik"] = len(fast_records)
+                        prof["candidate_count_motiongen"] = len(fast_candidates)
+                        prof["winner_count"] = len(fast_candidates)
+                        prof["success"] = bool(fast_candidates)
+                        prof["status"] = "Success" if fast_candidates else "NO_IK_RANKED_PAIRS"
+                    if fast_candidates:
+                        candidate_passes.append(("fast_ik", fast_candidates))
                 primary_candidates = _select_diverse_place_candidates(
                     all_direct_place_candidates,
                     max_place_candidates,
@@ -7047,6 +8262,7 @@ def _evaluate_joint_grasp_place_chains(
                     pass_num_trajopt_seeds = screen_num_trajopt_seeds_arg
                     pass_num_graph_seeds = None
                     if pass_is_fallback:
+                        _bump_profile_counter("fallback_count")
                         pass_enable_graph = bool(getattr(args, "joint_search_fallback_enable_graph", True))
                         fallback_timeout = float(getattr(args, "joint_search_fallback_timeout", 8.0))
                         if fallback_timeout > 0.0:
@@ -7102,6 +8318,14 @@ def _evaluate_joint_grasp_place_chains(
                         )
                         winner_floor = int(final_contact_check_limit or 6)
                         transport_max_winners = max(int(transport_max_winners or 1), winner_floor)
+                    if pass_label == "fast_ik":
+                        transport_max_winners = 1
+                        if validate_final_contact_in_joint_search:
+                            final_contact_check_limit = 1
+                        print(
+                            f"[joint_search] {grasp_label} fast_ik winner-chain mode: "
+                            "only the top IK-ranked pair is sent to transport/final-contact MotionGen"
+                        )
                     print(
                         f"[joint_search] transport-hover pair candidate count for {grasp_label} "
                         f"({pass_label}): {len(direct_pair_candidates)}"
@@ -7221,9 +8445,8 @@ def _evaluate_joint_grasp_place_chains(
                     skip_direct_transport_batch = False
                     skip_direct_transport_reason = "SKIPPED_INVALID_START_WORLD_COLLISION"
                     if (
-                        source_name == "bi"
-                        and pass_label == "primary"
-                        and bool(getattr(args, "curobo_attach_object", True))
+                        bool(getattr(args, "curobo_attach_object", True))
+                        and (pass_label == "fast_ik" or (source_name == "bi" and pass_label == "primary"))
                     ):
                         skip_direct_transport_batch = _start_state_is_world_collision(
                             planner,
@@ -7298,6 +8521,7 @@ def _evaluate_joint_grasp_place_chains(
                                     exclude_object_names=exclude_names,
                                     disabled_world_collision_links=direct_place_disabled_links,
                                 )
+                                _copy_last_candidate_counts_to_profile(prof, planner)
                                 prof["winner_count"] = len(fast_lane_successes)
                                 prof["success"] = bool(fast_lane_successes)
                                 prof["status"] = "Success" if fast_lane_successes else "NO_WINNERS_VERTICAL_FAST_LANE"
@@ -7312,66 +8536,6 @@ def _evaluate_joint_grasp_place_chains(
                                     print(
                                         f"[joint_search] {grasp_label} {pass_label}: "
                                         f"accepted {source_name} vertical-long-axis fast-lane transport/final-contact chain"
-                                    )
-                    if (
-                        source_name == "carriot"
-                        and pass_label == "primary"
-                        and validate_final_contact_in_joint_search
-                        and not skip_direct_transport_batch
-                    ):
-                        fast_lane_candidates = _carriot_transport_fast_lane_candidates(
-                            direct_pair_candidates,
-                            args,
-                            label=f"{grasp_label}_{pass_label}",
-                        )
-                        if fast_lane_candidates:
-                            fast_lane_successes = []
-                            with _profile_stage(
-                                args,
-                                "joint_search_transport_hover",
-                                candidate_count=len(fast_lane_candidates),
-                                status="carriot_fast_lane",
-                                max_attempts=int(getattr(args, "curobo_max_attempts", 2) if pass_max_attempts is None else pass_max_attempts),
-                                num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64) if pass_num_ik_seeds is None else pass_num_ik_seeds),
-                                num_trajopt_seeds=int(
-                                    getattr(args, "curobo_num_trajopt_seeds", 1)
-                                    if pass_num_trajopt_seeds is None
-                                    else pass_num_trajopt_seeds
-                                ),
-                                enable_graph=bool(getattr(args, "curobo_enable_graph", False) if pass_enable_graph is None else pass_enable_graph),
-                            ) as prof:
-                                fast_lane_successes = _evaluate_curobo_pose_candidates_multi_start(
-                                    planner,
-                                    demo,
-                                    transport_screen_args,
-                                    fast_lane_candidates,
-                                    label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}_carriot_fast_lane",
-                                    use_attach=True,
-                                    timeout=pass_timeout,
-                                    max_attempts=pass_max_attempts,
-                                    num_ik_seeds=pass_num_ik_seeds,
-                                    num_trajopt_seeds=pass_num_trajopt_seeds,
-                                    num_graph_seeds=pass_num_graph_seeds,
-                                    enable_graph=pass_enable_graph,
-                                    max_winners=1,
-                                    include_table=True,
-                                    exclude_object_names=exclude_names,
-                                    disabled_world_collision_links=direct_place_disabled_links,
-                                )
-                                prof["winner_count"] = len(fast_lane_successes)
-                                prof["success"] = bool(fast_lane_successes)
-                                prof["status"] = "Success" if fast_lane_successes else "NO_WINNERS_CARRIOT_FAST_LANE"
-                                prof["world_changed"] = bool(getattr(planner, "_last_world_changed", False))
-                                prof["cache_hit"] = bool(getattr(planner, "_last_world_cache_hit", False))
-                                if fast_lane_successes:
-                                    prof["path_waypoints"] = int((fast_lane_successes[0].get("metrics") or {}).get("waypoint_count", 0) or 0)
-                                    prof["path_score"] = float(fast_lane_successes[0].get("score", 0.0) or 0.0)
-                            if fast_lane_successes:
-                                accepted_chain_this_pass = _accept_direct_place_successes(fast_lane_successes)
-                                if accepted_chain_this_pass:
-                                    print(
-                                        f"[joint_search] {grasp_label} {pass_label}: "
-                                        "accepted carriot fast-lane transport/final-contact chain"
                                     )
                     if accepted_chain_this_pass:
                         if max_feasible_chains > 0 and len(chains) >= max_feasible_chains:
@@ -7416,6 +8580,7 @@ def _evaluate_joint_grasp_place_chains(
                                 exclude_object_names=exclude_names,
                                 disabled_world_collision_links=direct_place_disabled_links,
                             )
+                            _copy_last_candidate_counts_to_profile(prof, planner)
                             prof["winner_count"] = len(direct_place_successes)
                             prof["success"] = bool(direct_place_successes)
                             prof["status"] = "Success" if direct_place_successes else "NO_WINNERS"
@@ -7497,6 +8662,7 @@ def _evaluate_joint_grasp_place_chains(
                                 f"[joint_search] {grasp_label} {pass_label}: straight lift failed after "
                                 "start-collision skip; running the skipped direct transport batch as fallback"
                             )
+                            _bump_profile_counter("fallback_count")
                             with _profile_stage(
                                 args,
                                 "joint_search_transport_hover",
@@ -7529,6 +8695,7 @@ def _evaluate_joint_grasp_place_chains(
                                     exclude_object_names=exclude_names,
                                     disabled_world_collision_links=direct_place_disabled_links,
                                 )
+                                _copy_last_candidate_counts_to_profile(prof, planner)
                                 prof["winner_count"] = len(direct_place_successes)
                                 prof["success"] = bool(direct_place_successes)
                                 prof["status"] = "Success" if direct_place_successes else "NO_WINNERS_FALLBACK_AFTER_LIFT_FAIL"
@@ -7605,6 +8772,7 @@ def _evaluate_joint_grasp_place_chains(
                             if source_name == "bi" and pass_label == "primary":
                                 fast_lane = _bi_insert_fast_lane_candidates(
                                     lifted_pair_candidates,
+                                    args,
                                     label=f"{grasp_label}_{pass_label}_after_lift",
                                 )
                                 if fast_lane and len(fast_lane) < len(lifted_pair_candidates):
@@ -7658,6 +8826,7 @@ def _evaluate_joint_grasp_place_chains(
                                         exclude_object_names=lift_exclude_names,
                                         disabled_world_collision_links=direct_place_disabled_links,
                                     )
+                                    _copy_last_candidate_counts_to_profile(prof, planner)
                                     prof["winner_count"] = len(direct_place_successes)
                                     prof["success"] = bool(direct_place_successes)
                                     prof["status"] = "Success" if direct_place_successes else f"NO_WINNERS_{lifted_pass_label.upper()}"
@@ -7728,8 +8897,34 @@ def run_targeted_place_episode_curobo_direct(
     scene_capture_cache,
     place_state_cache,
 ) -> bool:
-    print("\n[episode] planning from FoundationPose-initialized object pose")
     args._skip_remaining_step_confirms_in_object = False
+
+    rule = None
+    selected_joint_chain = None
+    two_step_pregrasp_lookup = {}
+    if not args.skip_goal_motion:
+        rule = targeted.get_place_rule(args.object_name)
+        if rule is None:
+            print(f"[FAIL] no targeted-place rule is configured for source object {args.object_name}")
+            _hide_actor_quiet(getattr(demo, "_target_object_goal_visual_actor", None))
+            return False
+        _render_current_target_object_goal_visual(
+            demo,
+            bridge_mod,
+            scene_capture_cache,
+            place_state_cache,
+            rule,
+            args,
+        )
+        if getattr(args, "render_mode", None) == "human":
+            try:
+                bridge_mod.render_preview(demo.env, repeats=1)
+            except Exception:
+                pass
+    else:
+        _hide_actor_quiet(getattr(demo, "_target_object_goal_visual_actor", None))
+
+    print("\n[episode] planning from FoundationPose-initialized object pose")
 
     start_q = demo.current_arm_qpos()
     if real_exec is not None and bool(getattr(args, "single_confirm_per_object", False)):
@@ -7757,15 +8952,6 @@ def run_targeted_place_episode_curobo_direct(
     targeted.base.update_attached_box_visual(demo, visible=False)
     _clear_visualized_attached_spheres(demo)
 
-    rule = None
-    selected_joint_chain = None
-    two_step_pregrasp_lookup = {}
-    if not args.skip_goal_motion:
-        rule = targeted.get_place_rule(args.object_name)
-        if rule is None:
-            print(f"[FAIL] no targeted-place rule is configured for source object {args.object_name}")
-            return False
-
     targeted.base.lift_active_object_above_table_if_needed(
         demo,
         args,
@@ -7788,6 +8974,7 @@ def run_targeted_place_episode_curobo_direct(
     print("object p:", np.round(demo.get_obj_pose()[0], 6), "object q:", np.round(demo.get_obj_pose()[1], 6))
     direct_grasp_disabled_links: list[str] = []
     direct_grasp_max_winners = int(getattr(args, "direct_grasp_goalset_max_winners", 2))
+    requested_direct_grasp_max_winners = int(direct_grasp_max_winners)
     source_name = _current_source_object_name(args)
     if (
         rule is not None
@@ -7807,28 +8994,50 @@ def run_targeted_place_episode_curobo_direct(
             f"{direct_grasp_max_winners}->{bi_min_pregrasp_winners} to test equivalent wrist-roll branches"
         )
         direct_grasp_max_winners = bi_min_pregrasp_winners
-    if source_name == "lvmukuai" and direct_grasp_max_winners > 0 and direct_grasp_max_winners < 6:
+    if _is_fixed_tabletop_source(source_name) and direct_grasp_max_winners > 0 and direct_grasp_max_winners < 6:
         print(
-            "[direct_grasp] lvmukuai: increasing pregrasp winners "
-            f"{direct_grasp_max_winners}->6 to test lifted/tilted flat-place relations"
+            "[direct_grasp] fixed-tabletop: increasing pregrasp winners "
+            f"{direct_grasp_max_winners}->6 to test fixed-pose vertical-gripper relations"
         )
         direct_grasp_max_winners = 6
-    # Match the downstream shuazi floor above so the pregrasp goalset keeps the
-    # 180deg approach-roll branch available for grasp->place screening.
-    shuazi_min_pregrasp_winners = 6
-    if source_name == "shuazi" and direct_grasp_max_winners > 0 and direct_grasp_max_winners < shuazi_min_pregrasp_winners:
-        print(
-            "[direct_grasp] shuazi: increasing pregrasp winners "
-            f"{direct_grasp_max_winners}->{shuazi_min_pregrasp_winners} so downstream transport can test approach-roll grasp relations"
-        )
-        direct_grasp_max_winners = shuazi_min_pregrasp_winners
+    expanded_direct_grasp_max_winners = int(direct_grasp_max_winners)
+    if bool(getattr(args, "fast_chain_screening", False)):
+        initial_fast_winners = int(getattr(args, "fast_chain_initial_grasp_winners", 1) or 0)
+        if initial_fast_winners > 0 and direct_grasp_max_winners > initial_fast_winners:
+            print(
+                "[direct_grasp] integrated fast-chain: first planning only "
+                f"{initial_fast_winners}/{expanded_direct_grasp_max_winners} pregrasp winner(s); "
+                "full expanded winner set remains fallback"
+            )
+            direct_grasp_max_winners = initial_fast_winners
     grasp_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+    all_grasp_candidates_for_fallback = list(grasp_candidates or [])
+    initial_grasp_candidates = list(grasp_candidates or [])
+    preselected_grasp = _fast_chain_preselect_grasp_place_pair(
+        planner,
+        demo,
+        bridge_mod,
+        args,
+        scene_capture_cache,
+        place_state_cache,
+        rule,
+        initial_grasp_candidates,
+        grasp_start_q,
+        disabled_world_collision_links=direct_grasp_disabled_links,
+    )
+    if preselected_grasp is not None:
+        selected_label = str(preselected_grasp.get("label", ""))
+        initial_grasp_candidates = [preselected_grasp]
+        print(
+            "[winner_chain] first MotionGen pass restricted to IK-preselected grasp "
+            f"{selected_label!r}; full grasp set remains fallback"
+        )
     two_step_pregrasp_successes = _evaluate_two_step_grasp_candidates(
         planner,
         demo,
         args,
         grasp_start_q,
-        grasp_candidates,
+        initial_grasp_candidates,
         label="two_step_grasp",
         max_winners=direct_grasp_max_winners,
         include_active_object=True,
@@ -7839,9 +9048,35 @@ def run_targeted_place_episode_curobo_direct(
             str(item.get("label", "")): item for item in list(two_step_pregrasp_successes or [])
         }
         print(f"[grasp] explicit two-step grasp pregrasp succeeded for {len(two_step_pregrasp_lookup)} candidate(s)")
+    elif preselected_grasp is not None and len(all_grasp_candidates_for_fallback) > 1:
+        fallback_winners = min(
+            max(2, expanded_direct_grasp_max_winners, requested_direct_grasp_max_winners),
+            len(all_grasp_candidates_for_fallback),
+        )
+        print(
+            "[winner_chain] IK-preselected grasp failed pregrasp MotionGen; "
+            f"falling back to expanded grasp goalset winners={fallback_winners}"
+        )
+        targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
+        two_step_pregrasp_successes = _evaluate_two_step_grasp_candidates(
+            planner,
+            demo,
+            args,
+            grasp_start_q,
+            all_grasp_candidates_for_fallback,
+            label="two_step_grasp_preselect_fallback",
+            max_winners=fallback_winners,
+            include_active_object=True,
+            disabled_world_collision_links=direct_grasp_disabled_links,
+        )
+        two_step_pregrasp_lookup = {
+            str(item.get("label", "")): item for item in list(two_step_pregrasp_successes or [])
+        }
+        if two_step_pregrasp_successes:
+            print(f"[grasp] fallback pregrasp succeeded for {len(two_step_pregrasp_lookup)} candidate(s)")
     else:
         print("[FAIL] two-step grasp pregrasp planning failed")
-        selected_pose = grasp_candidates[0].get("pregrasp_pose", grasp_candidates[0]["pose"]) if grasp_candidates else demo.build_topdown_grasp_pose()
+        selected_pose = all_grasp_candidates_for_fallback[0].get("pregrasp_pose", all_grasp_candidates_for_fallback[0]["pose"]) if all_grasp_candidates_for_fallback else demo.build_topdown_grasp_pose()
         targeted.base.inspect_failed_pose(
             demo,
             bridge_mod,
@@ -7849,7 +9084,7 @@ def run_targeted_place_episode_curobo_direct(
             args,
             pose=selected_pose,
             gripper_closed=False,
-            candidate_poses=[item.get("pregrasp_pose", item["pose"]) for item in grasp_candidates],
+            candidate_poses=[item.get("pregrasp_pose", item["pose"]) for item in all_grasp_candidates_for_fallback],
         )
         return False
 
@@ -7889,7 +9124,10 @@ def run_targeted_place_episode_curobo_direct(
         if not joint_chains:
             fallback_grasp_successes = []
             if direct_grasp_max_winners == 1 and len(grasp_candidates) > 1:
-                fallback_winners = min(2, len(grasp_candidates))
+                fallback_winners = min(
+                    max(2, expanded_direct_grasp_max_winners, requested_direct_grasp_max_winners),
+                    len(grasp_candidates),
+                )
                 print(
                     "[joint_search] first grasp winner produced no complete chain; "
                     f"expanding grasp goalset winners 1->{fallback_winners} before failing"
@@ -7900,7 +9138,7 @@ def run_targeted_place_episode_curobo_direct(
                     demo,
                     args,
                     grasp_start_q,
-                    grasp_candidates,
+                    all_grasp_candidates_for_fallback,
                     label="two_step_grasp_fallback",
                     max_winners=fallback_winners,
                     include_active_object=True,
@@ -8708,6 +9946,22 @@ def main():
                 planner_mod,
                 scene_capture_cache=scene_capture_cache,
             )
+            if not bool(getattr(args, "skip_goal_motion", False)):
+                rule = targeted.get_place_rule(args.object_name)
+                if rule is not None:
+                    _render_current_target_object_goal_visual(
+                        demo,
+                        bridge_mod,
+                        scene_capture_cache,
+                        getattr(args, "_targeted_place_state_cache", None) or {"used_slots_by_target": {}},
+                        rule,
+                        args,
+                    )
+                    if getattr(args, "render_mode", None) == "human":
+                        try:
+                            bridge_mod.render_preview(demo.env, repeats=1)
+                        except Exception:
+                            pass
             cached_objects = []
             if isinstance(scene_capture_cache, dict):
                 cached_objects = list((scene_capture_cache.get("objects") or {}).keys())

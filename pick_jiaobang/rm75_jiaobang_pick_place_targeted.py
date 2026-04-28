@@ -1651,6 +1651,7 @@ def main():
                 break
 
             cycle_args, spec = base.make_cycle_args(base_args, selected_name)
+            cycle_args._targeted_place_state_cache = place_state_cache
             selected_obstacles = _derive_cycle_obstacle_names(base_args, cycle_idx, selected_name, cycle_object_sequence, cached_scene_names)
             cycle_args.selected_obstacle_object_names = list(selected_obstacles)
             cycle_args.required_scene_object_names = list(selected_obstacles)

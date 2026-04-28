@@ -177,6 +177,51 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
         sim_linear_damping=0.12,
         sim_angular_damping=6.0,
     ),
+    # ---------------  roof assembly  ---------------
+    "red_bricks_cube": ObjectSpec(
+        name="red_bricks_cube",
+        grounding_prompt="red brick cube.",
+        mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_bricks_cube.glb",
+        sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_bricks_cube.glb",
+        real_longest_axis_m=0.105,
+        fixed_goal_joints_deg=DEFAULT_FIXED_GOAL_JOINTS_DEG,
+    ),
+    "red_triangle_front": ObjectSpec(
+        name="red_triangle_front",
+        grounding_prompt="red triangle panel.",
+        mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_triangle.glb",
+        sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_triangle.glb",
+        real_longest_axis_m=0.12,
+        fixed_goal_joints_deg=DEFAULT_FIXED_GOAL_JOINTS_DEG,
+        grasp_mode="topdown_long_axis",
+    ),
+    "red_triangle_back": ObjectSpec(
+        name="red_triangle_back",
+        grounding_prompt="red triangle panel.",
+        mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_triangle.glb",
+        sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_triangle.glb",
+        real_longest_axis_m=0.12,
+        fixed_goal_joints_deg=DEFAULT_FIXED_GOAL_JOINTS_DEG,
+        grasp_mode="topdown_long_axis",
+    ),
+    "red_triangle_left": ObjectSpec(
+        name="red_triangle_left",
+        grounding_prompt="red triangle panel.",
+        mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_triangle.glb",
+        sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_triangle.glb",
+        real_longest_axis_m=0.12,
+        fixed_goal_joints_deg=DEFAULT_FIXED_GOAL_JOINTS_DEG,
+        grasp_mode="topdown_long_axis",
+    ),
+    "red_triangle_right": ObjectSpec(
+        name="red_triangle_right",
+        grounding_prompt="red triangle panel.",
+        mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_triangle.glb",
+        sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_triangle.glb",
+        real_longest_axis_m=0.12,
+        fixed_goal_joints_deg=DEFAULT_FIXED_GOAL_JOINTS_DEG,
+        grasp_mode="topdown_long_axis",
+    ),
 }
 
 
@@ -203,6 +248,13 @@ OBJECT_NAME_ALIASES: Dict[str, str] = {
     "lvsebi": "greenpen",
     "glue_stick": "gluestick",
     "jiaobang": "gluestick",
+    # roof assembly aliases
+    "roof_tri_front": "red_triangle_front",
+    "roof_tri_back": "red_triangle_back",
+    "roof_tri_left": "red_triangle_left",
+    "roof_tri_right": "red_triangle_right",
+    "red_triangle": "red_triangle_front",
+    "bricks_cube": "red_bricks_cube",
 }
 
 

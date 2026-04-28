@@ -27,6 +27,7 @@ runs/
 output/
 outputs/
 results/
+pick_jiaobang/.curobo_torch_extensions/
 
 # Archives / data
 *.zip

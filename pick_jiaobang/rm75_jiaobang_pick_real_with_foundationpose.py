@@ -2175,6 +2175,8 @@ def lift_scene_obstacles_above_table_if_needed(env, demo, *, min_clearance: floa
 
     lifted_count = 0
     for item in scene_obstacles:
+        if bool(item.get("placed", False)):
+            continue
         actor_name = str(item.get("actor_name", "") or "")
         actor = actors_by_name.get(actor_name)
         asset_file = item.get("asset_file")
@@ -2250,6 +2252,8 @@ def snap_scene_obstacles_flat_on_table_if_needed(env, demo, args, *, min_clearan
 
     snapped_count = 0
     for item in scene_obstacles:
+        if bool(item.get("placed", False)):
+            continue
         actor_name = str(item.get("actor_name", "") or "")
         actor = actors_by_name.get(actor_name)
         asset_file = item.get("asset_file")

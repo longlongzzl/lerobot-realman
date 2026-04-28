@@ -10,11 +10,12 @@ from typing import Any
 import numpy as np
 
 import rm75_jiaobang_pick_place_targeted as targeted
-from curobo_rm75_planner import RM75CuRoboPlanner, RM75CuRoboPlannerConfig
+from curobo_rm75_planner import DEFAULT_CUDA_ARCH_LIST, RM75CuRoboPlanner, RM75CuRoboPlannerConfig
 from object_specs import normalize_object_name
 
 
 _PLANNER_CACHE: dict[tuple[Any, ...], RM75CuRoboPlanner] = {}
+DEFAULT_TORCH_EXTENSIONS_DIR = Path(__file__).resolve().parent / ".curobo_torch_extensions"
 
 
 def build_arg_parser():
@@ -106,14 +107,20 @@ def build_arg_parser():
     parser.add_argument(
         "--curobo-torch-extensions-dir",
         type=Path,
-        default=Path("/tmp/curobo_torch_extensions"),
-        help="Writable directory for torch JIT CUDA extensions used by cuRobo.",
+        default=DEFAULT_TORCH_EXTENSIONS_DIR,
+        help=(
+            "Writable persistent directory for torch JIT CUDA extensions used by cuRobo. "
+            "Use the same path in headless and manual runs to avoid recompiling kernels."
+        ),
     )
     parser.add_argument(
         "--curobo-cuda-arch-list",
         type=str,
-        default=None,
-        help="Optional TORCH_CUDA_ARCH_LIST override for cuRobo compilation.",
+        default=DEFAULT_CUDA_ARCH_LIST,
+        help=(
+            "TORCH_CUDA_ARCH_LIST for cuRobo compilation. Defaults to 12.0 for the local sm_120 GPU; "
+            "override this if running on a different GPU."
+        ),
     )
     parser.add_argument(
         "--curobo-num-ik-seeds",
@@ -179,7 +186,7 @@ def build_arg_parser():
 
 
 def _configure_curobo_torch_extensions(args) -> None:
-    ext_dir = Path(getattr(args, "curobo_torch_extensions_dir", Path("/tmp/curobo_torch_extensions"))).expanduser().resolve()
+    ext_dir = Path(getattr(args, "curobo_torch_extensions_dir", DEFAULT_TORCH_EXTENSIONS_DIR)).expanduser().resolve()
     ext_dir.mkdir(parents=True, exist_ok=True)
     prev = os.environ.get("TORCH_EXTENSIONS_DIR")
     os.environ["TORCH_EXTENSIONS_DIR"] = str(ext_dir)

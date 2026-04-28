@@ -816,14 +816,12 @@ class RM75JiaobangPickMove:
         if axis_x_world is None or axis_y_world is None or axis_z_world is None:
             raise RuntimeError("Failed to compute object local axes from quaternion.")
 
-        # 物体局部 xy 平面的法向就是局部 z 轴。
-        # TCP 的 approaching 轴取 -normal，这样是“垂直于物体”，而不是垂直于桌面。
-        approaching = -axis_z_world
-        approaching = normalize(approaching)
-        if approaching is None:
-            raise RuntimeError("Object-plane normal is degenerate.")
+        # Grasp approach is a table/world constraint, not an object-local-Z
+        # constraint.  Always approach from above along world -Z; object axes
+        # are only used to choose the horizontal pad/opening direction.
+        approaching = np.array([0.0, 0.0, -1.0], dtype=np.float64)
 
-        # 闭合方向取物体局部 xy 平面中较短的边。
+        # 闭合方向取物体局部 xy 平面中较短的边，但只使用其世界 XY 投影。
         closing_seed = axis_x_world if sx <= sy else axis_y_world
         closing = closing_seed - np.dot(closing_seed, approaching) * approaching
         closing = normalize(closing)
@@ -890,46 +888,11 @@ class RM75JiaobangPickMove:
         return ortho, closing, approaching
 
     def get_long_axis_adaptive_axes_from_quat(self, quat_wxyz):
-        quat_wxyz = flatten(quat_wxyz)[:4]
-        lo = np.asarray(self.base_env.obj_local_aabb_min[0], dtype=np.float64)
-        hi = np.asarray(self.base_env.obj_local_aabb_max[0], dtype=np.float64)
-        size_local = hi - lo
-        longest_axis_idx = int(np.argmax(size_local))
-
-        R_obj = quaternions.quat2mat(quat_wxyz)
-        long_axis_world = normalize(R_obj[:, longest_axis_idx])
-        if long_axis_world is None:
-            raise RuntimeError("Failed to compute object long axis from quaternion.")
-
-        world_down = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-        approaching = world_down - np.dot(world_down, long_axis_world) * long_axis_world
-        approaching = normalize(approaching)
-        if approaching is None:
-            fallback_seed = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            if abs(np.dot(fallback_seed, long_axis_world)) > 0.9:
-                fallback_seed = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            approaching = fallback_seed - np.dot(fallback_seed, long_axis_world) * long_axis_world
-            approaching = normalize(approaching)
-        if approaching is None:
-            raise RuntimeError("Failed to construct adaptive approach axis from object long axis.")
-
-        ortho = long_axis_world
-        if ortho[0] < 0:
-            ortho = -ortho
-        closing = np.cross(approaching, ortho)
-        closing = normalize(closing)
-        if closing is None:
-            raise RuntimeError("Failed to construct adaptive closing axis from object long axis.")
-
-        ortho = np.cross(closing, approaching)
-        ortho = normalize(ortho)
-        if ortho is None:
-            raise RuntimeError("Failed to re-orthogonalize adaptive long axis.")
-        if np.dot(ortho, long_axis_world) < 0:
-            ortho = -ortho
-            closing = -closing
-
-        return ortho, closing, approaching
+        # Adaptive grasping used to tilt the approach to be perpendicular to
+        # the object long axis.  For this tabletop pipeline that produces
+        # non-vertical grasps on objects such as carriot.  Keep the long-axis
+        # horizontal alignment, but force the approach to world -Z.
+        return self.get_topdown_long_axis_axes_from_quat(quat_wxyz)
 
     def get_grasp_axes_from_quat(self, quat_wxyz):
         grasp_mode = str(getattr(self.args, "grasp_mode", "object_normal") or "object_normal").strip().lower()

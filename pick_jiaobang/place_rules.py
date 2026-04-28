@@ -283,7 +283,12 @@ PLACE_RULES: Dict[str, PlaceRule] = {
     "carriot": make_tabletop_slot_rule(
         "carriot",
         center_y=0.070,
-        rpy_deg=(0.0, 90.0, 0.0),
+        # The carrot mesh is flat on the table with local +Y as the table
+        # normal in the captured scenes. Keep the long axis at 45deg in world
+        # XY, but do not swap the down-facing mesh axis; otherwise the shared
+        # TCP-object relation forces a horizontal/upside-down gripper at one
+        # end of the grasp-place chain.
+        rpy_deg=(180.0, 0.0, 90.0),
         hover_height=0.08,
         release_retreat_height=0.10,
     ),
@@ -303,6 +308,27 @@ PLACE_RULES: Dict[str, PlaceRule] = {
         release_retreat_height=0.10,
         orientation_invariant=True,
     ),
+    # ---------------  roof assembly  ---------------
+    "red_triangle_front": PlaceRule(
+        source_object_name="red_triangle_front",
+        target_object_name="red_bricks_cube",
+        primitive="roof_assembly",
+    ),
+    "red_triangle_back": PlaceRule(
+        source_object_name="red_triangle_back",
+        target_object_name="red_bricks_cube",
+        primitive="roof_assembly",
+    ),
+    "red_triangle_left": PlaceRule(
+        source_object_name="red_triangle_left",
+        target_object_name="red_bricks_cube",
+        primitive="roof_assembly",
+    ),
+    "red_triangle_right": PlaceRule(
+        source_object_name="red_triangle_right",
+        target_object_name="red_bricks_cube",
+        primitive="roof_assembly",
+    ),
 }
 
 PLACE_RULES["gluestick"] = apply_vertical_long_axis_rule_overrides(
@@ -316,8 +342,8 @@ PLACE_RULES["hongshupian"] = apply_vertical_long_axis_rule_overrides(
 PLACE_RULES["lvmukuai"] = PlaceRule(
     **{
         **PLACE_RULES["lvmukuai"].__dict__,
-        "allow_tabletop_yaw_variants": True,
-        "tabletop_axial_spin_deg": (0.0, 90.0, 180.0, 270.0),
+        "allow_tabletop_yaw_variants": False,
+        "tabletop_axial_spin_deg": (),
     }
 )
 PLACE_RULES["carriot"] = PlaceRule(
@@ -329,10 +355,7 @@ PLACE_RULES["carriot"] = PlaceRule(
 PLACE_RULES["shuazi"] = PlaceRule(
     **{
         **PLACE_RULES["shuazi"].__dict__,
-        # Brush placement only requires a flat footprint at the selected desk
-        # slot. In-plane yaw does not move the slot center or lift/tilt the
-        # object, but it gives the grasp-coupled release TCP reachable branches.
-        "allow_tabletop_yaw_variants": True,
+        "allow_tabletop_yaw_variants": False,
     }
 )
 PLACE_RULES["tennis"] = PlaceRule(

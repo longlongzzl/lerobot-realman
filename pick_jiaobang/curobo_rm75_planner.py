@@ -14,7 +14,8 @@ import numpy as np
 
 DEFAULT_CUROBO_ROOT = Path("/home/zhangzhao/PycharmProjects/curobo")
 DEFAULT_RM75_URDF = Path("/home/zhangzhao/Desktop/lerobot/RM75_gripper/RM75-B/urdf/RM75-B.urdf")
-DEFAULT_TORCH_EXTENSIONS_DIR = Path("/tmp/curobo_torch_extensions")
+DEFAULT_TORCH_EXTENSIONS_DIR = Path(__file__).resolve().parent / ".curobo_torch_extensions"
+DEFAULT_CUDA_ARCH_LIST = "12.0"
 
 ARM_JOINT_NAMES = [
     "joint_1",
@@ -46,6 +47,14 @@ TRACKED_LINK_NAMES = [
     "left_pad",
     "right_pad",
 ]
+
+CUROBO_EXTENSION_MODULES = (
+    "kinematics_fused_cu",
+    "geom_cu",
+    "lbfgs_step_cu",
+    "line_search_cu",
+    "tensor_step_cu",
+)
 
 DEFAULT_RETRACT_CONFIG = [
     float(np.pi / 2.0),
@@ -80,7 +89,7 @@ class RM75CuRoboPlannerConfig:
     ee_link: str = "gripper_tcp"
     device: str = "cuda:0"
     torch_extensions_dir: Path = DEFAULT_TORCH_EXTENSIONS_DIR
-    cuda_arch_list: Optional[str] = None
+    cuda_arch_list: Optional[str] = DEFAULT_CUDA_ARCH_LIST
     gripper_lock: float = 0.6
     num_ik_seeds: int = 64
     num_trajopt_seeds: int = 1
@@ -587,6 +596,69 @@ class RM75CuRoboPlanner:
             debug={
                 "motion_gen_internal_ik_successes": motion_ik_successes,
                 "interpolation_dt": float(result.interpolation_dt),
+            },
+        )
+
+    def plan_to_joint_state(
+        self,
+        start_q: Sequence[float],
+        goal_q: Sequence[float],
+        *,
+        enable_graph: bool = False,
+        max_attempts: int = 2,
+        timeout: float = 5.0,
+        num_trajopt_seeds: Optional[int] = None,
+        num_graph_seeds: Optional[int] = None,
+    ) -> CuRoboPlanResult:
+        start_q_np = self._normalize_q(start_q)
+        goal_q_np = self._normalize_q(goal_q)
+        start_state = self._make_start_state(start_q_np)
+        goal_state = self._make_start_state(goal_q_np)
+
+        use_num_trajopt_seeds = (
+            self.config.num_trajopt_seeds if num_trajopt_seeds is None else int(num_trajopt_seeds)
+        )
+        use_num_graph_seeds = (
+            self.config.num_graph_seeds if num_graph_seeds is None else int(num_graph_seeds)
+        )
+
+        plan_config = self.mods["MotionGenPlanConfig"](
+            enable_graph=bool(enable_graph),
+            enable_opt=True,
+            max_attempts=int(max_attempts),
+            timeout=float(timeout),
+            num_graph_seeds=use_num_graph_seeds,
+            num_trajopt_seeds=use_num_trajopt_seeds,
+        )
+
+        self.motion_gen.reset_seed()
+        result = self.motion_gen.plan_single_js(start_state, goal_state, plan_config)
+        success = bool(result.success.reshape(-1)[0].item())
+        status = None if result.status is None else str(result.status)
+        if not success:
+            return CuRoboPlanResult(
+                success=False,
+                status=status,
+                solve_time=float(result.solve_time),
+                ik_time=float(getattr(result, "ik_time", 0.0) or 0.0),
+                trajopt_time=float(result.trajopt_time),
+                raw_result=result,
+            )
+
+        traj = result.get_interpolated_plan()
+        q_path = self._to_numpy(traj.position).astype(np.float32)
+        return CuRoboPlanResult(
+            success=True,
+            status=status,
+            goal_joint=np.asarray(q_path[-1], dtype=np.float32),
+            joint_path=q_path,
+            solve_time=float(result.solve_time),
+            ik_time=float(getattr(result, "ik_time", 0.0) or 0.0),
+            trajopt_time=float(result.trajopt_time),
+            raw_result=result,
+            debug={
+                "interpolation_dt": float(result.interpolation_dt),
+                "target_joint_error": float(np.max(np.abs(np.asarray(q_path[-1], dtype=np.float32) - goal_q_np))),
             },
         )
 
@@ -1562,7 +1634,7 @@ class RM75CuRoboPlanner:
     def _prepare_runtime_env(self) -> None:
         torch_extensions_dir = self.config.torch_extensions_dir.expanduser().resolve()
         torch_extensions_dir.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(torch_extensions_dir))
+        os.environ["TORCH_EXTENSIONS_DIR"] = str(torch_extensions_dir)
         if self.config.cuda_arch_list:
             os.environ["TORCH_CUDA_ARCH_LIST"] = str(self.config.cuda_arch_list)
         elif "TORCH_CUDA_ARCH_LIST" not in os.environ:
@@ -1582,6 +1654,32 @@ class RM75CuRoboPlanner:
                     os.environ["TORCH_CUDA_ARCH_LIST"] = ";".join(arch_list)
             except Exception:
                 pass
+        self._register_cached_curobo_extensions(torch_extensions_dir)
+
+    def _register_cached_curobo_extensions(self, torch_extensions_dir: Path) -> None:
+        """Let cuRobo's package import find project-local JIT extension .so files.
+
+        cuRobo first tries `from curobo.curobolib import *_cu` and only then
+        falls back to `torch.utils.cpp_extension.load()`.  Adding each cached
+        extension directory to `curobo.curobolib.__path__` makes that first
+        import succeed, so warm caches do not print misleading "JIT compiling"
+        messages or take the JIT fallback path.
+        """
+        try:
+            import curobo.curobolib as curobolib
+        except Exception:
+            return
+        package_path = getattr(curobolib, "__path__", None)
+        if package_path is None:
+            return
+        for module_name in CUROBO_EXTENSION_MODULES:
+            module_dir = torch_extensions_dir / module_name
+            module_so = module_dir / f"{module_name}.so"
+            if not module_so.is_file():
+                continue
+            module_dir_str = str(module_dir)
+            if module_dir_str not in package_path:
+                package_path.append(module_dir_str)
 
     def _ensure_curobo_on_path(self, curobo_root: Path) -> None:
         src_dir = curobo_root.expanduser().resolve() / "src"

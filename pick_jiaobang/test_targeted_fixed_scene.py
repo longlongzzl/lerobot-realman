@@ -328,7 +328,14 @@ def main() -> None:
                 post_final_grace_seconds=float(args.post_final_grace_seconds),
                 object_name=object_name,
             )
-            success = returncode == 0 and "final success = True" in stdout
+            final_success_seen = "final success = True" in stdout
+            benign_post_success_x_error = (
+                final_success_seen
+                and returncode != 0
+                and "X Error of failed request:" in stdout
+                and "BadWindow" in stdout
+            )
+            success = (returncode == 0 and final_success_seen) or benign_post_success_x_error
             effective_returncode = 0 if success else (returncode if returncode != 0 else 1)
             failure_code = "ok"
             failure_detail = ""
