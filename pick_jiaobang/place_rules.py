@@ -294,7 +294,7 @@ PLACE_RULES: Dict[str, PlaceRule] = {
     ),
     "gluestick": make_tabletop_slot_rule(
         "gluestick",
-        center_y=0.12,
+        center_y=0.10,
         rpy_deg=(0.0, 0.0, 0.0),
         hover_height=0.12,
         release_retreat_height=0.12,

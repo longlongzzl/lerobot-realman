@@ -125,7 +125,7 @@ def build_arg_parser():
     parser.add_argument(
         "--target-selection-order",
         choices=("random", "risk_aware"),
-        default="random",
+        default="risk_aware",
         help="How to choose among rule-enabled targets. risk_aware keeps randomness inside priority groups but tries small/easily-blocked objects before bulky placed obstacles.",
     )
     parser.add_argument(
@@ -497,6 +497,12 @@ def _build_targeted_place_staging_pose(demo, pre_place_pose, args) -> Pose:
     return base.make_pose_with_position(pre_place_pose, tcp_p)
 
 
+def _target_place_up_axis(rule: PlaceRule, T_world_target: np.ndarray) -> np.ndarray | None:
+    if rule.primitive == "place_on_slots" and normalize_object_name(rule.target_object_name) == "desk":
+        return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return _normalize(np.asarray(T_world_target[:3, 1], dtype=np.float32).reshape(3))
+
+
 def _make_tabletop_place_world_pose_variants(
     demo,
     bridge_mod,
@@ -525,7 +531,7 @@ def _make_tabletop_place_world_pose_variants(
         yaw_degs = [0.0]
     yaw_degs = sorted(yaw_degs, key=lambda d: (abs(float(d)), float(d)))
 
-    up_axis = _normalize(T_world_target[:3, 1])
+    up_axis = _target_place_up_axis(rule, T_world_target)
     robot_base_T = bridge_mod.get_robot_base_transform(demo.env)
     robot_pos = None if robot_base_T is None else np.asarray(robot_base_T[:3, 3], dtype=np.float32).reshape(3)
     if up_axis is None or robot_pos is None:
@@ -629,7 +635,7 @@ def build_targeted_place_plan_variants(
             f"Failed to resolve the world pose of destination object {target_name}. "
             "Make sure it is captured into the scene cache."
         )
-    target_up_axis = _normalize(np.asarray(T_world_target[:3, 1], dtype=np.float32).reshape(3))
+    target_up_axis = _target_place_up_axis(rule, T_world_target)
 
     if T_tcp_obj_override is None:
         T_tcp_obj = _current_tcp_to_object_transform(demo)
@@ -1632,18 +1638,18 @@ def main():
                 break
             if failed_targets_this_cycle:
                 print(
-                    f"\n[cycle {cycle_idx}] random target pool after failures: {target_candidates}; "
+                    f"\n[cycle {cycle_idx}] target pool after failures: {target_candidates}; "
                     f"failed_this_cycle={sorted(failed_targets_this_cycle)}, "
                     f"deferred_failed={sorted(deferred_failed_targets)}"
                 )
             elif deferred_failed_targets:
                 print(
-                    f"\n[cycle {cycle_idx}] random target pool: {target_candidates}; "
+                    f"\n[cycle {cycle_idx}] target pool: {target_candidates}; "
                     f"deferred_failed={sorted(deferred_failed_targets)}"
                 )
             else:
-                print(f"\n[cycle {cycle_idx}] random target pool: {target_candidates}")
-            print(f"[cycle {cycle_idx}] randomly selected target object: {selected_name}")
+                print(f"\n[cycle {cycle_idx}] target pool: {target_candidates}")
+            print(f"[cycle {cycle_idx}] selected target object: {selected_name}")
             rule = get_place_rule(selected_name)
             if rule is None:
                 final_ok = False

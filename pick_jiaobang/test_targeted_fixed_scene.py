@@ -30,6 +30,15 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--child-python", type=Path, default=DEFAULT_CHILD_PYTHON)
     parser.add_argument("--objects", nargs="*", default=None, help="Optional subset of source objects to test.")
+    parser.add_argument(
+        "--obstacles",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional fixed obstacle object names to pass to the child for every tested object. "
+            "If omitted, all scene objects except the current target are used."
+        ),
+    )
     parser.add_argument("--render-mode", type=str, default="none")
     parser.add_argument("--repetitions", type=int, default=1, help="Run each selected object this many times.")
     parser.add_argument("--log-dir", type=Path, default=None, help="Directory to store per-object child logs.")
@@ -253,6 +262,9 @@ def _build_child_cmd(
         "--fixed-scene-strict",
         "--no-reselect-target-on-planning-failure",
         "--auto-execute",
+        "--no-preview-trajectory-before-confirm",
+        "--trajectory-preview-sleep",
+        "0",
         "--render-mode",
         render_mode,
         "--seed",
@@ -303,9 +315,15 @@ def main() -> None:
     )
 
     results: list[dict] = []
+    fixed_obstacles = None
+    if args.obstacles is not None:
+        fixed_obstacles = [str(name) for name in args.obstacles if str(name)]
     for repetition in range(1, repetitions + 1):
         for index, object_name in enumerate(test_objects, start=1):
-            obstacle_names = [name for name in scene_object_names if name != object_name]
+            if fixed_obstacles is None:
+                obstacle_names = [name for name in scene_object_names if name != object_name]
+            else:
+                obstacle_names = [name for name in fixed_obstacles if name != object_name]
             print(
                 f"\n[test] repetition {repetition}/{repetitions} object {index}/{len(test_objects)}: "
                 f"{object_name} obstacles={obstacle_names}"

@@ -2654,9 +2654,11 @@ def render_planned_trajectory_preview(demo, bridge_mod, label: str, q_preview_pa
 
 
 def confirm_planned_motion_or_skip(demo, bridge_mod, label: str, target_pose, q_target, args, *, q_preview_path=None) -> bool:
+    headless_auto = bool(getattr(args, "auto_execute", False))
+    can_render_preview = getattr(args, "render_mode", None) == "human" and not headless_auto
     if bool(getattr(args, "_skip_remaining_step_confirms_in_object", False)):
-        demo.preview_target_pose(target_pose)
-        if args.render_mode == "human":
+        if can_render_preview:
+            demo.preview_target_pose(target_pose)
             bridge_mod.render_preview(demo.env, repeats=3)
         print(f"\n[planned {label}]")
         print("target p:", np.round(flatten_np(target_pose.p)[:3], 6))
@@ -2664,7 +2666,8 @@ def confirm_planned_motion_or_skip(demo, bridge_mod, label: str, target_pose, q_
         print("planned arm q:", np.round(flatten_np(q_target)[:7], 6))
         print(f"[confirm] auto-approved {label} because single-confirm-per-object is active")
         return True
-    demo.preview_target_pose(target_pose)
+    if can_render_preview:
+        demo.preview_target_pose(target_pose)
     if q_preview_path is None:
         q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
         q_preview_path = _build_linear_preview_path(
@@ -2673,7 +2676,8 @@ def confirm_planned_motion_or_skip(demo, bridge_mod, label: str, target_pose, q_
             max_frames=int(getattr(args, "trajectory_preview_max_frames", 80)),
         )
     render_planned_trajectory_preview(demo, bridge_mod, label, q_preview_path, args)
-    bridge_mod.render_preview(demo.env, repeats=3)
+    if can_render_preview:
+        bridge_mod.render_preview(demo.env, repeats=3)
 
     print(f"\n[planned {label}]")
     print("target p:", np.round(flatten_np(target_pose.p)[:3], 6))
