@@ -3,9 +3,15 @@ from __future__ import annotations
 
 import re
 import atexit
+import copy
+import gc
 import json
 import time
 import os
+import sys
+import threading
+import traceback
+import types
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,12 +25,22 @@ import rm75_jiaobang_pick_place_targeted_curobo as curobo_wrapper
 _PROFILE_RECORDS: list[dict] = []
 _PROFILE_PATH: Path | None = None
 _PROFILE_REGISTERED = False
+_PROFILE_RUN_HEADER_WRITTEN = False
 _PROFILE_COUNTERS: Counter = Counter()
+_PROFILE_IK_BATCH_SIZE_HIST: Counter = Counter()
+_PROFILE_THREAD_LOCAL = threading.local()
+_CUROBO_GPU_LOCK = threading.RLock()
 _PROFILE_COUNTER_FIELDS = (
     "ik_batch_call_count",
+    "ik_goal_count",
+    "ik_cuda_graph_solve_count",
+    "ik_cuda_graph_requested_goal_count",
+    "ik_cuda_graph_padded_goal_count",
     "motiongen_call_count",
     "constrained_linear_call_count",
     "graph_call_count",
+    "prefilter_q_goal_motiongen_count",
+    "prefilter_q_goal_success_count",
     "timeout_count",
     "fallback_count",
     "world_refresh_count",
@@ -39,8 +55,16 @@ def _jsonable(value):
         return value.tolist()
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, (set, tuple)):
-        return list(value)
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, SimpleNamespace):
+        return _jsonable(vars(value))
+    if isinstance(value, types.ModuleType):
+        return f"<module {getattr(value, '__name__', 'unknown')}>"
+    if callable(value):
+        return f"<callable {getattr(value, '__name__', type(value).__name__)}>"
     return value
 
 
@@ -51,11 +75,27 @@ def _profile_enabled(args) -> bool:
 def _bump_profile_counter(name: str, amount: int = 1) -> None:
     if not name or amount == 0:
         return
+    if bool(getattr(_PROFILE_THREAD_LOCAL, "suspend_counters", False)):
+        return
     _PROFILE_COUNTERS[str(name)] += int(amount)
+
+
+@contextmanager
+def _suspend_profile_counters_for_thread():
+    prev = bool(getattr(_PROFILE_THREAD_LOCAL, "suspend_counters", False))
+    _PROFILE_THREAD_LOCAL.suspend_counters = True
+    try:
+        yield
+    finally:
+        _PROFILE_THREAD_LOCAL.suspend_counters = prev
 
 
 def _snapshot_profile_counters() -> Counter:
     return Counter(_PROFILE_COUNTERS)
+
+
+def _snapshot_profile_ik_batch_size_hist() -> Counter:
+    return Counter(_PROFILE_IK_BATCH_SIZE_HIST)
 
 
 def _profile_counter_delta(start: Counter) -> dict[str, int]:
@@ -63,6 +103,12 @@ def _profile_counter_delta(start: Counter) -> dict[str, int]:
         key: int(_PROFILE_COUNTERS.get(key, 0) - start.get(key, 0))
         for key in _PROFILE_COUNTER_FIELDS
     }
+
+
+def _profile_ik_batch_size_hist_delta(start: Counter) -> dict[str, int]:
+    delta = Counter(_PROFILE_IK_BATCH_SIZE_HIST)
+    delta.subtract(start)
+    return {str(key): int(value) for key, value in sorted(delta.items(), key=lambda kv: int(kv[0])) if int(value) > 0}
 
 
 def _copy_last_candidate_counts_to_profile(prof: dict, planner) -> None:
@@ -93,21 +139,71 @@ def _graph_enabled_from_kwargs(kwargs: dict) -> bool:
     return bool(kwargs.get("enable_graph", False))
 
 
-def _profile_solve_batch_start_goal_ik(planner, *args, **kwargs):
+def _get_or_create_curobo_planner_serialized(args):
+    # cuRobo CUDA graph capture is process-global enough that background planner
+    # creation can trip over an active foreground capture. Keep GPU-facing cuRobo
+    # entry points serialized; background work still runs during robot execution.
+    with _CUROBO_GPU_LOCK:
+        return curobo_wrapper._get_or_create_curobo_planner(args)
+
+
+def _count_ik_batch_result_details(results) -> None:
+    seen_cuda_graph_chunks: set[int] = set()
+    for result in list(results or []):
+        debug = getattr(result, "debug", None)
+        if not isinstance(debug, dict) or not bool(debug.get("cuda_graph_batch", False)):
+            continue
+        chunk_index = int(debug.get("cuda_graph_chunk_index", 0) or 0)
+        if chunk_index in seen_cuda_graph_chunks:
+            continue
+        seen_cuda_graph_chunks.add(chunk_index)
+        _bump_profile_counter("ik_cuda_graph_solve_count")
+        _bump_profile_counter("ik_cuda_graph_requested_goal_count", int(debug.get("requested_batch_size", 0) or 0))
+        _bump_profile_counter("ik_cuda_graph_padded_goal_count", int(debug.get("fixed_batch_size", 0) or 0))
+
+
+def _profile_solve_batch_start_goal_ik(planner, *call_args, **kwargs):
     _bump_profile_counter("ik_batch_call_count")
-    return planner.solve_batch_start_goal_ik(*args, **kwargs)
+    goal_poses = call_args[1] if len(call_args) > 1 else kwargs.get("goal_poses", [])
+    try:
+        goal_count = len(goal_poses or [])
+    except TypeError:
+        goal_count = 0
+    _bump_profile_counter("ik_goal_count", goal_count)
+    if goal_count > 0:
+        _PROFILE_IK_BATCH_SIZE_HIST[str(goal_count)] += 1
+    with _CUROBO_GPU_LOCK:
+        results = planner.solve_batch_start_goal_ik(*call_args, **kwargs)
+    _count_ik_batch_result_details(results)
+    return results
 
 
 def _profile_solve_ik(planner, *args, **kwargs):
     _bump_profile_counter("ik_batch_call_count")
-    return planner.solve_ik(*args, **kwargs)
+    _bump_profile_counter("ik_goal_count")
+    _PROFILE_IK_BATCH_SIZE_HIST["1"] += 1
+    with _CUROBO_GPU_LOCK:
+        return planner.solve_ik(*args, **kwargs)
+
+
+def _profile_fast_chain_solve_batch_start_goal_ik(args, planner, start_qs, goal_poses, *, num_seeds: int):
+    return _profile_solve_batch_start_goal_ik(
+        planner,
+        start_qs,
+        goal_poses,
+        num_seeds=int(num_seeds),
+        use_cuda_graph_batch=bool(getattr(args, "fast_chain_cuda_graph_ik", False)),
+        cuda_graph_batch_size=int(getattr(args, "fast_chain_cuda_graph_ik_max_batch_size", 128) or 0),
+        cuda_graph_fixed_batch_size=int(getattr(args, "fast_chain_cuda_graph_ik_fixed_batch_size", 16) or 0),
+    )
 
 
 def _profile_plan_to_pose(planner, *args, **kwargs):
     _bump_profile_counter("motiongen_call_count")
     if _graph_enabled_from_kwargs(kwargs):
         _bump_profile_counter("graph_call_count")
-    result = planner.plan_to_pose(*args, **kwargs)
+    with _CUROBO_GPU_LOCK:
+        result = planner.plan_to_pose(*args, **kwargs)
     _count_motiongen_result(result)
     return result
 
@@ -121,7 +217,8 @@ def _profile_plan_constrained_linear_to_pose(planner, *args, **kwargs):
     short constrained-line primitives on the selected pair.
     """
     _bump_profile_counter("constrained_linear_call_count")
-    result = planner.plan_to_pose(*args, **kwargs)
+    with _CUROBO_GPU_LOCK:
+        result = planner.plan_to_pose(*args, **kwargs)
     _count_motiongen_result(result)
     return result
 
@@ -130,7 +227,8 @@ def _profile_plan_to_joint_state(planner, *args, **kwargs):
     _bump_profile_counter("motiongen_call_count")
     if _graph_enabled_from_kwargs(kwargs):
         _bump_profile_counter("graph_call_count")
-    result = planner.plan_to_joint_state(*args, **kwargs)
+    with _CUROBO_GPU_LOCK:
+        result = planner.plan_to_joint_state(*args, **kwargs)
     _count_motiongen_result(result)
     return result
 
@@ -139,7 +237,8 @@ def _profile_plan_goalset_to_poses(planner, *args, **kwargs):
     _bump_profile_counter("motiongen_call_count")
     if _graph_enabled_from_kwargs(kwargs):
         _bump_profile_counter("graph_call_count")
-    result = planner.plan_goalset_to_poses(*args, **kwargs)
+    with _CUROBO_GPU_LOCK:
+        result = planner.plan_goalset_to_poses(*args, **kwargs)
     _count_motiongen_result(result)
     return result
 
@@ -148,7 +247,8 @@ def _profile_plan_batch_to_poses(planner, *args, **kwargs):
     _bump_profile_counter("motiongen_call_count")
     if _graph_enabled_from_kwargs(kwargs):
         _bump_profile_counter("graph_call_count")
-    results = planner.plan_batch_to_poses(*args, **kwargs)
+    with _CUROBO_GPU_LOCK:
+        results = planner.plan_batch_to_poses(*args, **kwargs)
     for result in list(results or []):
         _count_motiongen_result(result)
     return results
@@ -158,7 +258,8 @@ def _profile_plan_batch_start_goal_pairs(planner, *args, **kwargs):
     _bump_profile_counter("motiongen_call_count")
     if _graph_enabled_from_kwargs(kwargs):
         _bump_profile_counter("graph_call_count")
-    results = planner.plan_batch_start_goal_pairs(*args, **kwargs)
+    with _CUROBO_GPU_LOCK:
+        results = planner.plan_batch_start_goal_pairs(*args, **kwargs)
     for result in list(results or []):
         _count_motiongen_result(result)
     return results
@@ -168,9 +269,79 @@ def _profile_object_name(args) -> str:
     return str(getattr(args, "object_name", "") or "unknown")
 
 
+def _safe_profile_filename_part(value, *, fallback: str = "run", max_len: int = 80) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._-")
+    if not text:
+        text = fallback
+    return text[:max_len] or fallback
+
+
+def _profile_run_name(args) -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    target = curobo_wrapper.normalize_object_name(getattr(args, "object_name", None))
+    if target is None:
+        cycle_names = list(getattr(args, "cycle_object_names", None) or [])
+        target = f"cycle{len(cycle_names)}" if cycle_names else "run"
+    target_part = _safe_profile_filename_part(target, fallback="run", max_len=48)
+    return f"{timestamp}_{target_part}_pid{os.getpid()}.jsonl"
+
+
+def _profile_auto_path(args) -> Path:
+    raw_jsonl = getattr(args, "planning_profile_jsonl", None)
+    if raw_jsonl:
+        requested = Path(str(raw_jsonl)).expanduser()
+        raw_text = str(raw_jsonl)
+        if raw_text.endswith(("/", os.sep)) or requested.suffix.lower() != ".jsonl":
+            profile_dir = requested
+        else:
+            return requested
+    else:
+        profile_dir = Path(
+            str(getattr(args, "planning_profile_dir", "planning_profile_logs") or "planning_profile_logs")
+        ).expanduser()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    path = profile_dir / _profile_run_name(args)
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for idx in range(1, 1000):
+        candidate = profile_dir / f"{stem}_{idx:03d}{suffix}"
+        if not candidate.exists():
+            return candidate
+    return profile_dir / f"{stem}_{time.time_ns()}{suffix}"
+
+
 def _profile_path(args) -> Path:
-    raw = str(getattr(args, "planning_profile_jsonl", "planning_profile.jsonl") or "planning_profile.jsonl")
-    return Path(raw).expanduser()
+    return _profile_auto_path(args)
+
+
+def _profile_args_snapshot(args) -> dict:
+    raw = dict(vars(args)) if hasattr(args, "__dict__") else {}
+    return {str(k): _jsonable(v) for k, v in sorted(raw.items(), key=lambda kv: str(kv[0]))}
+
+
+def _write_profile_run_header(args) -> None:
+    global _PROFILE_RUN_HEADER_WRITTEN
+    if _PROFILE_RUN_HEADER_WRITTEN or _PROFILE_PATH is None:
+        return
+    record = {
+        "ts": time.time(),
+        "object_name": "__run__",
+        "stage_name": "run_config",
+        "success": True,
+        "status": "STARTED",
+        "argv": list(sys.argv),
+        "cwd": str(Path.cwd()),
+        "pid": os.getpid(),
+        "profile_jsonl": str(_PROFILE_PATH),
+        "args": _profile_args_snapshot(args),
+    }
+    with _PROFILE_PATH.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    _PROFILE_RECORDS.append(record)
+    _PROFILE_RUN_HEADER_WRITTEN = True
 
 
 def _ensure_profile(args) -> None:
@@ -181,9 +352,28 @@ def _ensure_profile(args) -> None:
         _PROFILE_PATH = _profile_path(args)
         if _PROFILE_PATH.parent != Path("."):
             _PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _write_profile_run_header(args)
     if not _PROFILE_REGISTERED:
         atexit.register(_print_profile_summary)
         _PROFILE_REGISTERED = True
+
+
+@contextmanager
+def _profile_record_context(**fields):
+    prev = getattr(_PROFILE_THREAD_LOCAL, "record_context", None)
+    merged = dict(prev or {})
+    merged.update({str(k): v for k, v in fields.items() if v is not None})
+    _PROFILE_THREAD_LOCAL.record_context = merged
+    try:
+        yield
+    finally:
+        if prev is None:
+            try:
+                delattr(_PROFILE_THREAD_LOCAL, "record_context")
+            except AttributeError:
+                pass
+        else:
+            _PROFILE_THREAD_LOCAL.record_context = prev
 
 
 def _record_profile(args, stage_name: str, **fields) -> None:
@@ -195,6 +385,9 @@ def _record_profile(args, stage_name: str, **fields) -> None:
         "object_name": _profile_object_name(args),
         "stage_name": str(stage_name),
     }
+    context_fields = getattr(_PROFILE_THREAD_LOCAL, "record_context", None)
+    if isinstance(context_fields, dict):
+        record.update({str(k): _jsonable(v) for k, v in context_fields.items() if v is not None})
     record.update({str(k): _jsonable(v) for k, v in fields.items() if v is not None})
     _PROFILE_RECORDS.append(record)
     if _PROFILE_PATH is not None:
@@ -202,10 +395,23 @@ def _record_profile(args, stage_name: str, **fields) -> None:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
+def _record_prefetch_profile(base_args, object_name, stage_name: str, **fields) -> None:
+    object_name = curobo_wrapper.normalize_object_name(object_name) or str(object_name or "prefetch")
+    fields.setdefault("is_prefetch", True)
+    profile_args = SimpleNamespace(
+        object_name=object_name,
+        planning_profile_enabled=bool(getattr(base_args, "planning_profile_enabled", True)),
+        planning_profile_jsonl=getattr(base_args, "planning_profile_jsonl", None),
+        planning_profile_dir=getattr(base_args, "planning_profile_dir", "planning_profile_logs"),
+    )
+    _record_profile(profile_args, stage_name, **fields)
+
+
 @contextmanager
 def _profile_stage(args, stage_name: str, **fields):
     start_t = time.perf_counter()
     counter_start = _snapshot_profile_counters()
+    ik_batch_hist_start = _snapshot_profile_ik_batch_size_hist()
     rec = dict(fields)
     try:
         yield rec
@@ -216,8 +422,12 @@ def _profile_stage(args, stage_name: str, **fields):
         raise
     finally:
         rec["elapsed_ms"] = round((time.perf_counter() - start_t) * 1000.0, 3)
-        for key, value in _profile_counter_delta(counter_start).items():
-            rec.setdefault(key, value)
+        if not bool(getattr(_PROFILE_THREAD_LOCAL, "suspend_counters", False)):
+            for key, value in _profile_counter_delta(counter_start).items():
+                rec.setdefault(key, value)
+            ik_batch_size_hist = _profile_ik_batch_size_hist_delta(ik_batch_hist_start)
+            if ik_batch_size_hist:
+                rec.setdefault("ik_batch_size_hist", ik_batch_size_hist)
         if "candidate_count" in rec and "candidate_count_in" not in rec:
             rec["candidate_count_in"] = rec.get("candidate_count")
         _record_profile(args, stage_name, **rec)
@@ -228,6 +438,8 @@ def _print_profile_summary() -> None:
         return
     grouped: dict[tuple[str, str], list[dict]] = {}
     for rec in _PROFILE_RECORDS:
+        if str(rec.get("stage_name", "")) == "run_config":
+            continue
         grouped.setdefault((str(rec.get("object_name", "?")), str(rec.get("stage_name", "?"))), []).append(rec)
     rows = []
     for (obj, stage), items in grouped.items():
@@ -326,8 +538,17 @@ def build_arg_parser():
     parser.add_argument(
         "--planning-profile-jsonl",
         type=str,
-        default="planning_profile.jsonl",
-        help="Append one JSON record per planning stage to this JSONL file.",
+        default=None,
+        help=(
+            "Write planning profile JSONL to this explicit file. "
+            "If omitted, a timestamped file is created under --planning-profile-dir."
+        ),
+    )
+    parser.add_argument(
+        "--planning-profile-dir",
+        type=str,
+        default="planning_profile_logs",
+        help="Directory for per-run timestamped planning profile JSONL files.",
     )
     parser.add_argument(
         "--planning-profile",
@@ -564,7 +785,7 @@ def build_arg_parser():
         "--joint-search-fallback-enable-graph",
         dest="joint_search_fallback_enable_graph",
         action="store_true",
-        default=True,
+        default=False,
         help="Enable cuRobo graph planning during the generic joint-search fallback pass after trajopt-only transport screening fails.",
     )
     parser.add_argument(
@@ -602,6 +823,43 @@ def build_arg_parser():
         type=float,
         default=8.0,
         help="Timeout in seconds for the generic joint-search fallback pass.",
+    )
+    parser.add_argument(
+        "--transport-use-prefilter-q-goal",
+        dest="transport_use_prefilter_q_goal",
+        action="store_true",
+        default=True,
+        help="Before pose MotionGen in transport-hover, try the already-screened IK q_hover/q_goal with joint-space MotionGen.",
+    )
+    parser.add_argument(
+        "--no-transport-use-prefilter-q-goal",
+        dest="transport_use_prefilter_q_goal",
+        action="store_false",
+        help="Disable the transport-hover joint-space trial that reuses the IK prefilter q goal.",
+    )
+    parser.add_argument(
+        "--transport-prefilter-q-goal-max-trials",
+        type=int,
+        default=1,
+        help="Maximum number of IK-prefiltered q goals to try with joint-space MotionGen before falling back to pose MotionGen.",
+    )
+    parser.add_argument(
+        "--transport-prefilter-q-goal-timeout",
+        type=float,
+        default=2.0,
+        help="Timeout in seconds for each transport-hover joint-space q_goal trial.",
+    )
+    parser.add_argument(
+        "--transport-prefilter-q-goal-max-attempts",
+        type=int,
+        default=1,
+        help="MotionGen attempts for each transport-hover joint-space q_goal trial.",
+    )
+    parser.add_argument(
+        "--transport-prefilter-q-goal-num-trajopt-seeds",
+        type=int,
+        default=1,
+        help="Trajectory optimization seeds for each transport-hover joint-space q_goal trial.",
     )
     parser.add_argument(
         "--fast-chain-screening",
@@ -670,10 +928,133 @@ def build_arg_parser():
         ),
     )
     parser.add_argument(
+        "--fast-chain-place-rank-grasp-limit",
+        type=int,
+        default=3,
+        help=(
+            "Maximum cheap-IK grasp candidates allowed to build/rank place candidates in winner-chain preselect. "
+            "Set <=0 to rank place candidates for every grasp with valid pregrasp/grasp IK."
+        ),
+    )
+    parser.add_argument(
+        "--fast-chain-place-ik-chunk-candidates",
+        type=int,
+        default=8,
+        help=(
+            "Number of place candidates to IK-rank per fast-chain batch. "
+            "Each candidate contributes hover+release goals, so the default 8 maps to a fixed CUDA graph IK batch of 16."
+        ),
+    )
+    parser.add_argument(
+        "--fast-chain-place-ik-early-stop",
+        dest="fast_chain_place_ik_early_stop",
+        action="store_true",
+        default=True,
+        help="Stop fast-chain place IK ranking once the current grasp has enough valid ranked place candidates.",
+    )
+    parser.add_argument(
+        "--no-fast-chain-place-ik-early-stop",
+        dest="fast_chain_place_ik_early_stop",
+        action="store_false",
+        help="Rank all fast-chain place IK candidates even after enough valid candidates are found.",
+    )
+    parser.add_argument(
         "--fast-chain-ik-seeds",
         type=int,
         default=32,
         help="IK seeds used by the fast-chain ranking pass.",
+    )
+    parser.add_argument(
+        "--fast-chain-cuda-graph-ik",
+        dest="fast_chain_cuda_graph_ik",
+        action="store_true",
+        default=True,
+        help=(
+            "Use fixed-size cuRobo CUDA graph batch IK for fast-chain IK screening. "
+            "Enabled by default; use --no-fast-chain-cuda-graph-ik to fall back to eager cuRobo batch IK."
+        ),
+    )
+    parser.add_argument(
+        "--no-fast-chain-cuda-graph-ik",
+        dest="fast_chain_cuda_graph_ik",
+        action="store_false",
+        help="Disable CUDA graph batch IK for fast-chain screening and use eager cuRobo batch IK.",
+    )
+    parser.add_argument(
+        "--fast-chain-cuda-graph-ik-max-batch-size",
+        type=int,
+        default=128,
+        help="Maximum fixed CUDA graph IK batch bucket used by fast-chain screening.",
+    )
+    parser.add_argument(
+        "--fast-chain-cuda-graph-ik-fixed-batch-size",
+        type=int,
+        default=16,
+        help=(
+            "When --fast-chain-cuda-graph-ik is enabled, pad every fast-chain IK request to this single fixed batch size. "
+            "Set <=0 to use power-of-two buckets instead."
+        ),
+    )
+    parser.add_argument(
+        "--next-cycle-plan-prefetch",
+        dest="next_cycle_plan_prefetch",
+        action="store_true",
+        default=True,
+        help=(
+            "Speculatively plan the next cycle in a background demo/planner once the current "
+            "cycle's place target is known. The cached plan is reused only if the next cycle "
+            "selects the same object and the start state/scene pose still match."
+        ),
+    )
+    parser.add_argument(
+        "--no-next-cycle-plan-prefetch",
+        dest="next_cycle_plan_prefetch",
+        action="store_false",
+        help="Disable background next-cycle planning prefetch.",
+    )
+    parser.add_argument(
+        "--next-cycle-prefetch-start-q-tolerance",
+        type=float,
+        default=0.08,
+        help="Maximum per-joint start-q mismatch allowed when reusing a prefetched next-cycle plan.",
+    )
+    parser.add_argument(
+        "--next-cycle-prefetch-scene-pos-tolerance-m",
+        type=float,
+        default=0.05,
+        help="Maximum placed-object translation mismatch allowed when reusing a prefetched next-cycle plan.",
+    )
+    parser.add_argument(
+        "--next-cycle-prefetch-wait-timeout",
+        type=float,
+        default=30.0,
+        help=(
+            "Maximum seconds to wait at the next cycle for a reserved background plan to finish "
+            "before falling back to live planning. The default waits for the already-running "
+            "background plan instead of duplicating the same target in the foreground."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run-motion-window-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "In dry-run mode, sleep after each simulated path execution for this fraction of the "
+            "estimated real waypoint-stream duration. Use 1.0 to preserve a realistic execution "
+            "window so background next-cycle prefetch can overlap with simulated motion."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run-motion-window-max-s",
+        type=float,
+        default=30.0,
+        help="Maximum dry-run motion-window sleep per executed path. Set <=0 for no cap.",
+    )
+    parser.add_argument(
+        "--dry-run-motion-window-min-s",
+        type=float,
+        default=0.0,
+        help="Minimum dry-run motion-window sleep for non-empty executed paths when the scale is enabled.",
     )
     parser.add_argument(
         "--joint-search-start-collision-lift-m",
@@ -860,7 +1241,101 @@ def build_arg_parser():
         "--return-start-clearance-lift-m",
         type=float,
         default=0.060,
-        help="Before returning to the cycle-start joint state after place, lift the empty gripper by this world-z distance to clear the desk.",
+        help=(
+            "Fallback/fixed world-Z lift distance before returning to the cycle-start joint state after place. "
+            "By default the return prelift uses the placed object's world-Z half-height plus "
+            "--return-start-clearance-lift-extra-m; disable that with "
+            "--no-return-start-clearance-lift-from-placed-object."
+        ),
+    )
+    parser.add_argument(
+        "--return-start-clearance-lift-from-placed-object",
+        dest="return_start_clearance_lift_from_placed_object",
+        action="store_true",
+        default=True,
+        help="Set return prelift distance from the newly placed object's oriented world-Z half-height plus a small margin.",
+    )
+    parser.add_argument(
+        "--no-return-start-clearance-lift-from-placed-object",
+        dest="return_start_clearance_lift_from_placed_object",
+        action="store_false",
+        help="Use --return-start-clearance-lift-m as a fixed return prelift distance.",
+    )
+    parser.add_argument(
+        "--return-start-clearance-lift-extra-m",
+        type=float,
+        default=0.015,
+        help="Extra clearance added to the placed object's world-Z half-height for dynamic return prelift.",
+    )
+    parser.add_argument(
+        "--return-start-clearance-lift-min-m",
+        type=float,
+        default=0.030,
+        help="Minimum dynamic return prelift distance when using the placed object's world-Z half-height.",
+    )
+    parser.add_argument(
+        "--return-start-clearance-lift-max-m",
+        type=float,
+        default=0.090,
+        help="Maximum dynamic return prelift distance when using the placed object's world-Z half-height.",
+    )
+    parser.add_argument(
+        "--return-to-start-preplan",
+        dest="return_to_start_preplan",
+        action="store_true",
+        default=True,
+        help=(
+            "Preplan the empty-gripper return_to_start joint path in a background thread once "
+            "post-place clearance is known."
+        ),
+    )
+    parser.add_argument(
+        "--no-return-to-start-preplan",
+        dest="return_to_start_preplan",
+        action="store_false",
+        help="Disable background preplanning for the empty-gripper return_to_start path.",
+    )
+    parser.add_argument(
+        "--return-to-start-preplan-wait-timeout",
+        type=float,
+        default=30.0,
+        help="Maximum seconds to wait for an already-started return_to_start preplan before falling back to live planning.",
+    )
+    parser.add_argument(
+        "--return-to-start-preplan-start-q-tolerance",
+        type=float,
+        default=0.05,
+        help="Maximum per-joint mismatch allowed when reusing a preplanned return_to_start path.",
+    )
+    parser.add_argument(
+        "--return-to-start-preplan-prelift",
+        dest="return_to_start_preplan_prelift",
+        action="store_true",
+        default=True,
+        help="If direct return_to_start preplanning fails, preplan a short prelift then return from the lifted joint state.",
+    )
+    parser.add_argument(
+        "--no-return-to-start-preplan-prelift",
+        dest="return_to_start_preplan_prelift",
+        action="store_false",
+        help="Disable the prelift rescue branch inside return_to_start preplanning.",
+    )
+    parser.add_argument(
+        "--return-to-start-preplan-prelift-first",
+        dest="return_to_start_preplan_prelift_first",
+        action="store_true",
+        default=True,
+        help=(
+            "Start return_to_start preplanning from a fixed world-Z prelift pose instead of first trying "
+            "direct return from the release/clearance pose. This avoids repeated start-state collision "
+            "failures against the newly placed object."
+        ),
+    )
+    parser.add_argument(
+        "--no-return-to-start-preplan-prelift-first",
+        dest="return_to_start_preplan_prelift_first",
+        action="store_false",
+        help="Try direct return_to_start preplanning before the prelift rescue branch.",
     )
     parser.add_argument(
         "--no-post-grasp-lift",
@@ -1313,7 +1788,7 @@ def _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, label: str, *, us
         (current_tcp_p + np.array([0.0, 0.0, lift_delta], dtype=np.float32)).astype(np.float32),
     )
 
-    planner = curobo_wrapper._get_or_create_curobo_planner(args)
+    planner = _get_or_create_curobo_planner_serialized(args)
     q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     q_path = None
     if planner is not None:
@@ -1987,6 +2462,131 @@ def _build_active_object_curobo_world(demo, args):
     ], []
 
 
+def _copy_scene_obstacle_entries(entries) -> list[dict]:
+    copied = []
+    for item in list(entries or []):
+        if not isinstance(item, dict):
+            continue
+        out = {}
+        for key, value in item.items():
+            if isinstance(value, np.ndarray):
+                out[key] = value.copy()
+            elif isinstance(value, (list, tuple)):
+                out[key] = [v.copy() if isinstance(v, np.ndarray) else copy.deepcopy(v) for v in value]
+            else:
+                try:
+                    out[key] = copy.deepcopy(value)
+                except Exception:
+                    out[key] = value
+        copied.append(out)
+    return copied
+
+
+def _build_current_target_placed_obstacle(args, T_world_obj) -> dict | None:
+    object_name = curobo_wrapper.normalize_object_name(getattr(args, "object_name", None))
+    if object_name is None or T_world_obj is None:
+        return None
+    try:
+        T_world_obj = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4).copy()
+    except Exception:
+        return None
+    asset_file = getattr(args, "sim_asset_file", None) or getattr(args, "mesh_file", None)
+    if asset_file is None:
+        return None
+    asset_file = str(Path(str(asset_file)).expanduser())
+    try:
+        asset_scale = float(getattr(args, "sim_asset_scale", None) or getattr(args, "mesh_scale", 1.0) or 1.0)
+        visual_box_size = np.asarray(targeted.base.get_asset_box_size(asset_file, asset_scale), dtype=np.float32).reshape(3)
+    except Exception as exc:
+        if bool(getattr(args, "curobo_debug", False)):
+            print(f"[return_preplan] failed to build placed-object obstacle for {object_name}: {exc}")
+        return None
+    try:
+        box_scale = float(_single_scene_obstacle_box_scale(args, object_name, placed=True))
+    except Exception:
+        box_scale = float(max(getattr(args, "scene_obstacle_box_scale", 1.0), 1e-3))
+    planner_box_size = (visual_box_size * max(box_scale, 1e-3)).astype(np.float32)
+    return {
+        "object_name": object_name,
+        "actor_name": f"scene_obstacle_{object_name}",
+        "label": object_name,
+        "score": 1.0,
+        "T_world_obj": T_world_obj,
+        "placed": True,
+        "planner_collision": True,
+        "asset_file": asset_file,
+        "asset_scale": asset_scale,
+        "visual_box_size": visual_box_size,
+        "planner_box_size": planner_box_size,
+    }
+
+
+def _return_to_start_placed_obstacles(demo, args, *, place_choice=None) -> list[dict]:
+    T_world_obj = None
+    if place_choice is not None:
+        T_world_obj = _predicted_place_T_world_obj(place_choice)
+    if T_world_obj is None:
+        T_world_obj = getattr(demo, "_scene_cache_placed_object_world_pose", None)
+    if T_world_obj is None:
+        cached = _copy_scene_obstacle_entries(getattr(args, "_return_to_start_extra_scene_obstacles", []) or [])
+        return cached
+    obstacle = _build_current_target_placed_obstacle(args, T_world_obj)
+    if obstacle is None:
+        return []
+    return [obstacle]
+
+
+def _placed_obstacle_world_z_height(obstacle: dict | None) -> float | None:
+    if not isinstance(obstacle, dict):
+        return None
+    T_world_obj = obstacle.get("T_world_obj")
+    dims = obstacle.get("visual_box_size", obstacle.get("planner_box_size"))
+    if T_world_obj is None or dims is None:
+        return None
+    try:
+        T_world_obj = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4)
+        dims = np.asarray(dims, dtype=np.float32).reshape(3)
+    except Exception:
+        return None
+    if not np.all(np.isfinite(T_world_obj)) or not np.all(np.isfinite(dims)):
+        return None
+    R = T_world_obj[:3, :3]
+    height = float(np.sum(np.abs(R[2, :]) * np.maximum(dims, 0.0)))
+    return height if height > 1e-6 else None
+
+
+def _return_start_clearance_lift_m(args, placed_obstacles=None) -> tuple[float, dict]:
+    fixed_lift = float(max(getattr(args, "return_start_clearance_lift_m", 0.060), 0.0))
+    if not bool(getattr(args, "return_start_clearance_lift_from_placed_object", True)):
+        return fixed_lift, {"source": "fixed", "fixed_lift_m": fixed_lift}
+
+    heights = [
+        h
+        for h in (
+            _placed_obstacle_world_z_height(item)
+            for item in list(placed_obstacles or [])
+        )
+        if h is not None
+    ]
+    if not heights:
+        return fixed_lift, {"source": "fixed_no_placed_object", "fixed_lift_m": fixed_lift}
+
+    object_height = float(max(heights))
+    extra = float(max(getattr(args, "return_start_clearance_lift_extra_m", 0.015), 0.0))
+    min_lift = float(max(getattr(args, "return_start_clearance_lift_min_m", 0.030), 0.0))
+    max_lift = float(max(getattr(args, "return_start_clearance_lift_max_m", 0.090), min_lift))
+    raw_lift = 0.5 * object_height + extra
+    lift_m = float(np.clip(raw_lift, min_lift, max_lift))
+    return lift_m, {
+        "source": "placed_object_half_height",
+        "object_world_z_height_m": object_height,
+        "raw_lift_m": raw_lift,
+        "extra_m": extra,
+        "min_lift_m": min_lift,
+        "max_lift_m": max_lift,
+    }
+
+
 def _build_virtual_table_cuboid(args) -> dict:
     table_x = float(getattr(args, "curobo_table_center_x", 0.0))
     table_y = float(getattr(args, "curobo_table_center_y", 0.0))
@@ -2131,6 +2731,7 @@ def _clear_visualized_attached_spheres(demo) -> None:
 def _refresh_curobo_world(
     planner, demo, args, *, label: str, include_active_object: bool = False, include_table: bool = False,
     exclude_object_names: set[str] | None = None,
+    extra_scene_obstacles: list[dict] | None = None,
 ) -> None:
     _bump_profile_counter("world_refresh_count")
     if planner.collision_enabled:
@@ -2142,6 +2743,15 @@ def _refresh_curobo_world(
         cuboids, meshes = curobo_wrapper._scene_obstacles_to_curobo_world(
             demo, args, exclude_object_names=requested_excludes or None,
         )
+        if extra_scene_obstacles:
+            extra_demo = SimpleNamespace(scene_obstacles=_copy_scene_obstacle_entries(extra_scene_obstacles))
+            extra_cuboids, extra_meshes = curobo_wrapper._scene_obstacles_to_curobo_world(
+                extra_demo,
+                args,
+                exclude_object_names=requested_excludes or None,
+            )
+            cuboids.extend(extra_cuboids)
+            meshes.extend(extra_meshes)
         if include_active_object:
             active_cuboids, active_meshes = _build_active_object_curobo_world(demo, args)
             cuboids.extend(active_cuboids)
@@ -2170,7 +2780,8 @@ def _refresh_curobo_world(
                 meshes,
                 demo,
             )
-            planner.set_world_from_obstacles(cuboids=cuboids_in_base, meshes=meshes_in_base)
+            with _CUROBO_GPU_LOCK:
+                planner.set_world_from_obstacles(cuboids=cuboids_in_base, meshes=meshes_in_base)
             planner._persistent_world_signature = world_signature
         if requested_excludes:
             print(
@@ -3215,6 +3826,15 @@ def _convert_demo_tcp_pose_to_curobo_ee_pose(demo, pose, *, ee_link_name: str):
     return targeted._pose_from_matrix(T_base_goal_ee_link.astype(np.float32))
 
 
+def _convert_demo_tcp_pose_to_curobo_ee_pose_for_joint_q(demo, q_arm, pose, *, ee_link_name: str):
+    q_saved = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+    try:
+        targeted.base.sync_demo_arm_qpos(demo, q_arm)
+        return _convert_demo_tcp_pose_to_curobo_ee_pose(demo, pose, ee_link_name=ee_link_name)
+    finally:
+        targeted.base.sync_demo_arm_qpos(demo, q_saved)
+
+
 def _nlerp_quat_wxyz(q0, q1, alpha: float) -> np.ndarray:
     q0 = _normalize_quat_wxyz(q0)
     q1 = _normalize_quat_wxyz(q1)
@@ -3531,7 +4151,8 @@ def _plan_short_curobo_cartesian_descent(
                 interp_pose,
                 ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
             )
-            ik_result = planner.solve_ik(
+            ik_result = _profile_solve_ik(
+                planner,
                 q_prev,
                 planner_pose,
                 num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
@@ -3747,6 +4368,7 @@ def _plan_short_world_z_lift_ik(
     label: str,
     include_table: bool = True,
     exclude_object_names: set[str] | None = None,
+    extra_scene_obstacles: list[dict] | None = None,
     disabled_world_collision_links: list[str] | None = None,
 ):
     lift_m = float(max(lift_m, 0.0))
@@ -3764,6 +4386,7 @@ def _plan_short_world_z_lift_ik(
         include_active_object=False,
         include_table=include_table,
         exclude_object_names=exclude_object_names,
+        extra_scene_obstacles=extra_scene_obstacles,
     )
     requested_disabled_links = _normalize_disabled_world_collision_links(planner, disabled_world_collision_links)
     restore_attached_spheres = "attached_object" in set(requested_disabled_links or [])
@@ -3845,7 +4468,8 @@ def _plan_short_world_z_lift_ik(
                     interp_pose,
                     ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
                 )
-                ik_result = planner.solve_ik(
+                ik_result = _profile_solve_ik(
+                    planner,
                     q_prev,
                     planner_pose,
                     num_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
@@ -3858,7 +4482,8 @@ def _plan_short_world_z_lift_ik(
                             pose_goal,
                             ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
                         )
-                        goal_ik = planner.solve_ik(
+                        goal_ik = _profile_solve_ik(
+                            planner,
                             start_q,
                             goal_planner_pose,
                             num_seeds=max(int(getattr(args, "curobo_num_ik_seeds", 64)), 128),
@@ -4195,6 +4820,518 @@ def _start_state_is_world_collision(
     return False
 
 
+def _plan_return_to_start_joint_curobo(
+    planner,
+    demo,
+    args,
+    start_q,
+    goal_q,
+    *,
+    label: str,
+    extra_scene_obstacles: list[dict] | None = None,
+) -> dict:
+    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    goal_q = np.asarray(goal_q, dtype=np.float32).reshape(-1)[:7]
+    if planner is None:
+        return {"success": False, "status": "NO_PLANNER", "q_path": None}
+    _refresh_curobo_world(planner, demo, args, label=label, extra_scene_obstacles=extra_scene_obstacles)
+    result = _profile_plan_to_joint_state(
+        planner,
+        start_q,
+        goal_q,
+        enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+        max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
+        timeout=float(getattr(args, "curobo_timeout", 5.0)),
+        num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+        num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
+    )
+    payload = {
+        "success": False,
+        "status": str(getattr(result, "status", "")),
+        "q_path": None,
+        "solve_time": float(getattr(result, "solve_time", 0.0) or 0.0),
+        "trajopt_time": float(getattr(result, "trajopt_time", 0.0) or 0.0),
+    }
+    if result.success and result.joint_path is not None:
+        q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in result.joint_path]
+        q_final = q_path[-1]
+        joint_errors = np.abs(q_final - goal_q)
+        max_joint_error_per_joint = float(getattr(args, "return_to_start_max_joint_error_rad", 0.1))
+        max_error = float(np.max(joint_errors))
+        payload.update(
+            {
+                "path_waypoints": len(q_path),
+                "max_joint_error": max_error,
+                "q_path": q_path if max_error <= max_joint_error_per_joint else None,
+                "success": max_error <= max_joint_error_per_joint,
+                "status": "Success" if max_error <= max_joint_error_per_joint else "JOINT_ERROR_TOO_LARGE",
+            }
+        )
+        if max_error > max_joint_error_per_joint:
+            worst_joint_idx = int(np.argmax(joint_errors))
+            payload["worst_joint_idx"] = worst_joint_idx
+            payload["worst_joint_error"] = float(joint_errors[worst_joint_idx])
+    return payload
+
+
+def _concat_joint_paths(*paths) -> list[np.ndarray]:
+    out: list[np.ndarray] = []
+    for path in paths:
+        for q in list(path or []):
+            q_arr = np.asarray(q, dtype=np.float32).reshape(-1)[:7].copy()
+            if out and np.allclose(out[-1], q_arr, atol=1e-6, rtol=0.0):
+                continue
+            out.append(q_arr)
+    return out
+
+
+def _plan_return_to_start_prelift_rescue_curobo(
+    planner,
+    demo,
+    args,
+    start_q,
+    goal_q,
+    *,
+    prelift_planner_pose,
+    lift_m: float,
+    label: str,
+    extra_scene_obstacles: list[dict] | None = None,
+) -> dict:
+    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    goal_q = np.asarray(goal_q, dtype=np.float32).reshape(-1)[:7]
+    if planner is None:
+        return {"success": False, "status": "NO_PLANNER", "q_path": None, "mode": "prelift_rescue"}
+    if prelift_planner_pose is None:
+        return {"success": False, "status": "NO_PRELIFT_POSE", "q_path": None, "mode": "prelift_rescue"}
+
+    prelift_path = None
+    q_lift = None
+    with _profile_stage(
+        args,
+        "return_to_start_preplan_prelift_ik",
+        lift_m=float(lift_m),
+        num_ik_seeds=int(getattr(args, "short_linear_ik_seeds", getattr(args, "curobo_num_ik_seeds", 64))),
+    ) as prof:
+        _refresh_curobo_world(
+            planner,
+            demo,
+            args,
+            label=f"{label}_prelift_ik_world",
+            include_active_object=False,
+            include_table=bool(getattr(args, "curobo_table_collision", True)),
+            extra_scene_obstacles=extra_scene_obstacles,
+        )
+        disabled = _set_world_collision_for_links(
+            planner,
+            _direct_place_contact_tolerant_disabled_links(planner),
+            enabled=False,
+            label=f"{label}_prelift_ik",
+        )
+        try:
+            ik_result = _profile_solve_ik(
+                planner,
+                start_q,
+                prelift_planner_pose,
+                num_seeds=int(getattr(args, "short_linear_ik_seeds", getattr(args, "curobo_num_ik_seeds", 64))),
+            )
+        finally:
+            _set_world_collision_for_links(
+                planner,
+                disabled,
+                enabled=True,
+                label=f"{label}_prelift_ik",
+            )
+        prof["raw_status"] = str(getattr(ik_result, "status", ""))
+        prof["solve_time"] = float(getattr(ik_result, "solve_time", 0.0) or 0.0)
+        prof["ik_success_count"] = (
+            getattr(getattr(ik_result, "debug", None), "get", lambda *_: None)("ik_success_count")
+            if isinstance(getattr(ik_result, "debug", None), dict)
+            else None
+        )
+        if not bool(ik_result.success) or ik_result.goal_joint is None:
+            prof["success"] = False
+            prof["status"] = str(getattr(ik_result, "status", "IK_FAIL"))
+            prof["path_waypoints"] = 0
+            return {
+                "success": False,
+                "status": str(getattr(ik_result, "status", "IK_FAIL")),
+                "q_path": None,
+                "mode": "prelift_rescue",
+            }
+        q_lift = np.asarray(ik_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
+        prelift_path = _linear_joint_path(
+            start_q,
+            q_lift,
+            max_step_rad=float(getattr(args, "short_linear_joint_step_rad", 0.035)),
+        )
+        prof["success"] = bool(prelift_path)
+        prof["status"] = "Success" if prelift_path else "EMPTY_PRELIFT_PATH"
+        prof["path_waypoints"] = len(prelift_path or [])
+        prof["max_joint_delta"] = float(np.max(np.abs(q_lift - start_q)))
+    if not prelift_path or q_lift is None:
+        return {"success": False, "status": "EMPTY_PRELIFT_PATH", "q_path": None, "mode": "prelift_rescue"}
+
+    with _profile_stage(
+        args,
+        "return_to_start_preplan_after_prelift_joint_plan",
+        enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+        num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+    ) as prof:
+        return_payload = _plan_return_to_start_joint_curobo(
+            planner,
+            demo,
+            args,
+            q_lift,
+            goal_q,
+            label=f"{label}_after_prelift",
+            extra_scene_obstacles=extra_scene_obstacles,
+        )
+        prof["success"] = bool(return_payload.get("success", False))
+        prof["status"] = str(return_payload.get("status", "FAILED"))
+        prof["path_waypoints"] = int(return_payload.get("path_waypoints", 0) or 0)
+        prof["max_joint_error"] = return_payload.get("max_joint_error")
+        prof["solve_time"] = return_payload.get("solve_time")
+        prof["trajopt_time"] = return_payload.get("trajopt_time")
+    if not bool(return_payload.get("success", False)) or not return_payload.get("q_path"):
+        return {
+            "success": False,
+            "status": str(return_payload.get("status", "FAILED")),
+            "q_path": None,
+            "mode": "prelift_rescue",
+            "prelift_waypoints": len(prelift_path or []),
+            "solve_time": return_payload.get("solve_time"),
+            "trajopt_time": return_payload.get("trajopt_time"),
+        }
+    q_path = _concat_joint_paths(prelift_path, return_payload.get("q_path"))
+    return {
+        "success": True,
+        "status": "Success",
+        "q_path": q_path,
+        "mode": "prelift_rescue",
+        "path_waypoints": len(q_path),
+        "prelift_waypoints": len(prelift_path or []),
+        "return_waypoints": int(return_payload.get("path_waypoints", 0) or 0),
+        "max_joint_error": return_payload.get("max_joint_error"),
+        "solve_time": return_payload.get("solve_time"),
+        "trajopt_time": return_payload.get("trajopt_time"),
+    }
+
+
+def _start_return_to_start_preplan(
+    demo,
+    planner,
+    args,
+    start_q,
+    goal_q,
+    *,
+    prelift_planner_pose=None,
+    prelift_lift_m: float = 0.0,
+    extra_scene_obstacles: list[dict] | None = None,
+) -> None:
+    if not bool(getattr(args, "return_to_start_preplan", True)):
+        return
+    if bool(getattr(args, "_planning_prefetch_capture_only", False)):
+        return
+    if isinstance(getattr(args, "_return_to_start_preplan_state", None), dict):
+        _record_profile(
+            args,
+            "return_to_start_preplan_start",
+            success=True,
+            status="ALREADY_STARTED",
+        )
+        return
+    preplan_start_q = _q7_or_none(start_q)
+    goal_q = _q7_or_none(goal_q)
+    if preplan_start_q is None or goal_q is None or planner is None:
+        _record_profile(
+            args,
+            "return_to_start_preplan_start",
+            success=False,
+            status="INVALID_INPUT",
+        )
+        return
+    state = {
+        "lock": threading.Lock(),
+        "result": None,
+        "start_q": preplan_start_q.copy(),
+        "goal_q": goal_q.copy(),
+        "prelift_enabled": bool(prelift_planner_pose is not None and prelift_lift_m > 1e-5),
+        "extra_scene_obstacles": _copy_scene_obstacle_entries(extra_scene_obstacles),
+        "started_ts": time.time(),
+    }
+    prelift_first = (
+        bool(getattr(args, "return_to_start_preplan_prelift_first", True))
+        and bool(state["prelift_enabled"])
+        and bool(getattr(args, "return_to_start_preplan_prelift", True))
+    )
+    args._return_to_start_preplan_state = state
+    _record_profile(
+        args,
+        "return_to_start_preplan_start",
+        success=True,
+        status="STARTED",
+        start_goal_delta=float(np.max(np.abs(preplan_start_q - goal_q))),
+        prelift_enabled=bool(prelift_planner_pose is not None and prelift_lift_m > 1e-5),
+        prelift_first=bool(prelift_first),
+        prelift_lift_m=float(prelift_lift_m),
+        extra_scene_obstacle_count=len(state["extra_scene_obstacles"]),
+        extra_scene_obstacle_names=[
+            str(item.get("object_name") or item.get("actor_name") or "")
+            for item in list(state["extra_scene_obstacles"] or [])
+        ],
+    )
+
+    def _worker() -> None:
+        worker_start = time.perf_counter()
+        status = "FAILED"
+        error_text = None
+        result_payload = None
+        direct_status = None
+        try:
+            with _profile_record_context(is_return_to_start_preplan=True):
+                if prelift_first:
+                    direct_status = "SKIPPED_PRELIFT_FIRST"
+                    result_payload = _plan_return_to_start_prelift_rescue_curobo(
+                        planner,
+                        demo,
+                        args,
+                        preplan_start_q,
+                        goal_q,
+                        prelift_planner_pose=prelift_planner_pose,
+                        lift_m=float(prelift_lift_m),
+                        label="return_to_cycle_start_preplan",
+                        extra_scene_obstacles=state["extra_scene_obstacles"],
+                    )
+                    status = str(result_payload.get("status", "FAILED"))
+                else:
+                    with _profile_stage(
+                        args,
+                        "return_to_start_preplan_joint_plan",
+                        start_goal_delta=float(np.max(np.abs(preplan_start_q - goal_q))),
+                        enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+                        num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+                    ) as prof:
+                        result_payload = _plan_return_to_start_joint_curobo(
+                            planner,
+                            demo,
+                            args,
+                            preplan_start_q,
+                            goal_q,
+                            label="return_to_cycle_start_preplan",
+                            extra_scene_obstacles=state["extra_scene_obstacles"],
+                        )
+                        status = str(result_payload.get("status", "FAILED"))
+                        direct_status = status
+                        prof["success"] = bool(result_payload.get("success", False))
+                        prof["status"] = status
+                        prof["path_waypoints"] = int(result_payload.get("path_waypoints", 0) or 0)
+                        prof["max_joint_error"] = result_payload.get("max_joint_error")
+                        prof["solve_time"] = result_payload.get("solve_time")
+                        prof["trajopt_time"] = result_payload.get("trajopt_time")
+                if (
+                    not prelift_first
+                    and not bool(result_payload and result_payload.get("success", False))
+                    and bool(getattr(args, "return_to_start_preplan_prelift", True))
+                    and prelift_planner_pose is not None
+                    and float(prelift_lift_m) > 1e-5
+                ):
+                    rescue_payload = _plan_return_to_start_prelift_rescue_curobo(
+                        planner,
+                        demo,
+                        args,
+                        preplan_start_q,
+                        goal_q,
+                        prelift_planner_pose=prelift_planner_pose,
+                        lift_m=float(prelift_lift_m),
+                        label="return_to_cycle_start_preplan",
+                        extra_scene_obstacles=state["extra_scene_obstacles"],
+                    )
+                    if bool(rescue_payload.get("success", False)):
+                        result_payload = rescue_payload
+                        status = str(rescue_payload.get("status", "Success"))
+                    elif result_payload is None:
+                        result_payload = rescue_payload
+        except Exception:
+            status = "EXCEPTION"
+            error_text = traceback.format_exc()
+            print("[return_preplan] worker failed:\n" + error_text)
+        elapsed_ms = round((time.perf_counter() - worker_start) * 1000.0, 3)
+        payload = {
+            "status": status,
+            "success": bool(result_payload and result_payload.get("success", False)),
+            "elapsed_ms": elapsed_ms,
+            "q_path": None if result_payload is None else result_payload.get("q_path"),
+            "start_q": preplan_start_q.copy(),
+            "goal_q": goal_q.copy(),
+            "mode": None if result_payload is None else result_payload.get("mode", "direct"),
+            "direct_status": direct_status,
+            "prelift_waypoints": None if result_payload is None else result_payload.get("prelift_waypoints"),
+            "return_waypoints": None if result_payload is None else result_payload.get("return_waypoints"),
+            "extra_scene_obstacle_count": len(state["extra_scene_obstacles"]),
+            "error_text": error_text,
+        }
+        with state["lock"]:
+            state["result"] = payload
+        _record_profile(
+            args,
+            "return_to_start_preplan_worker",
+            success=bool(payload["success"]),
+            status=status,
+            elapsed_ms=elapsed_ms,
+            path_waypoints=len(payload["q_path"] or []),
+            mode=payload.get("mode"),
+            direct_status=direct_status,
+            prelift_waypoints=payload.get("prelift_waypoints"),
+            return_waypoints=payload.get("return_waypoints"),
+            extra_scene_obstacle_count=payload.get("extra_scene_obstacle_count"),
+            error_text=None if error_text is None else str(error_text)[-6000:],
+        )
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"return-to-start-preplan-{getattr(args, 'object_name', 'unknown')}",
+        daemon=True,
+    )
+    state["thread"] = thread
+    thread.start()
+
+
+def _consume_return_to_start_preplan(demo, args, current_q, goal_q, *, use_attach: bool) -> list[np.ndarray] | None:
+    state = getattr(args, "_return_to_start_preplan_state", None)
+    if not isinstance(state, dict):
+        return None
+    current_q = _q7_or_none(current_q)
+    goal_q = _q7_or_none(goal_q)
+    if current_q is None or goal_q is None:
+        return None
+    thread = state.get("thread")
+    wait_timeout = float(max(getattr(args, "return_to_start_preplan_wait_timeout", 30.0), 0.0))
+    if thread is not None and thread.is_alive() and wait_timeout > 0.0:
+        print(f"[return_preplan] waiting up to {wait_timeout:.2f}s for return_to_start preplan")
+        thread.join(wait_timeout)
+    thread_alive = bool(thread is not None and thread.is_alive())
+    with state["lock"]:
+        payload = dict(state.get("result") or {})
+    if not payload:
+        _record_profile(
+            args,
+            "return_to_start_preplan_consume",
+            success=False,
+            status="NOT_READY",
+            wait_timeout=wait_timeout,
+            thread_alive=thread_alive,
+        )
+        return None
+    if not bool(payload.get("success", False)) or not payload.get("q_path"):
+        _record_profile(
+            args,
+            "return_to_start_preplan_consume",
+            success=False,
+            status=str(payload.get("status", "FAILED")),
+            wait_timeout=wait_timeout,
+            thread_alive=thread_alive,
+            worker_elapsed_ms=payload.get("elapsed_ms"),
+            mode=payload.get("mode"),
+            direct_status=payload.get("direct_status"),
+            prelift_waypoints=payload.get("prelift_waypoints"),
+            return_waypoints=payload.get("return_waypoints"),
+            worker_error_text=None if payload.get("error_text") is None else str(payload.get("error_text"))[-6000:],
+        )
+        return None
+    planned_start_q = _q7_or_none(payload.get("start_q"))
+    planned_goal_q = _q7_or_none(payload.get("goal_q"))
+    if planned_start_q is None or planned_goal_q is None:
+        return None
+    start_delta = float(np.max(np.abs(current_q - planned_start_q)))
+    goal_delta = float(np.max(np.abs(goal_q - planned_goal_q)))
+    q_tol = float(max(getattr(args, "return_to_start_preplan_start_q_tolerance", 0.05), 0.0))
+    if start_delta > q_tol or goal_delta > q_tol:
+        _record_profile(
+            args,
+            "return_to_start_preplan_consume",
+            success=False,
+            status="Q_MISMATCH",
+            wait_timeout=wait_timeout,
+            start_delta=start_delta,
+            goal_delta=goal_delta,
+            q_tol=q_tol,
+            worker_elapsed_ms=payload.get("elapsed_ms"),
+        )
+        return None
+    q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7].copy() for q in list(payload.get("q_path") or [])]
+    if not q_path:
+        return None
+    q_path[0] = current_q.copy()
+    if not _validate_candidate_joint_path_with_demo_planner(
+        demo,
+        current_q,
+        q_path,
+        use_attach=use_attach,
+        label="return_to_start_preplan_cached",
+    ):
+        _record_profile(
+            args,
+            "return_to_start_preplan_consume",
+            success=False,
+            status="DEMO_VALIDATE_FAIL",
+            wait_timeout=wait_timeout,
+            start_delta=start_delta,
+            goal_delta=goal_delta,
+            q_tol=q_tol,
+            worker_elapsed_ms=payload.get("elapsed_ms"),
+            path_waypoints=len(q_path),
+            mode=payload.get("mode"),
+            direct_status=payload.get("direct_status"),
+            prelift_waypoints=payload.get("prelift_waypoints"),
+            return_waypoints=payload.get("return_waypoints"),
+        )
+        return None
+    args._return_to_start_preplan_last_mode = str(payload.get("mode", "direct") or "direct")
+    _record_profile(
+        args,
+        "return_to_start_preplan_consume",
+        success=True,
+        status="HIT",
+        wait_timeout=wait_timeout,
+        start_delta=start_delta,
+        goal_delta=goal_delta,
+        q_tol=q_tol,
+        worker_elapsed_ms=payload.get("elapsed_ms"),
+        path_waypoints=len(q_path),
+        mode=payload.get("mode"),
+        direct_status=payload.get("direct_status"),
+        prelift_waypoints=payload.get("prelift_waypoints"),
+        return_waypoints=payload.get("return_waypoints"),
+    )
+    return q_path
+
+
+def _prepare_return_preplan_prelift_pose(demo, planner, args, return_start_q, *, placed_obstacles=None):
+    if not bool(getattr(args, "return_to_start_preplan_prelift", True)) or planner is None:
+        return None, 0.0
+    prelift_lift_m, lift_debug = _return_start_clearance_lift_m(args, placed_obstacles)
+    if prelift_lift_m <= 1e-5:
+        return None, prelift_lift_m
+    try:
+        prelift_start_pose = _get_demo_tcp_pose_for_joint_q(demo, return_start_q)
+        prelift_goal_pose = _lift_pose_world_z(prelift_start_pose, prelift_lift_m)
+        prelift_planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose_for_joint_q(
+            demo,
+            return_start_q,
+            prelift_goal_pose,
+            ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
+        )
+        if bool(getattr(args, "curobo_debug", False)):
+            print(
+                f"[return_preplan] prelift distance={prelift_lift_m:.4f}m "
+                f"({lift_debug.get('source')}, object_world_z_height_m={lift_debug.get('object_world_z_height_m')})"
+            )
+        return prelift_planner_pose, prelift_lift_m
+    except Exception as exc:
+        print(f"[return_preplan] failed to prepare prelift rescue pose: {exc}")
+        return None, prelift_lift_m
+
+
 def _plan_and_execute_return_to_cycle_start(
     demo,
     bridge_mod,
@@ -4215,84 +5352,101 @@ def _plan_and_execute_return_to_cycle_start(
     )
     target_pose = _get_demo_tcp_pose_for_joint_q(demo, start_q)
 
-    planner = curobo_wrapper._get_or_create_curobo_planner(args)
+    planner = _get_or_create_curobo_planner_serialized(args)
     q_path = None
-    clearance_lift_m = float(max(getattr(args, "return_start_clearance_lift_m", 0.060), 0.0))
-    if clearance_lift_m > 1e-5:
-        lift_path = _plan_short_world_z_lift_ik(
-            planner,
-            demo,
-            args,
-            q_current,
-            lift_m=clearance_lift_m,
-            label=f"{label}_prelift",
-            include_table=bool(getattr(args, "curobo_table_collision", True)),
-            exclude_object_names=None,
-            disabled_world_collision_links=_direct_place_contact_tolerant_disabled_links(planner),
-        ) if planner is not None else None
-        if lift_path is not None and len(lift_path) >= 2:
-            lift_pose = _lift_pose_world_z(demo.tcp.pose, clearance_lift_m)
-            ok, _ = targeted.base.execute_pose_path_stage(
-                demo,
-                bridge_mod,
-                real_exec,
-                f"{label}_prelift",
-                lift_pose,
-                lift_path,
-                args.real_gripper_open if gripper_pos is None else float(gripper_pos),
-                args,
-                use_attach=False,
-            )
-            if ok:
-                q_current = _clip_arm_q_to_joint_limits(
-                    demo,
-                    np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
-                    label=label,
-                )
-                print(f"[planner] {label}: lifted empty gripper by {clearance_lift_m:.3f}m before return planning")
-            else:
-                print(f"[warn] {label}: prelift execution failed; trying direct return anyway")
-        else:
-            print(f"[warn] {label}: prelift planning failed; trying direct return anyway")
-    if planner is not None:
-        _refresh_curobo_world(planner, demo, args, label=label)
-        result = _profile_plan_to_joint_state(
-            planner,
-            q_current,
-            start_q,
-            enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
-            max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
-            timeout=float(getattr(args, "curobo_timeout", 5.0)),
-            num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
-            num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
-        )
-        if result.success and result.joint_path is not None:
-            q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in result.joint_path]
-            # 检查终点joint configuration是否足够接近目标
-            # 重要：检查每个关节的误差，防止关节1多转360度的情况
-            q_final = q_path[-1]
-            joint_errors = np.abs(q_final - start_q)
-            max_joint_error_per_joint = float(getattr(args, "return_to_start_max_joint_error_rad", 0.1))  # 默认0.1弧度
-            max_error = float(np.max(joint_errors))
+    return_mode = "live"
+    return_extra_obstacles = _return_to_start_placed_obstacles(demo, args)
+    if return_extra_obstacles:
+        args._return_to_start_extra_scene_obstacles = _copy_scene_obstacle_entries(return_extra_obstacles)
+    cached_path = _consume_return_to_start_preplan(demo, args, q_current, start_q, use_attach=use_attach)
+    if cached_path:
+        q_path = cached_path
+        cached_plan_mode = str(getattr(args, "_return_to_start_preplan_last_mode", "direct") or "direct")
+        return_mode = f"preplan_cached_{cached_plan_mode}"
+        print(f"[return_preplan] using cached return_to_start path ({len(q_path)} waypoint(s))")
 
-            if max_error > max_joint_error_per_joint:
-                # 找出哪个关节误差最大
-                worst_joint_idx = int(np.argmax(joint_errors))
-                print(
-                    f"[curobo] {label} WARNING: joint[{worst_joint_idx}] error={joint_errors[worst_joint_idx]:.4f} rad "
-                    f"exceeds max_allowed={max_joint_error_per_joint:.4f} rad, falling back to MPLib"
+    clearance_lift_m, clearance_lift_debug = _return_start_clearance_lift_m(args, return_extra_obstacles)
+    if q_path is None and clearance_lift_m > 1e-5:
+        with _profile_stage(
+            args,
+            "return_to_start_prelift",
+            lift_m=clearance_lift_m,
+            lift_source=clearance_lift_debug.get("source"),
+            object_world_z_height_m=clearance_lift_debug.get("object_world_z_height_m"),
+        ) as prof:
+            lift_path = _plan_short_world_z_lift_ik(
+                planner,
+                demo,
+                args,
+                q_current,
+                lift_m=clearance_lift_m,
+                label=f"{label}_prelift",
+                include_table=bool(getattr(args, "curobo_table_collision", True)),
+                exclude_object_names=None,
+                extra_scene_obstacles=return_extra_obstacles,
+                disabled_world_collision_links=_direct_place_contact_tolerant_disabled_links(planner),
+            ) if planner is not None else None
+            prof["path_waypoints"] = len(lift_path or [])
+            if lift_path is not None and len(lift_path) >= 2:
+                lift_pose = _lift_pose_world_z(demo.tcp.pose, clearance_lift_m)
+                ok, _ = targeted.base.execute_pose_path_stage(
+                    demo,
+                    bridge_mod,
+                    real_exec,
+                    f"{label}_prelift",
+                    lift_pose,
+                    lift_path,
+                    args.real_gripper_open if gripper_pos is None else float(gripper_pos),
+                    args,
+                    use_attach=False,
                 )
-                print(f"[curobo] {label} all joint errors (rad): {np.round(joint_errors, 4).tolist()}")
-                q_path = None
+                prof["success"] = bool(ok)
+                prof["status"] = "Success" if ok else "EXEC_FAIL_CONTINUE"
+                if ok:
+                    q_current = _clip_arm_q_to_joint_limits(
+                        demo,
+                        np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
+                        label=label,
+                    )
+                    print(f"[planner] {label}: lifted empty gripper by {clearance_lift_m:.3f}m before return planning")
+                else:
+                    print(f"[warn] {label}: prelift execution failed; trying direct return anyway")
             else:
-                print(
-                    f"[curobo] {label} joint-space plan succeeded ({len(q_path)} waypoints), "
-                    f"max_joint_error={max_error:.4f} rad"
-                )
+                prof["success"] = False
+                prof["status"] = "PLAN_FAIL_CONTINUE"
+                print(f"[warn] {label}: prelift planning failed; trying direct return anyway")
+    if q_path is None and planner is not None:
+        with _profile_stage(
+            args,
+            "return_to_start_joint_plan",
+            enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+            num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+        ) as prof:
+            joint_payload = _plan_return_to_start_joint_curobo(
+                planner,
+                demo,
+                args,
+                q_current,
+                start_q,
+                label=label,
+                extra_scene_obstacles=return_extra_obstacles,
+            )
+            q_path = joint_payload.get("q_path")
+            prof["success"] = bool(joint_payload.get("success", False))
+            prof["status"] = str(joint_payload.get("status", "FAILED"))
+            prof["path_waypoints"] = int(joint_payload.get("path_waypoints", 0) or 0)
+            prof["max_joint_error"] = joint_payload.get("max_joint_error")
+            prof["solve_time"] = joint_payload.get("solve_time")
+            prof["trajopt_time"] = joint_payload.get("trajopt_time")
+        if q_path is not None:
+            print(
+                f"[curobo] {label} joint-space plan succeeded ({len(q_path)} waypoints), "
+                f"max_joint_error={float(joint_payload.get('max_joint_error', 0.0) or 0.0):.4f} rad"
+            )
         else:
             print(
                 f"[curobo] {label} joint-space cuRobo failed "
-                f"(status={result.status}), falling back to TCP-pose cuRobo"
+                f"(status={joint_payload.get('status')}), falling back to TCP-pose cuRobo"
             )
             goal_pose = _get_demo_tcp_pose_for_joint_q(demo, start_q)
             planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
@@ -4300,49 +5454,71 @@ def _plan_and_execute_return_to_cycle_start(
                 goal_pose,
                 ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
             )
-            pose_result = _profile_plan_to_pose(
-                planner,
-                q_current,
-                planner_pose,
+            with _profile_stage(
+                args,
+                "return_to_start_pose_fallback",
                 enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
-                max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
-                timeout=float(getattr(args, "curobo_timeout", 5.0)),
                 num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
                 num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
-                num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
-            )
-            if pose_result.success and pose_result.joint_path is not None:
-                pose_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in pose_result.joint_path]
-                q_final = pose_path[-1]
-                joint_errors = np.abs(q_final - start_q)
-                max_joint_error_per_joint = float(getattr(args, "return_to_start_max_joint_error_rad", 0.1))
-                max_error = float(np.max(joint_errors))
-                if max_error <= max_joint_error_per_joint:
-                    q_path = pose_path
-                    print(
-                        f"[curobo] {label} TCP-pose fallback succeeded ({len(q_path)} waypoints), "
-                        f"max_joint_error={max_error:.4f} rad"
-                    )
+            ) as prof:
+                pose_result = _profile_plan_to_pose(
+                    planner,
+                    q_current,
+                    planner_pose,
+                    enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+                    max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
+                    timeout=float(getattr(args, "curobo_timeout", 5.0)),
+                    num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
+                    num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+                    num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
+                )
+                prof["raw_status"] = str(getattr(pose_result, "status", ""))
+                if pose_result.success and pose_result.joint_path is not None:
+                    pose_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in pose_result.joint_path]
+                    q_final = pose_path[-1]
+                    joint_errors = np.abs(q_final - start_q)
+                    max_joint_error_per_joint = float(getattr(args, "return_to_start_max_joint_error_rad", 0.1))
+                    max_error = float(np.max(joint_errors))
+                    prof["path_waypoints"] = len(pose_path)
+                    prof["max_joint_error"] = max_error
+                    if max_error <= max_joint_error_per_joint:
+                        q_path = pose_path
+                        prof["success"] = True
+                        prof["status"] = "Success"
+                        print(
+                            f"[curobo] {label} TCP-pose fallback succeeded ({len(q_path)} waypoints), "
+                            f"max_joint_error={max_error:.4f} rad"
+                        )
+                    else:
+                        worst_joint_idx = int(np.argmax(joint_errors))
+                        prof["success"] = False
+                        prof["status"] = "JOINT_ERROR_TOO_LARGE"
+                        prof["worst_joint_idx"] = worst_joint_idx
+                        prof["worst_joint_error"] = float(joint_errors[worst_joint_idx])
+                        print(
+                            f"[curobo] {label} TCP-pose fallback joint[{worst_joint_idx}] error="
+                            f"{joint_errors[worst_joint_idx]:.4f} rad exceeds "
+                            f"max_allowed={max_joint_error_per_joint:.4f} rad"
+                        )
+                        print(f"[curobo] {label} all joint errors (rad): {np.round(joint_errors, 4).tolist()}")
                 else:
-                    worst_joint_idx = int(np.argmax(joint_errors))
-                    print(
-                        f"[curobo] {label} TCP-pose fallback joint[{worst_joint_idx}] error="
-                        f"{joint_errors[worst_joint_idx]:.4f} rad exceeds "
-                        f"max_allowed={max_joint_error_per_joint:.4f} rad"
-                    )
-                    print(f"[curobo] {label} all joint errors (rad): {np.round(joint_errors, 4).tolist()}")
-            else:
-                print(f"[curobo] {label} TCP-pose cuRobo failed (status={pose_result.status}), falling back to MPLib (no RRT)")
+                    prof["success"] = False
+                    prof["status"] = str(getattr(pose_result, "status", "FAILED"))
+                    print(f"[curobo] {label} TCP-pose cuRobo failed (status={pose_result.status}), falling back to MPLib (no RRT)")
 
     if q_path is None:
-        q_path = targeted.base.plan_joint_path(
-            demo,
-            start_q,
-            use_attach=use_attach,
-            label=label,
-            start_q=q_current,
-            allow_reverse_rrt_fallback=False,
-        )
+        with _profile_stage(args, "return_to_start_mplib_fallback") as prof:
+            q_path = targeted.base.plan_joint_path(
+                demo,
+                start_q,
+                use_attach=use_attach,
+                label=label,
+                start_q=q_current,
+                allow_reverse_rrt_fallback=False,
+            )
+            prof["success"] = bool(q_path)
+            prof["status"] = "Success" if q_path else "PLAN_FAIL"
+            prof["path_waypoints"] = len(q_path or [])
     if q_path is None:
         print(f"[FAIL] {label} planning failed")
         targeted.base.print_failure_diagnostics(
@@ -4360,17 +5536,20 @@ def _plan_and_execute_return_to_cycle_start(
             elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
         )
         return False
-    ok, _ = targeted.base.execute_pose_path_stage(
-        demo,
-        bridge_mod,
-        real_exec,
-        label,
-        target_pose,
-        q_path,
-        args.real_gripper_open if gripper_pos is None else float(gripper_pos),
-        args,
-        use_attach=use_attach,
-    )
+    with _profile_stage(args, "return_to_start_execute", mode=return_mode, path_waypoints=len(q_path or [])) as prof:
+        ok, _ = targeted.base.execute_pose_path_stage(
+            demo,
+            bridge_mod,
+            real_exec,
+            label,
+            target_pose,
+            q_path,
+            args.real_gripper_open if gripper_pos is None else float(gripper_pos),
+            args,
+            use_attach=use_attach,
+        )
+        prof["success"] = bool(ok)
+        prof["status"] = "Success" if ok else "EXEC_FAIL"
     if not ok:
         print(f"[FAIL] {label} execution failed")
         _record_profile(
@@ -4389,6 +5568,7 @@ def _plan_and_execute_return_to_cycle_start(
         status="Success",
         elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
         path_waypoints=len(q_path or []),
+        mode=return_mode,
         enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
         num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
         num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
@@ -5281,9 +6461,12 @@ def _fast_chain_rank_place_candidates(
         remaining = remaining[:max_ik_candidates]
 
     start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
-    chunk_size = int(getattr(args, "curobo_batch_chunk_size", 64) or 0)
+    chunk_size = int(getattr(args, "fast_chain_place_ik_chunk_candidates", 8) or 0)
+    if chunk_size <= 0:
+        chunk_size = int(getattr(args, "curobo_batch_chunk_size", 64) or 0)
     if chunk_size <= 0:
         chunk_size = len(remaining)
+    early_stop = bool(getattr(args, "fast_chain_place_ik_early_stop", True))
     ik_seeds = int(getattr(args, "fast_chain_ik_seeds", 32) or 0)
     if ik_seeds <= 0:
         ik_seeds = int(getattr(args, "curobo_num_ik_seeds", 64) or 64)
@@ -5318,18 +6501,15 @@ def _fast_chain_rank_place_candidates(
                 )
                 for item in chunk
             ]
-            hover_results = _profile_solve_batch_start_goal_ik(
+            combined_results = _profile_fast_chain_solve_batch_start_goal_ik(
+                args,
                 planner,
-                start_qs,
-                hover_poses,
+                start_qs + start_qs,
+                hover_poses + release_poses,
                 num_seeds=ik_seeds,
             )
-            release_results = _profile_solve_batch_start_goal_ik(
-                planner,
-                start_qs,
-                release_poses,
-                num_seeds=ik_seeds,
-            )
+            hover_results = combined_results[: len(chunk)]
+            release_results = combined_results[len(chunk) :]
             for item, hover_result, release_result in zip(chunk, hover_results, release_results):
                 hover_status = str(hover_result.status)
                 release_status = str(release_result.status)
@@ -5398,6 +6578,13 @@ def _fast_chain_rank_place_candidates(
                     role="hover",
                 )
                 ranked.append(ranked_item)
+            if early_stop and len(ranked) >= top_pairs:
+                print(
+                    f"[joint_search] {label} fast-chain IK early stop after "
+                    f"{min(start_idx + len(chunk), len(remaining))}/{len(remaining)} place candidate(s); "
+                    f"kept {len(ranked)} valid candidate(s)"
+                )
+                break
     finally:
         _set_world_collision_for_links(
             planner,
@@ -5665,6 +6852,57 @@ def _evaluate_curobo_pose_candidates_multi_start(
             exclude_object_names=exclude_object_names,
         )
 
+    def _build_transport_success_item(candidate, result, planner_pose, *, mode_label: str):
+        candidate_label = str(candidate["label"])
+        if not result.success or result.joint_path is None:
+            return None
+        start_q = np.asarray(candidate["start_q"], dtype=np.float32).reshape(-1)[:7]
+        q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in result.joint_path]
+        terminal_align = _validate_curobo_terminal_pose(
+            demo,
+            args,
+            q_path,
+            candidate["pose"],
+            label=candidate_label,
+        )
+        if terminal_align is None:
+            return None
+        q_path = terminal_align["q_path"]
+        if not _validate_candidate_joint_path_with_demo_planner(
+            demo,
+            start_q,
+            q_path,
+            use_attach=use_attach,
+            label=candidate_label,
+        ):
+            return None
+        metrics, score = _path_metrics_and_score(start_q, q_path)
+        selection_penalty = _candidate_selection_penalty(candidate, args)
+        place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
+        score = float(score) + float(selection_penalty) + float(place_pref_penalty)
+        item = dict(candidate)
+        item["result"] = result
+        item["q_path"] = q_path
+        item["metrics"] = metrics
+        item["score"] = score
+        item["selection_penalty"] = selection_penalty
+        item["place_preference_penalty"] = place_pref_penalty
+        item["terminal_align"] = terminal_align
+        item["planner_pose"] = planner_pose
+        item.setdefault("q_hover", q_path[-1])
+        print(
+            f"[curobo] {candidate_label} {mode_label} success: score={score:.3f}, "
+            f"selection_penalty={selection_penalty:.3f}, "
+            f"place_pref_penalty={place_pref_penalty:.3f}, "
+            f"total_motion={metrics['total_motion']:.3f} rad, "
+            f"joint7_total={metrics['joint7_total_motion']:.3f} rad, "
+            f"joint7_excursion={metrics['joint7_max_excursion']:.3f} rad, "
+            f"waypoints={metrics['waypoint_count']}, "
+            f"realized_pos_err={terminal_align['realized_after']['pos_err']:.4f} m, "
+            f"realized_rot_err={terminal_align['realized_after']['rot_err_deg']:.2f} deg"
+        )
+        return item
+
     disabled_world_collision_links = _set_world_collision_for_links(
         planner,
         disabled_world_collision_links,
@@ -5672,6 +6910,77 @@ def _evaluate_curobo_pose_candidates_multi_start(
         label=label,
     )
     try:
+        q_goal_trial_cap = int(getattr(args, "transport_prefilter_q_goal_max_trials", 1) or 0)
+        if bool(getattr(args, "transport_use_prefilter_q_goal", True)) and q_goal_trial_cap > 0:
+            q_goal_trials = 0
+            q_goal_winner_ids: set[int] = set()
+            q_goal_failures: list[tuple[str, str]] = []
+            for candidate in remaining:
+                if q_goal_trials >= q_goal_trial_cap or len(winners) >= use_max_winners:
+                    break
+                candidate_label = str(candidate["label"])
+                start_q = np.asarray(candidate["start_q"], dtype=np.float32).reshape(-1)[:7]
+                q_goal = _candidate_reusable_prefilter_q(candidate, start_q=start_q)
+                if q_goal is None:
+                    continue
+                q_goal_trials += 1
+                planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
+                    demo,
+                    candidate["pose"],
+                    ee_link_name=ee_link_name,
+                )
+                _bump_profile_counter("prefilter_q_goal_motiongen_count")
+                js_result = _profile_plan_to_joint_state(
+                    planner,
+                    start_q,
+                    q_goal,
+                    enable_graph=False,
+                    max_attempts=int(getattr(args, "transport_prefilter_q_goal_max_attempts", 1) or 1),
+                    timeout=float(getattr(args, "transport_prefilter_q_goal_timeout", 2.0) or 2.0),
+                    num_trajopt_seeds=int(getattr(args, "transport_prefilter_q_goal_num_trajopt_seeds", 1) or 1),
+                    num_graph_seeds=1,
+                )
+                if not js_result.success or js_result.joint_path is None:
+                    q_goal_failures.append((candidate_label, str(js_result.status)))
+                    if str(js_result.status) == "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION":
+                        saw_invalid_start = True
+                    elif str(js_result.status) == "MotionGenStatus.INVALID_START_STATE_SELF_COLLISION":
+                        saw_invalid_start_self_collision = True
+                    continue
+                item = _build_transport_success_item(
+                    candidate,
+                    js_result,
+                    planner_pose,
+                    mode_label="prefilter-q-goal",
+                )
+                if item is None:
+                    q_goal_failures.append((candidate_label, "TERMINAL_OR_DEMO_VALIDATION_FAIL"))
+                    continue
+                _bump_profile_counter("prefilter_q_goal_success_count")
+                winners.append(item)
+                q_goal_winner_ids.add(id(candidate))
+            if q_goal_trials:
+                print(
+                    f"[curobo] {label} prefilter-q-goal joint-space trial: "
+                    f"{len(winners)} winner(s) from {q_goal_trials} trial(s)"
+                )
+            if q_goal_failures:
+                by_status = Counter(st for _, st in q_goal_failures)
+                by_label = Counter(lbl for lbl, _ in q_goal_failures)
+                print(
+                    f"[curobo] {label} prefilter-q-goal failures: "
+                    f"{len(q_goal_failures)}/{q_goal_trials} trial(s) failed | "
+                    f"statuses={dict(by_status)} | top_labels={by_label.most_common(6)}"
+                )
+            if len(winners) >= use_max_winners:
+                winners.sort(key=_candidate_sort_key)
+                return winners[:use_max_winners]
+            if q_goal_winner_ids:
+                remaining = [item for item in remaining if id(item) not in q_goal_winner_ids]
+                if not remaining:
+                    winners.sort(key=_candidate_sort_key)
+                    return winners[:use_max_winners]
+                num_chunks = max(1, (len(remaining) + chunk_size - 1) // chunk_size)
         if use_max_winners == 1 and len(remaining) > 1:
             start_q0 = np.asarray(remaining[0]["start_q"], dtype=np.float32).reshape(-1)[:7]
             same_start = all(
@@ -7912,6 +9221,8 @@ def _fast_chain_preselect_grasp_place_pair(
         "winner_chain_ik_preselect",
         candidate_count=len(candidates),
         num_ik_seeds=int(getattr(args, "fast_chain_ik_seeds", 32) or getattr(args, "curobo_num_ik_seeds", 64)),
+        fast_chain_cuda_graph_ik=bool(getattr(args, "fast_chain_cuda_graph_ik", False)),
+        fast_chain_cuda_graph_fixed_batch_size=int(getattr(args, "fast_chain_cuda_graph_ik_fixed_batch_size", 16) or 0),
     ) as prof:
         _refresh_curobo_world(
             planner,
@@ -7937,7 +9248,8 @@ def _fast_chain_preselect_grasp_place_pair(
                 )
                 for item in candidates
             ]
-            pregrasp_results = _profile_solve_batch_start_goal_ik(
+            pregrasp_results = _profile_fast_chain_solve_batch_start_goal_ik(
+                args,
                 planner,
                 [start_q for _ in candidates],
                 pregrasp_poses,
@@ -7970,7 +9282,8 @@ def _fast_chain_preselect_grasp_place_pair(
                     )
                     for item in pregrasp_ok
                 ]
-                grasp_results = _profile_solve_batch_start_goal_ik(
+                grasp_results = _profile_fast_chain_solve_batch_start_goal_ik(
+                    args,
                     planner,
                     [np.asarray(item["_winner_preselect_q_pregrasp"], dtype=np.float32).reshape(-1)[:7] for item in pregrasp_ok],
                     grasp_poses,
@@ -8025,6 +9338,17 @@ def _fast_chain_preselect_grasp_place_pair(
                 f"(pregrasp_ok={len(pregrasp_ok)}/{len(candidates)}); falling back only if caller allows it"
             )
             return None
+
+        prof["grasp_candidate_count_before_place_rank"] = len(grasp_ik_candidates)
+        place_rank_grasp_limit = int(getattr(args, "fast_chain_place_rank_grasp_limit", 3) or 0)
+        if place_rank_grasp_limit > 0 and len(grasp_ik_candidates) > place_rank_grasp_limit:
+            print(
+                "[winner_chain] limiting place IK ranking to "
+                f"{place_rank_grasp_limit}/{len(grasp_ik_candidates)} grasp candidate(s) "
+                "in generated priority order"
+            )
+            grasp_ik_candidates = grasp_ik_candidates[:place_rank_grasp_limit]
+        prof["grasp_candidate_count_place_ranked"] = len(grasp_ik_candidates)
 
         pair_records: list[dict] = []
         top_pair_count = max(1, int(getattr(args, "fast_chain_top_pairs", 1) or 1))
@@ -9092,7 +10416,7 @@ def _evaluate_joint_grasp_place_chains(
                     pass_num_graph_seeds = None
                     if pass_is_fallback:
                         _bump_profile_counter("fallback_count")
-                        pass_enable_graph = bool(getattr(args, "joint_search_fallback_enable_graph", True))
+                        pass_enable_graph = bool(getattr(args, "joint_search_fallback_enable_graph", False))
                         fallback_timeout = float(getattr(args, "joint_search_fallback_timeout", 8.0))
                         if fallback_timeout > 0.0:
                             pass_timeout = max(float(pass_timeout or 0.0), fallback_timeout)
@@ -9808,7 +11132,7 @@ def run_targeted_place_episode_curobo_direct(
     else:
         print("\n[dry-run] --execute-real was not provided, so motions will only be planned and previewed")
 
-    planner = curobo_wrapper._get_or_create_curobo_planner(args)
+    planner = _get_or_create_curobo_planner_serialized(args)
     if getattr(planner, "attached_object_active", False):
         print("[curobo] clearing stale attached payload before grasp planning")
         planner.detach_object_from_robot()
@@ -9883,23 +11207,71 @@ def run_targeted_place_episode_curobo_direct(
     grasp_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     all_grasp_candidates_for_fallback = list(grasp_candidates or [])
     initial_grasp_candidates = list(grasp_candidates or [])
+    prefetched_plan = None
+    prefetch_manager = getattr(args, "_next_cycle_prefetch_manager", None)
+    if prefetch_manager is not None:
+        try:
+            prefetched_plan = prefetch_manager.consume_for_current_cycle(
+                args,
+                getattr(args, "object_name", None),
+                grasp_start_q,
+                scene_capture_cache,
+            )
+        except Exception as exc:
+            print(f"[prefetch] failed to consume cached plan for {args.object_name}: {exc}")
+            prefetched_plan = None
     preselected_grasp = None
-    preselected_grasp = _fast_chain_preselect_grasp_place_pair(
-        planner,
-        demo,
-        bridge_mod,
-        args,
-        scene_capture_cache,
-        place_state_cache,
-        rule,
-        initial_grasp_candidates,
-        grasp_start_q,
-        disabled_world_collision_links=direct_grasp_disabled_links,
-    )
+    two_step_pregrasp_successes = []
+    if isinstance(prefetched_plan, dict):
+        prefetched_chain = prefetched_plan.get("selected_joint_chain")
+        prefetched_grasp = prefetched_plan.get("grasp_choice")
+        if isinstance(prefetched_chain, dict) and isinstance(prefetched_grasp, dict):
+            selected_joint_chain = dict(prefetched_chain)
+            selected_joint_chain["grasp_choice"] = dict(prefetched_grasp)
+            two_step_pregrasp_successes = [dict(prefetched_grasp)]
+            direct_grasp_max_winners = 1
+            _record_prefetch_profile(
+                args,
+                getattr(args, "object_name", None),
+                "next_cycle_prefetch_apply",
+                success=True,
+                status="APPLIED",
+                selected_grasp_label=str(prefetched_grasp.get("label", "")),
+                selected_place_label=str((selected_joint_chain.get("place_choice") or {}).get("label", "")),
+            )
+            print(
+                f"[prefetch] applying cached grasp/place plan for {args.object_name}; "
+                "winner_chain IK and transport MotionGen will be skipped if validation stays within tolerance"
+            )
+        else:
+            _record_prefetch_profile(
+                args,
+                getattr(args, "object_name", None),
+                "next_cycle_prefetch_apply",
+                success=False,
+                status="INVALID_PLAN_SHAPE",
+                has_selected_joint_chain=isinstance(prefetched_chain, dict),
+                has_grasp_choice=isinstance(prefetched_grasp, dict),
+            )
+            prefetched_plan = None
+    if prefetched_plan is None:
+        preselected_grasp = _fast_chain_preselect_grasp_place_pair(
+            planner,
+            demo,
+            bridge_mod,
+            args,
+            scene_capture_cache,
+            place_state_cache,
+            rule,
+            initial_grasp_candidates,
+            grasp_start_q,
+            disabled_world_collision_links=direct_grasp_disabled_links,
+        )
     if (
         rule is not None
         and bool(getattr(args, "fast_chain_screening", False))
         and preselected_grasp is None
+        and prefetched_plan is None
     ):
         print(
             "[FAIL] pair-first IK preselect found no complete grasp/place pair; "
@@ -9937,7 +11309,6 @@ def run_targeted_place_episode_curobo_direct(
             f"first={selected_label!r}, count={len(preselected_pair_grasps)}; "
             "candidate-stage grasp MotionGen is skipped"
         )
-    two_step_pregrasp_successes = []
     if preselected_grasp is not None:
         preselected_pair_grasps = [
             dict(item)
@@ -10033,6 +11404,12 @@ def run_targeted_place_episode_curobo_direct(
         print(
             f"[joint_search] skipped for {args.object_name}; "
             "will plan targeted place after executed grasp and post-grasp lift"
+        )
+    elif rule is not None and selected_joint_chain is not None:
+        selected_joint_chain["grasp_choice"] = grasp_choice
+        print(
+            f"[prefetch] reusing cached joint_search chain for {args.object_name}; "
+            "live transport MotionGen is skipped unless later start-state validation rejects reuse"
         )
     elif rule is not None:
         joint_chains = _evaluate_joint_grasp_place_chains(
@@ -10634,6 +12011,80 @@ def run_targeted_place_episode_curobo_direct(
         np.asarray(q, dtype=np.float32).reshape(-1)[:7]
         for q in place_choice.get("q_place_path", [np.asarray(q_pre_place_path[-1], dtype=np.float32).reshape(-1)[:7]])
     ]
+    if bool(getattr(args, "_planning_prefetch_capture_only", False)):
+        args._planning_prefetch_result = _build_prefetch_capture_result(
+            args,
+            start_q=start_q,
+            grasp_start_q=grasp_start_q,
+            selected_joint_chain=selected_joint_chain,
+            grasp_choice=grasp_choice,
+            place_choice=place_choice,
+            q_pre_place_path=q_pre_place_path,
+            q_place_path=q_place_path,
+        )
+        print(
+            f"[prefetch] captured reusable plan for target={args.object_name}; "
+            f"transport_waypoints={len(q_pre_place_path)}, place_waypoints={len(q_place_path)}"
+        )
+        return True
+    if (
+        not bool(getattr(args, "skip_return_to_cycle_start", False))
+        and bool(getattr(args, "return_to_start_preplan", True))
+    ):
+        predicted_return_start_q = None
+        place_mode_for_return_preplan = str(place_choice.get("place_mode", "drop_place"))
+        skip_clearance_for_return_preplan = bool(getattr(args, "skip_post_place_clearance", False))
+        force_clearance_for_return_preplan = (
+            skip_clearance_for_return_preplan
+            and place_mode_for_return_preplan == "insert_place"
+        )
+        if (
+            place_mode_for_return_preplan != "insert_place"
+            and not skip_clearance_for_return_preplan
+            and len(q_place_path) >= 2
+        ):
+            predicted_return_start_q = np.asarray(q_place_path[0], dtype=np.float32).reshape(-1)[:7]
+        elif skip_clearance_for_return_preplan and not force_clearance_for_return_preplan:
+            predicted_return_start_q = np.asarray(q_place_path[-1], dtype=np.float32).reshape(-1)[:7]
+        if predicted_return_start_q is not None:
+            return_extra_obstacles = _return_to_start_placed_obstacles(demo, args, place_choice=place_choice)
+            if return_extra_obstacles:
+                args._return_to_start_extra_scene_obstacles = _copy_scene_obstacle_entries(return_extra_obstacles)
+            if planner.attached_object_active:
+                planner.detach_object_from_robot()
+            prelift_planner_pose, prelift_lift_m = _prepare_return_preplan_prelift_pose(
+                demo,
+                planner,
+                args,
+                predicted_return_start_q,
+                placed_obstacles=return_extra_obstacles,
+            )
+            _start_return_to_start_preplan(
+                demo,
+                planner,
+                args,
+                predicted_return_start_q,
+                start_q,
+                prelift_planner_pose=prelift_planner_pose,
+                prelift_lift_m=prelift_lift_m,
+                extra_scene_obstacles=return_extra_obstacles,
+            )
+    prefetch_manager = getattr(args, "_next_cycle_prefetch_manager", None)
+    if prefetch_manager is not None:
+        try:
+            prefetch_manager.start_after_current_plan(
+                current_args=args,
+                scene_capture_cache=scene_capture_cache,
+                place_state_cache=place_state_cache,
+                rule=rule,
+                place_choice=place_choice,
+                predicted_next_start_q=start_q,
+                next_cycle_idx=int(getattr(args, "_single_scene_cycle_idx", 0) or 0) + 1,
+                failed_targets_this_cycle=getattr(args, "_next_cycle_prefetch_failed_targets_this_cycle", set()),
+                deferred_failed_targets=getattr(args, "_next_cycle_prefetch_deferred_failed_targets", set()),
+            )
+        except Exception as exc:
+            print(f"[prefetch] failed to start next-cycle plan prefetch: {exc}")
     slot_suffix = f", slot={place_choice['slot_name']}" if place_choice.get("slot_name") else ""
     variant_suffix = f", variant={place_choice['variant_label']}" if place_choice.get("variant_label") else ""
     print(
@@ -10745,6 +12196,9 @@ def run_targeted_place_episode_curobo_direct(
     )
     q_clearance_path = None
     skip_clearance_requested = bool(getattr(args, "skip_post_place_clearance", False))
+    placed_object_obstacles = _return_to_start_placed_obstacles(demo, args, place_choice=place_choice)
+    if placed_object_obstacles:
+        args._return_to_start_extra_scene_obstacles = _copy_scene_obstacle_entries(placed_object_obstacles)
     force_clearance_after_insert = (
         skip_clearance_requested
         and place_mode_name == "insert_place"
@@ -10811,6 +12265,7 @@ def run_targeted_place_episode_curobo_direct(
                     label="post_place_clearance",
                     include_active_object=False,
                     include_table=bool(getattr(args, "curobo_table_collision", True)),
+                    extra_scene_obstacles=placed_object_obstacles,
                 )
                 q_clearance_path = _plan_constrained_linear_segment(
                     planner,
@@ -10837,6 +12292,40 @@ def run_targeted_place_episode_curobo_direct(
     skipped_clearance_by_request = skip_clearance_requested and not force_clearance_after_insert
     if not q_clearance_path and not skipped_clearance_by_request:
         print("[place] skipped legacy post_place_clearance planner; enable --allow-demo-planner-rescue to use it")
+    if (
+        not bool(getattr(args, "skip_return_to_cycle_start", False))
+        and bool(getattr(args, "return_to_start_preplan", True))
+    ):
+        return_preplan_start_q = None
+        if q_clearance_path:
+            return_preplan_start_q = np.asarray(q_clearance_path[-1], dtype=np.float32).reshape(-1)[:7]
+        elif skipped_clearance_by_request:
+            return_preplan_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+        if return_preplan_start_q is not None:
+            return_extra_obstacles = placed_object_obstacles or _return_to_start_placed_obstacles(
+                demo,
+                args,
+                place_choice=place_choice,
+            )
+            if return_extra_obstacles:
+                args._return_to_start_extra_scene_obstacles = _copy_scene_obstacle_entries(return_extra_obstacles)
+            prelift_planner_pose, prelift_lift_m = _prepare_return_preplan_prelift_pose(
+                demo,
+                planner,
+                args,
+                return_preplan_start_q,
+                placed_obstacles=return_extra_obstacles,
+            )
+            _start_return_to_start_preplan(
+                demo,
+                planner,
+                args,
+                return_preplan_start_q,
+                start_q,
+                prelift_planner_pose=prelift_planner_pose,
+                prelift_lift_m=prelift_lift_m,
+                extra_scene_obstacles=return_extra_obstacles,
+            )
     clearance_executed = False
     if q_clearance_path:
         ok, _ = targeted.base.execute_pose_path_stage(
@@ -10914,6 +12403,1605 @@ def run_targeted_place_episode_curobo_direct(
     return return_ok
 
 
+def _single_scene_actor_name(actor, fallback: str = "") -> str:
+    try:
+        name = getattr(actor, "name", None)
+        if name:
+            return str(name)
+    except Exception:
+        pass
+    try:
+        name = actor.get_name()
+        if name:
+            return str(name)
+    except Exception:
+        pass
+    return str(fallback)
+
+
+def _single_scene_actor_pose_matrix(actor) -> np.ndarray | None:
+    if actor is None:
+        return None
+    try:
+        pose = actor.pose
+        p = targeted.base.flatten_np(pose.p)[:3].astype(np.float32)
+        q = targeted.base.flatten_np(pose.q)[:4].astype(np.float32)
+        return targeted.base.pose_to_matrix(p, q).astype(np.float32)
+    except Exception:
+        return None
+
+
+def _single_scene_cache_entry(scene_capture_cache, object_name: str | None):
+    normalized = curobo_wrapper.normalize_object_name(object_name)
+    if normalized is None or not isinstance(scene_capture_cache, dict):
+        return None
+    objects = scene_capture_cache.get("objects")
+    if not isinstance(objects, dict):
+        return None
+    entry = objects.get(normalized)
+    return entry if isinstance(entry, dict) else None
+
+
+def _single_scene_get_object_args(base_args, object_name: str):
+    try:
+        cycle_args, _ = targeted.base.make_cycle_args(base_args, object_name)
+        return cycle_args
+    except Exception:
+        return None
+
+
+def _single_scene_build_actor_registry(demo, base_args, scene_capture_cache, active_name: str, active_args) -> dict:
+    registry = {}
+    active_name = curobo_wrapper.normalize_object_name(active_name)
+    if active_name is not None:
+        registry[active_name] = {
+            "object_name": active_name,
+            "actor": getattr(getattr(demo, "base_env", None), "obj", None),
+            "actor_name": f"scene_obstacle_{active_name}",
+            "planner_actor_name": f"scene_obstacle_{active_name}",
+            "object_args": active_args,
+        }
+
+    actor_by_name = {}
+    env_unwrapped = getattr(getattr(demo, "env", None), "unwrapped", None)
+    for actor in list(getattr(env_unwrapped, "_scene_obstacle_actors", []) or []):
+        actor_name = _single_scene_actor_name(actor)
+        if actor_name:
+            actor_by_name[actor_name] = actor
+
+    for item in list(getattr(demo, "scene_obstacles", []) or []):
+        object_name = curobo_wrapper.normalize_object_name(item.get("object_name"))
+        if object_name is None:
+            continue
+        if object_name.startswith("virtual_") and _single_scene_cache_entry(scene_capture_cache, object_name) is None:
+            continue
+        actor_name = str(item.get("actor_name") or f"scene_obstacle_{object_name}")
+        object_args = _single_scene_get_object_args(base_args, object_name)
+        registry[object_name] = {
+            "object_name": object_name,
+            "actor": actor_by_name.get(actor_name),
+            "actor_name": actor_name,
+            "planner_actor_name": actor_name,
+            "object_args": object_args,
+            "seed_entry": dict(item),
+        }
+
+    if isinstance(scene_capture_cache, dict):
+        objects = scene_capture_cache.get("objects")
+        if isinstance(objects, dict):
+            for raw_name in objects.keys():
+                object_name = curobo_wrapper.normalize_object_name(raw_name)
+                if object_name is None or object_name in registry:
+                    continue
+                object_args = _single_scene_get_object_args(base_args, object_name)
+                registry[object_name] = {
+                    "object_name": object_name,
+                    "actor": None,
+                    "actor_name": f"scene_obstacle_{object_name}",
+                    "planner_actor_name": f"scene_obstacle_{object_name}",
+                    "object_args": object_args,
+                }
+
+    demo._single_scene_object_registry = registry
+    return registry
+
+
+def _single_scene_registry(demo) -> dict:
+    registry = getattr(demo, "_single_scene_object_registry", None)
+    return registry if isinstance(registry, dict) else {}
+
+
+def _single_scene_to_env_tensor(demo, values):
+    torch_mod = getattr(targeted.base, "torch", None)
+    if torch_mod is None:
+        return np.asarray(values, dtype=np.float32)
+    device = getattr(getattr(demo, "base_env", None), "device", None)
+    return torch_mod.as_tensor(values, dtype=torch_mod.float32, device=device)
+
+
+def _single_scene_update_active_asset_metadata(demo, args) -> None:
+    base_env = getattr(demo, "base_env", None)
+    if base_env is None:
+        return
+    asset_file = str(Path(str(args.sim_asset_file or args.mesh_file)).expanduser())
+    asset_scale = float(args.sim_asset_scale or args.mesh_scale or 1.0)
+    points = targeted.base.get_asset_local_points(asset_file, asset_scale)
+    lo = np.asarray(points.min(axis=0), dtype=np.float32).reshape(1, 3)
+    hi = np.asarray(points.max(axis=0), dtype=np.float32).reshape(1, 3)
+    base_env.obj_local_aabb_min = _single_scene_to_env_tensor(demo, lo)
+    base_env.obj_local_aabb_max = _single_scene_to_env_tensor(demo, hi)
+    base_env.object_zs = _single_scene_to_env_tensor(demo, np.asarray([-float(lo.reshape(3)[2])], dtype=np.float32))
+    base_env.object_initial_height = _single_scene_to_env_tensor(demo, np.asarray([-1.0], dtype=np.float32))
+    try:
+        base_env.object_asset_path = asset_file
+        base_env.object_scale_vec = np.asarray([asset_scale, asset_scale, asset_scale], dtype=float)
+    except Exception:
+        pass
+    if hasattr(base_env, "get_obj_xy_shortest_edge_vector"):
+        try:
+            torch_mod = getattr(targeted.base, "torch", None)
+            if torch_mod is not None:
+                with torch_mod.no_grad():
+                    base_env.obj_xy_shortest_edge_vector = base_env.get_obj_xy_shortest_edge_vector().detach()
+            else:
+                base_env.obj_xy_shortest_edge_vector = np.zeros((1, 3), dtype=np.float32)
+        except Exception:
+            pass
+
+
+def _single_scene_remove_planner_object(demo, object_name: str, actor_name: str | None = None) -> None:
+    names = {
+        str(actor_name or ""),
+        f"scene_obstacle_{object_name}",
+        str(object_name),
+    }
+    if object_name == curobo_wrapper.normalize_object_name(getattr(getattr(demo, "args", None), "object_name", None)):
+        names.add("jiaobang")
+    for name in [x for x in names if x]:
+        try:
+            demo.planner.remove_normal_object(name)
+        except Exception:
+            pass
+
+
+def _single_scene_set_planner_obstacle(demo, entry: dict) -> None:
+    if not bool(entry.get("planner_collision", False)):
+        return
+    actor_name = str(entry.get("actor_name") or entry.get("object_name") or "")
+    T_world_obj = entry.get("T_world_obj")
+    planner_box_size = entry.get("planner_box_size", entry.get("visual_box_size"))
+    if not actor_name or T_world_obj is None or planner_box_size is None:
+        return
+    try:
+        from mplib import collision_detection as mplib_cd
+
+        T_world_obj = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4)
+        pos = T_world_obj[:3, 3].astype(np.float32)
+        quat = targeted.base.bridge_mod_mat2quat(T_world_obj[:3, :3]).astype(np.float32)
+        dims = np.asarray(planner_box_size, dtype=np.float32).reshape(3)
+        collision_object = mplib_cd.fcl.CollisionObject(
+            mplib_cd.fcl.Box(dims.tolist()),
+            pos.tolist(),
+            quat.tolist(),
+        )
+        demo.planner.set_normal_object(actor_name, collision_object)
+    except Exception as exc:
+        print(f"[single_scene] warning: failed to update planner obstacle {actor_name}: {exc}")
+
+
+def _single_scene_obstacle_box_scale(args, object_name: str, placed: bool) -> float:
+    object_spec = targeted.base.get_object_spec(object_name)
+    fixed_scene_names = {
+        curobo_wrapper.normalize_object_name(name)
+        for name in (
+            list(getattr(args, "selected_obstacle_object_names", []) or [])
+            + list(getattr(args, "tracked_scene_object_names", []) or [])
+        )
+    }
+    fixed_scene_names.discard(None)
+    global_box_scale = float(max(getattr(args, "scene_obstacle_box_scale", 1.0), 1e-3))
+    object_box_scale = float(max(getattr(object_spec, "scene_obstacle_box_scale", 1.0) or 1.0, 1e-3))
+    non_fixed_object_box_scale = 1.2 if object_name not in fixed_scene_names else 1.0
+    placed_box_scale = (
+        float(max(getattr(args, "placed_scene_obstacle_box_scale", 1.0), 1e-3))
+        if placed
+        else 1.0
+    )
+    return float(global_box_scale * object_box_scale * non_fixed_object_box_scale * placed_box_scale)
+
+
+def _single_scene_build_obstacle_entry(demo, args, object_name: str, meta: dict, scene_capture_cache) -> dict | None:
+    object_name = curobo_wrapper.normalize_object_name(object_name)
+    if object_name is None:
+        return None
+    object_args = meta.get("object_args") or args
+    asset_file = str(Path(str(getattr(object_args, "sim_asset_file", None) or getattr(object_args, "mesh_file", ""))).expanduser())
+    asset_scale = float(getattr(object_args, "sim_asset_scale", None) or getattr(object_args, "mesh_scale", 1.0) or 1.0)
+    actor = meta.get("actor")
+    T_world_obj = _single_scene_actor_pose_matrix(actor)
+    cache_entry = _single_scene_cache_entry(scene_capture_cache, object_name)
+    if T_world_obj is None and cache_entry is not None and cache_entry.get("T_world_obj") is not None:
+        T_world_obj = np.asarray(cache_entry["T_world_obj"], dtype=np.float32).reshape(4, 4)
+    if T_world_obj is None:
+        return None
+    placed = bool(cache_entry.get("placed", False)) if isinstance(cache_entry, dict) else False
+    visual_box_size = targeted.base.get_asset_box_size(asset_file, asset_scale)
+    box_scale = _single_scene_obstacle_box_scale(args, object_name, placed)
+    planner_box_size = (np.asarray(visual_box_size, dtype=np.float32) * box_scale).astype(np.float32)
+    actor_name = str(meta.get("planner_actor_name") or meta.get("actor_name") or f"scene_obstacle_{object_name}")
+    return {
+        "object_name": object_name,
+        "actor_name": actor_name,
+        "label": str((cache_entry or {}).get("label", object_name)),
+        "score": float((cache_entry or {}).get("score", 1.0)),
+        "T_world_obj": T_world_obj,
+        "placed": placed,
+        "planner_collision": True,
+        "asset_file": asset_file,
+        "asset_scale": float(asset_scale),
+        "visual_box_size": np.asarray(visual_box_size, dtype=np.float32).copy(),
+        "planner_box_size": planner_box_size,
+        "planner_box_actor_name": str((meta.get("seed_entry") or {}).get("planner_box_actor_name", "")),
+    }
+
+
+def _single_scene_sync_obstacles(demo, args, selected_name: str, obstacle_names, scene_capture_cache) -> None:
+    selected_name = curobo_wrapper.normalize_object_name(selected_name)
+    registry = _single_scene_registry(demo)
+    registry_names = set(registry.keys())
+    desired_names = {
+        curobo_wrapper.normalize_object_name(name)
+        for name in list(obstacle_names or [])
+        if curobo_wrapper.normalize_object_name(name) is not None
+    }
+    if selected_name is not None:
+        desired_names.discard(selected_name)
+
+    existing_virtual_entries = []
+    for item in list(getattr(demo, "scene_obstacles", []) or []):
+        item_name = curobo_wrapper.normalize_object_name(item.get("object_name"))
+        if item_name not in registry_names:
+            existing_virtual_entries.append(item)
+
+    for object_name, meta in registry.items():
+        _single_scene_remove_planner_object(demo, object_name, meta.get("planner_actor_name") or meta.get("actor_name"))
+
+    obstacle_entries = []
+    obstacle_actors = []
+    for object_name in sorted(desired_names):
+        meta = registry.get(object_name)
+        if meta is None:
+            print(f"[single_scene] warning: no actor registered for obstacle {object_name}; skipping")
+            continue
+        entry = _single_scene_build_obstacle_entry(demo, args, object_name, meta, scene_capture_cache)
+        if entry is None:
+            print(f"[single_scene] warning: no pose available for obstacle {object_name}; skipping")
+            continue
+        obstacle_entries.append(entry)
+        _single_scene_set_planner_obstacle(demo, entry)
+        actor = meta.get("actor")
+        if actor is not None:
+            obstacle_actors.append(actor)
+
+    demo.scene_obstacles = obstacle_entries + existing_virtual_entries
+    try:
+        env_unwrapped = demo.env.unwrapped
+        virtual_actor_names = {
+            str(item.get("actor_name") or "")
+            for item in existing_virtual_entries
+            if item.get("actor_name")
+        }
+        virtual_actors = [
+            actor
+            for actor in list(getattr(env_unwrapped, "_scene_obstacle_actors", []) or [])
+            if _single_scene_actor_name(actor) in virtual_actor_names
+        ]
+        env_unwrapped._scene_obstacle_actors = obstacle_actors + virtual_actors
+    except Exception:
+        pass
+    print(
+        f"[single_scene] active={selected_name}, scene obstacle(s)="
+        f"{[item.get('object_name') for item in obstacle_entries]}"
+    )
+
+
+def _single_scene_activate_object(
+    demo,
+    bridge_mod,
+    base_args,
+    cycle_args,
+    selected_name: str,
+    obstacle_names,
+    scene_capture_cache,
+) -> bool:
+    selected_name = curobo_wrapper.normalize_object_name(selected_name)
+    registry = _single_scene_registry(demo)
+    meta = registry.get(selected_name)
+    if meta is None or meta.get("actor") is None:
+        print(f"[single_scene][FAIL] object {selected_name!r} is not present in the current ManiSkill scene")
+        return False
+
+    actor = meta["actor"]
+    base_env = demo.env.unwrapped
+    base_env.obj = actor
+    try:
+        base_env._objs = [actor]
+    except Exception:
+        pass
+    demo.base_env = base_env
+    demo.args = cycle_args
+    cycle_args._single_scene_active_object_name = selected_name
+    _single_scene_update_active_asset_metadata(demo, cycle_args)
+    apply_physics_profile = getattr(bridge_mod, "apply_pick_object_physics_profile", None)
+    if callable(apply_physics_profile):
+        apply_physics_profile(demo.env, cycle_args)
+    _single_scene_sync_obstacles(demo, cycle_args, selected_name, obstacle_names, scene_capture_cache)
+    try:
+        demo.refresh_runtime_handles(rebuild_visual=False)
+    except Exception:
+        pass
+    if bool(getattr(cycle_args, "freeze_active_object_before_grasp", True)):
+        demo._freeze_active_object_before_grasp = False
+        demo._frozen_active_object_pose = None
+        targeted.base.set_pregrasp_object_freeze(demo, True)
+        targeted.base.refresh_frozen_active_object_pose(demo)
+    print(f"[single_scene] switched active object to {selected_name} without recreating env")
+    return True
+
+
+def _single_scene_restore_after_failed_attempt(
+    demo,
+    args,
+    scene_capture_cache,
+    selected_name: str,
+    cycle_start_q,
+) -> None:
+    if demo is None:
+        return
+    selected_name = curobo_wrapper.normalize_object_name(selected_name)
+    restored_fields = []
+    try:
+        planner = _get_or_create_curobo_planner_serialized(args)
+        if getattr(planner, "attached_object_active", False):
+            planner.detach_object_from_robot()
+            restored_fields.append("curobo_attached")
+    except Exception:
+        pass
+    try:
+        targeted.base.sync_demo_gripper_state(demo, closed=False, steps=4)
+        restored_fields.append("gripper")
+    except Exception:
+        pass
+    try:
+        targeted.base.set_pregrasp_object_freeze(demo, False)
+    except Exception:
+        pass
+    try:
+        demo._attached_box_visual_visible = False
+        demo._attached_object_visual_active = False
+        targeted.base.update_attached_box_visual(demo, visible=False)
+        restored_fields.append("attached_visual")
+    except Exception:
+        pass
+    _clear_visualized_attached_spheres(demo)
+    _restore_transport_payload_state(
+        demo,
+        {
+            "_transport_attached_T_tcp_obj": _MISSING_ATTR,
+            "attached_box_size": _MISSING_ATTR,
+            "attached_box_pose_tcp": _MISSING_ATTR,
+            "_attached_object_visual_active": False,
+            "_attached_box_visual_visible": False,
+        },
+    )
+    entry = _single_scene_cache_entry(scene_capture_cache, selected_name)
+    T_world_obj = None if not isinstance(entry, dict) else entry.get("T_world_obj")
+    if T_world_obj is not None and not bool((entry or {}).get("placed", False)):
+        try:
+            pose = _pose_from_world_matrix(np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4))
+            registry = _single_scene_registry(demo)
+            actor = (registry.get(selected_name) or {}).get("actor")
+            if actor is not None:
+                actor.set_pose(pose)
+                zero_vel = np.zeros(3, dtype=np.float32)
+                for method_name in ("set_linear_velocity", "set_velocity"):
+                    method = getattr(actor, method_name, None)
+                    if callable(method):
+                        method(zero_vel)
+                ang_method = getattr(actor, "set_angular_velocity", None)
+                if callable(ang_method):
+                    ang_method(zero_vel)
+            elif selected_name == curobo_wrapper.normalize_object_name(getattr(args, "object_name", None)):
+                _set_active_object_pose_quiet(demo, pose.p, pose.q)
+            restored_fields.append("object_pose")
+        except Exception as exc:
+            print(f"[single_scene] warning: failed to restore object pose for {selected_name}: {exc}")
+    q_restore = _q7_or_none(cycle_start_q)
+    if q_restore is not None:
+        try:
+            targeted.base.sync_demo_arm_qpos(demo, q_restore)
+            restored_fields.append("arm_q")
+        except Exception as exc:
+            print(f"[single_scene] warning: failed to restore arm q after failed {selected_name}: {exc}")
+    try:
+        if bool(getattr(args, "freeze_active_object_before_grasp", True)):
+            targeted.base.set_pregrasp_object_freeze(demo, True)
+            targeted.base.refresh_frozen_active_object_pose(demo)
+    except Exception:
+        pass
+    print(
+        f"[single_scene] restored simulation state after failed target={selected_name}: "
+        f"{sorted(set(restored_fields))}"
+    )
+    _record_profile(
+        args,
+        "failed_attempt_restore",
+        success=True,
+        status="RESTORED",
+        target_name=selected_name,
+        restored_fields=sorted(set(restored_fields)),
+        restored_arm_q=q_restore is not None,
+        restored_object_pose=T_world_obj is not None,
+    )
+
+
+_PREFETCH_DROP_KEYS = {
+    "result",
+    "raw_result",
+    "planner_pose",
+    "terminal_align",
+    "place_plan",
+}
+_PREFETCH_UNSAFE = object()
+
+
+def _prefetch_safe_copy_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, Path):
+        return Path(value)
+    if isinstance(value, types.ModuleType) or callable(value):
+        return _PREFETCH_UNSAFE
+    if isinstance(value, dict):
+        copied = {}
+        for key, item in value.items():
+            copied_key = _prefetch_safe_copy_value(key)
+            copied_item = _prefetch_safe_copy_value(item)
+            if copied_key is _PREFETCH_UNSAFE or copied_item is _PREFETCH_UNSAFE:
+                continue
+            copied[copied_key] = copied_item
+        return copied
+    if isinstance(value, list):
+        copied = []
+        for item in value:
+            copied_item = _prefetch_safe_copy_value(item)
+            if copied_item is not _PREFETCH_UNSAFE:
+                copied.append(copied_item)
+        return copied
+    if isinstance(value, tuple):
+        copied = []
+        for item in value:
+            copied_item = _prefetch_safe_copy_value(item)
+            if copied_item is not _PREFETCH_UNSAFE:
+                copied.append(copied_item)
+        return tuple(copied)
+    if hasattr(value, "__dict__"):
+        return _copy_namespace_like(value)
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return _PREFETCH_UNSAFE
+
+
+def _copy_namespace_like(value):
+    if hasattr(value, "__dict__"):
+        try:
+            copied = {}
+            for key, item in vars(value).items():
+                copied_item = _prefetch_safe_copy_value(item)
+                if copied_item is not _PREFETCH_UNSAFE:
+                    copied[str(key)] = copied_item
+            return targeted.argparse.Namespace(**copied)
+        except Exception:
+            pass
+    return value
+
+
+def _copy_scene_capture_cache_for_prefetch(scene_capture_cache) -> dict:
+    if not isinstance(scene_capture_cache, dict):
+        return {}
+    copied: dict = {}
+    for key, value in scene_capture_cache.items():
+        if key == "objects" and isinstance(value, dict):
+            objects = {}
+            for raw_name, raw_entry in value.items():
+                if not isinstance(raw_entry, dict):
+                    continue
+                entry = {}
+                for entry_key, entry_value in raw_entry.items():
+                    if isinstance(entry_value, np.ndarray):
+                        entry[entry_key] = entry_value.copy()
+                    elif entry_key == "object_args":
+                        entry[entry_key] = _copy_namespace_like(entry_value)
+                    else:
+                        copied_value = _prefetch_safe_copy_value(entry_value)
+                        if copied_value is not _PREFETCH_UNSAFE:
+                            entry[entry_key] = copied_value
+                objects[raw_name] = entry
+            copied[key] = objects
+        elif key == "scene_obstacles" and isinstance(value, list):
+            obstacles = []
+            for item in value:
+                if isinstance(item, dict):
+                    copied_item = _prefetch_safe_copy_value(item)
+                    if copied_item is not _PREFETCH_UNSAFE:
+                        obstacles.append(copied_item)
+            copied[key] = obstacles
+        elif isinstance(value, np.ndarray):
+            copied[key] = value.copy()
+        elif key == "fp_rt":
+            # FoundationPose runtime is not deep-copyable; the prefetch path only
+            # reuses cached poses, so sharing the reference is sufficient.
+            copied[key] = value
+        else:
+            copied_value = _prefetch_safe_copy_value(value)
+            if copied_value is not _PREFETCH_UNSAFE:
+                copied[key] = copied_value
+    return copied
+
+
+def _predicted_place_T_world_obj(place_choice) -> np.ndarray | None:
+    if not isinstance(place_choice, dict):
+        return None
+    for value in (
+        place_choice.get("T_world_obj_desired"),
+        getattr(place_choice.get("place_plan", None), "T_world_obj_desired", None),
+    ):
+        if value is None:
+            continue
+        try:
+            return np.asarray(value, dtype=np.float32).reshape(4, 4).copy()
+        except Exception:
+            continue
+    return None
+
+
+def _apply_predicted_place_to_scene_cache(scene_capture_cache: dict, object_name: str | None, object_args, place_choice) -> np.ndarray | None:
+    normalized = curobo_wrapper.normalize_object_name(object_name)
+    T_world_obj = _predicted_place_T_world_obj(place_choice)
+    if normalized is None or T_world_obj is None or not isinstance(scene_capture_cache, dict):
+        return None
+    objects = scene_capture_cache.setdefault("objects", {})
+    if not isinstance(objects, dict):
+        return None
+    old_entry = objects.get(normalized, {}) if isinstance(objects.get(normalized), dict) else {}
+    objects[normalized] = {
+        "object_name": normalized,
+        "label": str(old_entry.get("label", getattr(object_args, "target_object_name", "") or normalized)),
+        "score": float(old_entry.get("score", 1.0)),
+        "box": np.asarray(old_entry.get("box", np.zeros(4, dtype=np.float32)), dtype=np.float32).reshape(4),
+        "T_cam_obj": np.asarray(old_entry.get("T_cam_obj", np.eye(4, dtype=np.float32)), dtype=np.float32).reshape(4, 4),
+        "T_world_obj": T_world_obj,
+        "object_args": _copy_namespace_like(object_args),
+        "placed": True,
+    }
+    return T_world_obj
+
+
+def _copy_place_state_cache_for_prefetch(place_state_cache) -> dict:
+    if isinstance(place_state_cache, dict):
+        try:
+            return copy.deepcopy(place_state_cache)
+        except Exception:
+            return {"used_slots_by_target": dict(place_state_cache.get("used_slots_by_target", {}) or {})}
+    return {"used_slots_by_target": {}}
+
+
+def _sanitize_prefetch_value(value, _memo: set[int] | None = None, _depth: int = 0):
+    if _memo is None:
+        _memo = set()
+    if _depth > 80:
+        return _PREFETCH_UNSAFE
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.astype(np.float32, copy=True) if value.dtype.kind in {"f", "i", "u"} else value.copy()
+    if isinstance(value, Path):
+        return Path(value)
+    if isinstance(value, types.ModuleType) or callable(value):
+        return _PREFETCH_UNSAFE
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in _memo:
+            return _PREFETCH_UNSAFE
+        _memo.add(value_id)
+        copied = {}
+        try:
+            for key, item in value.items():
+                if str(key) in _PREFETCH_DROP_KEYS:
+                    continue
+                copied_item = _sanitize_prefetch_value(item, _memo, _depth + 1)
+                if copied_item is not _PREFETCH_UNSAFE:
+                    copied[str(key)] = copied_item
+            return copied
+        finally:
+            _memo.discard(value_id)
+    if isinstance(value, list):
+        value_id = id(value)
+        if value_id in _memo:
+            return _PREFETCH_UNSAFE
+        _memo.add(value_id)
+        try:
+            copied = []
+            for item in value:
+                copied_item = _sanitize_prefetch_value(item, _memo, _depth + 1)
+                if copied_item is not _PREFETCH_UNSAFE:
+                    copied.append(copied_item)
+            return copied
+        finally:
+            _memo.discard(value_id)
+    if isinstance(value, tuple):
+        value_id = id(value)
+        if value_id in _memo:
+            return _PREFETCH_UNSAFE
+        _memo.add(value_id)
+        try:
+            copied = []
+            for item in value:
+                copied_item = _sanitize_prefetch_value(item, _memo, _depth + 1)
+                if copied_item is not _PREFETCH_UNSAFE:
+                    copied.append(copied_item)
+            return tuple(copied)
+        finally:
+            _memo.discard(value_id)
+    return value
+
+
+def _with_prefetch_goal_pose(value):
+    if not isinstance(value, dict):
+        return value
+    copied = dict(value)
+    if copied.get("T_world_obj_desired") is None:
+        place_plan = copied.get("place_plan")
+        T_world_obj_desired = getattr(place_plan, "T_world_obj_desired", None)
+        if T_world_obj_desired is not None:
+            try:
+                copied["T_world_obj_desired"] = np.asarray(T_world_obj_desired, dtype=np.float32).reshape(4, 4).copy()
+            except Exception:
+                pass
+    return copied
+
+
+def _selected_chain_with_prefetch_goal_pose(selected_joint_chain):
+    if not isinstance(selected_joint_chain, dict):
+        return selected_joint_chain
+    copied = dict(selected_joint_chain)
+    for key in ("pre_place_choice", "place_choice"):
+        if isinstance(copied.get(key), dict):
+            copied[key] = _with_prefetch_goal_pose(copied[key])
+    return copied
+
+
+def _build_prefetch_capture_result(
+    args,
+    *,
+    start_q,
+    grasp_start_q,
+    selected_joint_chain,
+    grasp_choice,
+    place_choice,
+    q_pre_place_path,
+    q_place_path,
+) -> dict:
+    selected_joint_chain = _selected_chain_with_prefetch_goal_pose(selected_joint_chain)
+    place_choice = _with_prefetch_goal_pose(place_choice)
+    return {
+        "target_name": curobo_wrapper.normalize_object_name(getattr(args, "object_name", None)),
+        "start_q": np.asarray(start_q, dtype=np.float32).reshape(-1)[:7].copy(),
+        "grasp_start_q": np.asarray(grasp_start_q, dtype=np.float32).reshape(-1)[:7].copy(),
+        "selected_joint_chain": _sanitize_prefetch_value(selected_joint_chain),
+        "grasp_choice": _sanitize_prefetch_value(grasp_choice),
+        "place_choice": _sanitize_prefetch_value(place_choice),
+        "q_pre_place_path": [np.asarray(q, dtype=np.float32).reshape(-1)[:7].copy() for q in list(q_pre_place_path or [])],
+        "q_place_path": [np.asarray(q, dtype=np.float32).reshape(-1)[:7].copy() for q in list(q_place_path or [])],
+    }
+
+
+class _NextCyclePlanPrefetchManager:
+    def __init__(self, create_demo_func, bridge_mod, planner_mod, base_args, cycle_object_sequence):
+        self.create_demo_func = create_demo_func
+        self.bridge_mod = bridge_mod
+        self.planner_mod = planner_mod
+        self.base_args = base_args
+        self.cycle_object_sequence = list(cycle_object_sequence or [])
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._reserved: dict | None = None
+        self._result: dict | None = None
+
+    def reserved_target_for_cycle(self, cycle_idx: int, scene_capture_cache, failed_targets, deferred_targets) -> str | None:
+        with self._lock:
+            reserved = dict(self._reserved or {})
+        if int(reserved.get("cycle_idx", -1)) != int(cycle_idx):
+            return None
+        target_name = curobo_wrapper.normalize_object_name(reserved.get("target_name"))
+        if target_name is None:
+            return None
+        if target_name in set(failed_targets or set()) or target_name in set(deferred_targets or set()):
+            return None
+        entry = _single_scene_cache_entry(scene_capture_cache, target_name)
+        if isinstance(entry, dict) and bool(entry.get("placed", False)):
+            return None
+        return target_name
+
+    def start_after_current_plan(
+        self,
+        *,
+        current_args,
+        scene_capture_cache,
+        place_state_cache,
+        rule,
+        place_choice,
+        predicted_next_start_q,
+        next_cycle_idx: int,
+        failed_targets_this_cycle,
+        deferred_failed_targets,
+    ) -> None:
+        current_object_name = curobo_wrapper.normalize_object_name(getattr(current_args, "object_name", None))
+
+        def record_start(status: str, *, target_name=None, success: bool = False, **fields) -> None:
+            _record_prefetch_profile(
+                self.base_args,
+                curobo_wrapper.normalize_object_name(target_name) or current_object_name,
+                "next_cycle_prefetch_start",
+                success=success,
+                status=status,
+                cycle_idx=int(next_cycle_idx),
+                current_object_name=current_object_name,
+                **fields,
+            )
+
+        if not bool(getattr(current_args, "next_cycle_plan_prefetch", True)):
+            record_start("DISABLED")
+            return
+        if bool(getattr(current_args, "skip_return_to_cycle_start", False)):
+            print("[prefetch] next-cycle plan prefetch skipped: next start_q is not fixed when return_to_start is skipped")
+            record_start("SKIP_RETURN_TO_START")
+            return
+        predicted_next_start_q = _q7_or_none(predicted_next_start_q)
+        if predicted_next_start_q is None:
+            record_start("NO_PREDICTED_START_Q")
+            return
+        scene_snapshot = _copy_scene_capture_cache_for_prefetch(scene_capture_cache)
+        placed_T = _apply_predicted_place_to_scene_cache(
+            scene_snapshot,
+            getattr(current_args, "object_name", None),
+            current_args,
+            place_choice,
+        )
+        if placed_T is None:
+            print("[prefetch] next-cycle plan prefetch skipped: current place result has no predicted object world pose")
+            record_start("NO_PREDICTED_PLACED_POSE")
+            return
+        place_state_snapshot = _copy_place_state_cache_for_prefetch(place_state_cache)
+        try:
+            targeted._mark_place_rule_success(rule, place_state_snapshot, place_choice.get("slot_name"))
+        except Exception:
+            pass
+        cached_scene_names = targeted.base.list_cached_scene_object_names(scene_snapshot)
+        available_rule_names = targeted._list_cached_unplaced_rule_names(scene_snapshot)
+        selected_name, target_pool, target_candidates = targeted._select_random_cycle_target(
+            self.base_args,
+            self.cycle_object_sequence,
+            scene_snapshot,
+            available_rule_names,
+            set(failed_targets_this_cycle or set()),
+            set(deferred_failed_targets or set()),
+            int(next_cycle_idx),
+        )
+        selected_name = curobo_wrapper.normalize_object_name(selected_name)
+        if selected_name is None:
+            print("[prefetch] next-cycle plan prefetch skipped: no remaining target after predicted current place")
+            record_start(
+                "NO_TARGET",
+                target_pool=list(target_pool or []),
+                target_candidates=list(target_candidates or []),
+            )
+            return
+        selected_obstacles = targeted._derive_cycle_obstacle_names(
+            self.base_args,
+            int(next_cycle_idx),
+            selected_name,
+            self.cycle_object_sequence,
+            cached_scene_names,
+        )
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                print(
+                    f"[prefetch] previous next-cycle prefetch is still running; "
+                    f"not starting another one for {selected_name}"
+                )
+                record_start(
+                    "PREVIOUS_RUNNING",
+                    target_name=selected_name,
+                    target_pool=list(target_pool or []),
+                    target_candidates=list(target_candidates or []),
+                )
+                return
+            self._reserved = {
+                "cycle_idx": int(next_cycle_idx),
+                "target_name": selected_name,
+                "target_pool": list(target_pool or []),
+                "target_candidates": list(target_candidates or []),
+            }
+            self._result = None
+            self._thread = threading.Thread(
+                target=self._worker,
+                name=f"next-cycle-prefetch-{selected_name}",
+                kwargs={
+                    "target_name": selected_name,
+                    "next_cycle_idx": int(next_cycle_idx),
+                    "selected_obstacles": list(selected_obstacles),
+                    "scene_snapshot": scene_snapshot,
+                    "place_state_snapshot": place_state_snapshot,
+                    "predicted_start_q": predicted_next_start_q.copy(),
+                    "placed_object_name": curobo_wrapper.normalize_object_name(getattr(current_args, "object_name", None)),
+                    "placed_T": placed_T.copy(),
+                },
+                daemon=True,
+            )
+            self._thread.start()
+        record_start(
+            "STARTED",
+            target_name=selected_name,
+            success=True,
+            target_pool=list(target_pool or []),
+            target_candidates=list(target_candidates or []),
+            selected_obstacles=list(selected_obstacles),
+        )
+        print(
+            f"[prefetch] started background plan for cycle {int(next_cycle_idx)} target={selected_name}; "
+            f"reserved next target from candidates={list(target_candidates or [])}"
+        )
+
+    def _worker(
+        self,
+        *,
+        target_name: str,
+        next_cycle_idx: int,
+        selected_obstacles: list[str],
+        scene_snapshot: dict,
+        place_state_snapshot: dict,
+        predicted_start_q: np.ndarray,
+        placed_object_name: str | None,
+        placed_T: np.ndarray,
+    ) -> None:
+        env = None
+        status = "FAILED"
+        result = None
+        error_text = None
+        started = time.perf_counter()
+        try:
+            with _profile_record_context(
+                is_prefetch=True,
+                prefetch_cycle_idx=int(next_cycle_idx),
+                prefetch_target_name=target_name,
+            ), _suspend_profile_counters_for_thread():
+                prefetch_args, spec = targeted.base.make_cycle_args(self.base_args, target_name)
+                prefetch_args._targeted_place_state_cache = place_state_snapshot
+                prefetch_args.selected_obstacle_object_names = list(selected_obstacles)
+                prefetch_args.required_scene_object_names = list(selected_obstacles)
+                prefetch_args.execute_real = False
+                prefetch_args.auto_execute = True
+                prefetch_args.render_mode = "rgb_array"
+                prefetch_args.planning_profile_enabled = bool(
+                    getattr(self.base_args, "planning_profile_enabled", True)
+                )
+                prefetch_args.planning_profile_jsonl = getattr(self.base_args, "planning_profile_jsonl", None)
+                prefetch_args.planning_profile_dir = getattr(
+                    self.base_args,
+                    "planning_profile_dir",
+                    "planning_profile_logs",
+                )
+                prefetch_args.next_cycle_plan_prefetch = False
+                prefetch_args.single_confirm_per_object = False
+                prefetch_args._planning_prefetch_capture_only = True
+                prefetch_args._curobo_planner_cache_namespace = f"prefetch_{target_name}"
+                prefetch_args._targeted_place_state_cache = place_state_snapshot
+                print(
+                    f"[prefetch] worker planning cycle {int(next_cycle_idx)} target={target_name} "
+                    f"mesh={getattr(prefetch_args, 'mesh_file', '')}"
+                )
+                with _profile_stage(prefetch_args, "next_cycle_prefetch_create_demo") as prof:
+                    env, demo = self.create_demo_func(
+                        prefetch_args,
+                        self.bridge_mod,
+                        self.planner_mod,
+                        scene_capture_cache=scene_snapshot,
+                    )
+                    prof["success"] = True
+                    prof["status"] = "Success"
+                with _profile_stage(
+                    prefetch_args,
+                    "next_cycle_prefetch_activate_object",
+                    selected_obstacle_count=len(list(selected_obstacles or [])),
+                ) as prof:
+                    _single_scene_build_actor_registry(demo, self.base_args, scene_snapshot, target_name, prefetch_args)
+                    activated = _single_scene_activate_object(
+                        demo,
+                        self.bridge_mod,
+                        self.base_args,
+                        prefetch_args,
+                        target_name,
+                        selected_obstacles,
+                        scene_snapshot,
+                    )
+                    prof["success"] = bool(activated)
+                    prof["status"] = "Success" if activated else "ACTIVATE_FAIL"
+                if not activated:
+                    status = "ACTIVATE_FAIL"
+                else:
+                    targeted.base.sync_demo_arm_qpos(demo, predicted_start_q)
+                    with _profile_stage(prefetch_args, "next_cycle_prefetch_run_episode") as prof:
+                        ok = run_targeted_place_episode_curobo_direct(
+                            demo,
+                            self.bridge_mod,
+                            None,
+                            prefetch_args,
+                            scene_snapshot,
+                            place_state_snapshot,
+                        )
+                        result = getattr(prefetch_args, "_planning_prefetch_result", None)
+                        status = "Success" if ok and isinstance(result, dict) else "PLAN_FAIL"
+                        prof["success"] = status == "Success"
+                        prof["status"] = status
+                        prof["plan_available"] = isinstance(result, dict)
+        except Exception:
+            status = "EXCEPTION"
+            error_text = traceback.format_exc()
+            print("[prefetch] worker failed:\n" + error_text)
+        finally:
+            if env is not None:
+                try:
+                    targeted.base.close_env_quietly(env)
+                except Exception:
+                    pass
+                gc.collect()
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        payload = {
+            "cycle_idx": int(next_cycle_idx),
+            "target_name": target_name,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "predicted_start_q": predicted_start_q.copy(),
+            "placed_object_name": placed_object_name,
+            "placed_T": placed_T.copy(),
+            "plan": result if isinstance(result, dict) else None,
+            "error_text": error_text,
+        }
+        with self._lock:
+            self._result = payload
+        _record_prefetch_profile(
+            self.base_args,
+            target_name,
+            "next_cycle_prefetch_worker",
+            success=status == "Success",
+            status=status,
+            cycle_idx=int(next_cycle_idx),
+            elapsed_ms=elapsed_ms,
+            selected_obstacle_count=len(list(selected_obstacles or [])),
+            plan_available=isinstance(result, dict),
+            error_text=None if error_text is None else str(error_text)[-6000:],
+        )
+        print(f"[prefetch] worker finished target={target_name} status={status} elapsed_ms={elapsed_ms:.1f}")
+
+    def consume_for_current_cycle(self, args, target_name: str, start_q, scene_capture_cache) -> dict | None:
+        target_name = curobo_wrapper.normalize_object_name(target_name)
+        cycle_idx = int(getattr(args, "_single_scene_cycle_idx", 0) or 0)
+        wait_timeout = float(max(getattr(args, "next_cycle_prefetch_wait_timeout", 30.0), 0.0))
+
+        def record_consume(status: str, *, success: bool = False, **fields) -> None:
+            _record_prefetch_profile(
+                args,
+                target_name,
+                "next_cycle_prefetch_consume",
+                success=success,
+                status=status,
+                cycle_idx=cycle_idx,
+                wait_timeout=wait_timeout,
+                **fields,
+            )
+
+        with self._lock:
+            thread = self._thread
+            reserved = dict(self._reserved or {})
+        reserved_match = int(reserved.get("cycle_idx", -1)) == cycle_idx and reserved.get("target_name") == target_name
+        if reserved_match:
+            if thread is not None and thread.is_alive() and wait_timeout > 0:
+                print(f"[prefetch] waiting up to {wait_timeout:.2f}s for reserved plan target={target_name}")
+                thread.join(wait_timeout)
+        thread_alive = bool(thread is not None and thread.is_alive())
+        with self._lock:
+            payload = dict(self._result or {})
+        if int(payload.get("cycle_idx", -1)) != cycle_idx or payload.get("target_name") != target_name:
+            record_consume(
+                "NOT_READY" if reserved_match else "NO_RESERVED_RESULT",
+                reserved_match=reserved_match,
+                reserved_cycle_idx=reserved.get("cycle_idx"),
+                reserved_target=reserved.get("target_name"),
+                result_cycle_idx=payload.get("cycle_idx"),
+                result_target=payload.get("target_name"),
+                thread_alive=thread_alive,
+            )
+            return None
+        if payload.get("status") != "Success" or not isinstance(payload.get("plan"), dict):
+            print(f"[prefetch] reserved plan for {target_name} unavailable: status={payload.get('status')}")
+            record_consume(
+                "WORKER_FAIL",
+                worker_status=payload.get("status"),
+                worker_elapsed_ms=payload.get("elapsed_ms"),
+                worker_error_text=None if payload.get("error_text") is None else str(payload.get("error_text"))[-6000:],
+                thread_alive=thread_alive,
+            )
+            return None
+        current_q = _q7_or_none(start_q)
+        predicted_q = _q7_or_none(payload.get("predicted_start_q"))
+        if current_q is None or predicted_q is None:
+            record_consume(
+                "START_Q_UNAVAILABLE",
+                current_q_available=current_q is not None,
+                predicted_q_available=predicted_q is not None,
+                worker_elapsed_ms=payload.get("elapsed_ms"),
+            )
+            return None
+        q_delta = float(np.max(np.abs(current_q - predicted_q)))
+        q_tol = float(max(getattr(args, "next_cycle_prefetch_start_q_tolerance", 0.08), 0.0))
+        if q_delta > q_tol:
+            print(f"[prefetch] rejected plan for {target_name}: start_q_delta={q_delta:.4f} > tol={q_tol:.4f}")
+            record_consume(
+                "START_Q_MISMATCH",
+                q_delta=q_delta,
+                q_tol=q_tol,
+                worker_elapsed_ms=payload.get("elapsed_ms"),
+            )
+            return None
+        placed_name = curobo_wrapper.normalize_object_name(payload.get("placed_object_name"))
+        predicted_T = payload.get("placed_T")
+        pos_delta = None
+        pos_tol = None
+        if placed_name is not None and predicted_T is not None:
+            entry = _single_scene_cache_entry(scene_capture_cache, placed_name)
+            actual_T = None if not isinstance(entry, dict) else entry.get("T_world_obj")
+            if actual_T is not None:
+                try:
+                    predicted_T = np.asarray(predicted_T, dtype=np.float32).reshape(4, 4)
+                    actual_T = np.asarray(actual_T, dtype=np.float32).reshape(4, 4)
+                    pos_delta = float(np.linalg.norm(predicted_T[:3, 3] - actual_T[:3, 3]))
+                    pos_tol = float(max(getattr(args, "next_cycle_prefetch_scene_pos_tolerance_m", 0.05), 0.0))
+                    if pos_delta > pos_tol:
+                        print(
+                            f"[prefetch] rejected plan for {target_name}: placed {placed_name} "
+                            f"pos_delta={pos_delta:.4f}m > tol={pos_tol:.4f}m"
+                        )
+                        record_consume(
+                            "SCENE_POSE_MISMATCH",
+                            placed_object_name=placed_name,
+                            pos_delta=pos_delta,
+                            pos_tol=pos_tol,
+                            q_delta=q_delta,
+                            q_tol=q_tol,
+                            worker_elapsed_ms=payload.get("elapsed_ms"),
+                        )
+                        return None
+                except Exception:
+                    record_consume(
+                        "SCENE_POSE_COMPARE_ERROR",
+                        placed_object_name=placed_name,
+                        q_delta=q_delta,
+                        q_tol=q_tol,
+                        worker_elapsed_ms=payload.get("elapsed_ms"),
+                    )
+                    return None
+        plan = dict(payload["plan"])
+        with self._lock:
+            self._result = None
+            self._reserved = None
+        record_consume(
+            "HIT",
+            success=True,
+            q_delta=q_delta,
+            q_tol=q_tol,
+            placed_object_name=placed_name,
+            pos_delta=pos_delta,
+            pos_tol=pos_tol,
+            worker_elapsed_ms=payload.get("elapsed_ms"),
+        )
+        print(
+            f"[prefetch] using cached plan for {target_name}: "
+            f"elapsed_ms={float(payload.get('elapsed_ms', 0.0) or 0.0):.1f}, start_q_delta={q_delta:.4f}"
+        )
+        return plan
+
+    def shutdown(self, timeout: float = 0.1) -> None:
+        with self._lock:
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(float(max(timeout, 0.0)))
+
+
+def _estimate_real_waypoint_stream_duration_s(q_start, q_path, args) -> float:
+    points = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    if not points:
+        return 0.0
+    hz = float(max(getattr(args, "real_control_hz", 10.0), 1e-3))
+    max_delta = float(max(getattr(args, "real_max_delta_per_step", 0.03), 1e-6))
+    hold_steps = int(max(getattr(args, "real_hold_steps", 0), 0))
+    prev = _q7_or_none(q_start)
+    if prev is None:
+        prev = points[0]
+    total_steps = 0
+    for q in points:
+        delta = float(np.max(np.abs(q - prev)))
+        if delta > 1e-6:
+            total_steps += max(1, int(np.ceil(delta / max_delta)))
+        prev = q
+    if total_steps <= 0:
+        total_steps = 1
+    total_steps += hold_steps
+    return float(total_steps) / hz
+
+
+def _dry_run_motion_window_enabled(args) -> bool:
+    if bool(getattr(args, "execute_real", False)):
+        return False
+    if bool(getattr(args, "_planning_prefetch_capture_only", False)):
+        return False
+    scale = float(max(getattr(args, "dry_run_motion_window_scale", 0.0), 0.0))
+    return bool(scale > 0.0)
+
+
+def _dry_run_motion_window_duration_s(q_start, q_path, args) -> float:
+    scale = float(max(getattr(args, "dry_run_motion_window_scale", 0.0), 0.0))
+    duration_s = _estimate_real_waypoint_stream_duration_s(q_start, q_path, args) * scale
+    if list(q_path or []):
+        duration_s = max(duration_s, float(max(getattr(args, "dry_run_motion_window_min_s", 0.0), 0.0)))
+    max_s = float(getattr(args, "dry_run_motion_window_max_s", 30.0) or 0.0)
+    if max_s > 0.0:
+        duration_s = min(duration_s, max_s)
+    return float(max(duration_s, 0.0))
+
+
+def _render_dry_run_motion_frame(demo, bridge_mod, args) -> None:
+    if getattr(args, "render_mode", None) != "human":
+        return
+    try:
+        bridge_mod.render_preview(demo.env, repeats=1)
+    except Exception:
+        pass
+
+
+def _play_dry_run_motion_window(demo, bridge_mod, label: str, q_start, q_path, args) -> None:
+    q_points = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    if not q_points:
+        return
+    duration_s = _dry_run_motion_window_duration_s(q_start, q_points, args)
+    q0 = _q7_or_none(q_start)
+    if q0 is None:
+        q0 = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+    points = [q0.copy()]
+    for q in q_points:
+        if not np.allclose(points[-1], q, atol=1e-6, rtol=0.0):
+            points.append(q.copy())
+    if len(points) == 1:
+        targeted.base.sync_demo_arm_qpos(demo, points[-1])
+        _render_dry_run_motion_frame(demo, bridge_mod, args)
+        return
+    if duration_s <= 1e-6:
+        targeted.base.sync_demo_arm_qpos(demo, points[-1])
+        _render_dry_run_motion_frame(demo, bridge_mod, args)
+        return
+
+    fps = float(np.clip(float(getattr(args, "real_control_hz", 10.0) or 10.0), 5.0, 30.0))
+    frame_count = max(len(points), int(np.ceil(duration_s * fps)) + 1)
+    frame_count = min(frame_count, max(2, int(max(duration_s * 60.0, 2.0))))
+    seg_len = [float(np.max(np.abs(points[i + 1] - points[i]))) for i in range(len(points) - 1)]
+    total = float(sum(seg_len))
+    if total <= 1e-9:
+        targeted.base.sync_demo_arm_qpos(demo, points[-1])
+        _render_dry_run_motion_frame(demo, bridge_mod, args)
+        return
+    cumulative = np.cumsum([0.0] + seg_len)
+    print(
+        f"[dry-run] playing motion window for {label}: "
+        f"{duration_s:.2f}s, frames={frame_count}, waypoints={len(q_points)}"
+    )
+    start_t = time.perf_counter()
+    for frame_idx in range(frame_count):
+        progress = total * float(frame_idx) / float(max(frame_count - 1, 1))
+        seg_idx = int(np.searchsorted(cumulative, progress, side="right") - 1)
+        seg_idx = max(0, min(seg_idx, len(points) - 2))
+        denom = max(float(cumulative[seg_idx + 1] - cumulative[seg_idx]), 1e-9)
+        alpha = float((progress - cumulative[seg_idx]) / denom)
+        q = (1.0 - alpha) * points[seg_idx] + alpha * points[seg_idx + 1]
+        targeted.base.sync_demo_arm_qpos(demo, q.astype(np.float32))
+        _render_dry_run_motion_frame(demo, bridge_mod, args)
+        next_t = start_t + duration_s * float(frame_idx + 1) / float(max(frame_count - 1, 1))
+        sleep_s = next_t - time.perf_counter()
+        if sleep_s > 0.0:
+            time.sleep(sleep_s)
+    targeted.base.sync_demo_arm_qpos(demo, points[-1])
+
+
+def _install_dry_run_motion_window_wrappers() -> None:
+    if bool(getattr(targeted.base, "_direct_pre_place_dry_run_motion_window_wrapped", False)):
+        return
+    original_pose_stage = targeted.base.execute_pose_path_stage
+
+    def _execute_pose_path_stage_with_motion_window(
+        demo,
+        bridge_mod,
+        real_exec,
+        label,
+        pose,
+        q_path,
+        gripper_pos,
+        args,
+        *extra_args,
+        **kwargs,
+    ):
+        if real_exec is None and _dry_run_motion_window_enabled(args):
+            q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+            if not q_path:
+                q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                print(f"[planner] {label} is a zero-length pose path; skipping execution")
+                return True, q_current
+            skip_confirmation = bool(kwargs.get("skip_confirmation", False))
+            if not skip_confirmation and not targeted.base.confirm_planned_motion_or_skip(
+                demo,
+                bridge_mod,
+                label,
+                pose,
+                q_path[-1],
+                args,
+                q_preview_path=q_path,
+            ):
+                print(f"[abort] user cancelled before executing {label}")
+                return False, None
+            if skip_confirmation:
+                print(f"[planner] auto-executing {label} without separate preview/confirmation")
+            q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+            print(f"[dry-run] executing {label} in simulation with preserved motion window")
+            _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+            return True, q_path[-1]
+        q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+        ok, q_sent = original_pose_stage(
+            demo,
+            bridge_mod,
+            real_exec,
+            label,
+            pose,
+            q_path,
+            gripper_pos,
+            args,
+            *extra_args,
+            **kwargs,
+        )
+        if ok and real_exec is None and _dry_run_motion_window_enabled(args):
+            _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+        return ok, q_sent
+
+    targeted.base.execute_pose_path_stage = _execute_pose_path_stage_with_motion_window
+
+    original_joint_stage = getattr(targeted.base, "execute_joint_path_stage", None)
+    if callable(original_joint_stage):
+
+        def _execute_joint_path_stage_with_motion_window(
+            demo,
+            bridge_mod,
+            real_exec,
+            label,
+            q_path,
+            gripper_pos,
+            args,
+            *extra_args,
+            **kwargs,
+        ):
+            if real_exec is None and _dry_run_motion_window_enabled(args):
+                q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+                if not q_path:
+                    q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                    print(f"[planner] {label} is a zero-length joint path; skipping execution")
+                    return True, q_current
+                if not targeted.base.confirm_joint_path_motion(demo, bridge_mod, label, q_path, args):
+                    print(f"[abort] user cancelled before executing {label}")
+                    return False, None
+                q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                print(f"[dry-run] executing {label} in simulation with preserved motion window")
+                _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+                return True, q_path[-1]
+            q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+            ok, q_sent = original_joint_stage(
+                demo,
+                bridge_mod,
+                real_exec,
+                label,
+                q_path,
+                gripper_pos,
+                args,
+                *extra_args,
+                **kwargs,
+            )
+            if ok and real_exec is None and _dry_run_motion_window_enabled(args):
+                _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+            return ok, q_sent
+
+        targeted.base.execute_joint_path_stage = _execute_joint_path_stage_with_motion_window
+
+    targeted.base._direct_pre_place_dry_run_motion_window_wrapped = True
+
+
+def _run_single_scene_main(create_demo_func) -> None:
+    args = parse_args()
+    targeted.maybe_print_and_exit_place_rules(args)
+    targeted.base.maybe_print_and_exit_object_specs(args)
+    if int(args.repeat_count) < 1:
+        raise ValueError("--repeat-count must be >= 1")
+
+    base_args = targeted.argparse.Namespace(**vars(args).copy())
+    base_args.object_name = targeted.base.resolve_object_spec_name(base_args.object_name) if base_args.object_name else None
+    if base_args.selected_obstacle_object_names is not None:
+        base_args.selected_obstacle_object_names = targeted.base.resolve_object_spec_name_list(base_args.selected_obstacle_object_names)
+    if base_args.tracked_scene_object_names is not None:
+        base_args.tracked_scene_object_names = targeted.base.resolve_object_spec_name_list(base_args.tracked_scene_object_names)
+
+    cycle_object_sequence = (
+        targeted.base.resolve_object_spec_name_list(base_args.cycle_object_names)
+        if base_args.cycle_object_names
+        else []
+    )
+    if cycle_object_sequence:
+        targeted._validate_cycle_sources_have_place_rules(cycle_object_sequence)
+    if base_args.object_name is not None:
+        targeted._validate_cycle_sources_have_place_rules([base_args.object_name])
+    if cycle_object_sequence and not base_args.repeat_forever:
+        base_args.repeat_count = max(int(base_args.repeat_count), len(cycle_object_sequence))
+
+    bridge_mod = targeted.base.load_module_from_path("jiaobang_fp_bridge_targeted", args.bridge_script_path)
+    planner_mod = targeted.base.load_module_from_path("jiaobang_planner_impl_targeted", args.pick_script_path)
+
+    print(f"Using bridge script: {Path(args.bridge_script_path).resolve()}")
+    print(f"Using planner script: {Path(args.pick_script_path).resolve()}")
+    print(f"Using camera extrinsic from: {args.camera_extrinsic_opencv_path}")
+    print("[single_scene] scene lifecycle: create once, then switch active object actors in-place")
+    if args.repeat_forever:
+        print("Repeat mode: forever")
+    else:
+        print(f"Repeat mode: {base_args.repeat_count} cycle(s)")
+    if cycle_object_sequence:
+        print(f"Planned cycle sequence: {cycle_object_sequence}")
+    elif base_args.object_name is not None:
+        print(f"Initial target object: {base_args.object_name}")
+    print("Targeted place rules:")
+    print(targeted.describe_place_rules() or "(none)")
+
+    real_exec = None
+    env = None
+    demo = None
+    final_ok = True
+    cycle_idx = 0
+    if not bool(getattr(args, "reuse_foundationpose_scene_across_cycles", True)):
+        print("[single_scene] overriding --no-reuse-foundationpose-scene-across-cycles; single-scene mode needs the shared scene cache")
+    scene_capture_cache: dict | None = {}
+    place_state_cache: dict = {"used_slots_by_target": {}}
+    failed_targets_this_cycle: set[str] = set()
+    deferred_failed_targets: set[str] = set()
+    prefetch_manager = (
+        _NextCyclePlanPrefetchManager(create_demo_func, bridge_mod, planner_mod, base_args, cycle_object_sequence)
+        if bool(getattr(base_args, "next_cycle_plan_prefetch", True))
+        else None
+    )
+    try:
+        if args.execute_real:
+            real_exec = targeted.base.RealmanJointExecutor(args)
+            if args.reset_real_before_start:
+                print("\n[real robot pre-reset]")
+                if not targeted.base.confirm_simple_action(
+                    "reset the real robot to its hardware home pose before FoundationPose initialization",
+                    args,
+                ):
+                    print("[abort] user cancelled before the pre-FoundationPose real robot reset")
+                    return
+                real_exec.reset_robot(gripper_pos=args.real_gripper_open)
+
+        while True:
+            cycle_idx += 1
+            ok = False
+            cached_scene_names = targeted.base.list_cached_scene_object_names(scene_capture_cache)
+            available_rule_names = targeted._list_cached_unplaced_rule_names(scene_capture_cache)
+            reserved_name = (
+                prefetch_manager.reserved_target_for_cycle(
+                    cycle_idx,
+                    scene_capture_cache,
+                    failed_targets_this_cycle,
+                    deferred_failed_targets,
+                )
+                if prefetch_manager is not None
+                else None
+            )
+            if reserved_name is not None:
+                target_pool = list(available_rule_names or cycle_object_sequence or [reserved_name])
+                target_candidates = [reserved_name]
+                selected_name = reserved_name
+                print(f"[prefetch] using reserved target for cycle {cycle_idx}: {selected_name}")
+            else:
+                selected_name, target_pool, target_candidates = targeted._select_random_cycle_target(
+                    base_args,
+                    cycle_object_sequence,
+                    scene_capture_cache,
+                    available_rule_names,
+                    failed_targets_this_cycle,
+                    deferred_failed_targets,
+                    cycle_idx,
+                )
+            if selected_name is None:
+                final_ok = False
+                if target_pool and failed_targets_this_cycle:
+                    print(
+                        f"[abort] cycle {cycle_idx}: all selectable targets failed in this cycle: "
+                        f"{sorted(failed_targets_this_cycle & set(target_pool))}"
+                    )
+                else:
+                    print(f"[abort] cycle {cycle_idx}: no selectable target object remains")
+                break
+
+            if failed_targets_this_cycle:
+                print(
+                    f"\n[cycle {cycle_idx}] target pool after failures: {target_candidates}; "
+                    f"failed_this_cycle={sorted(failed_targets_this_cycle)}, "
+                    f"deferred_failed={sorted(deferred_failed_targets)}"
+                )
+            elif deferred_failed_targets:
+                print(
+                    f"\n[cycle {cycle_idx}] target pool: {target_candidates}; "
+                    f"deferred_failed={sorted(deferred_failed_targets)}"
+                )
+            else:
+                print(f"\n[cycle {cycle_idx}] target pool: {target_candidates}")
+            print(f"[cycle {cycle_idx}] selected target object: {selected_name}")
+            rule = targeted.get_place_rule(selected_name)
+            if rule is None:
+                final_ok = False
+                print(f"[abort] no targeted-place rule is configured for {selected_name}")
+                break
+
+            cycle_args, spec = targeted.base.make_cycle_args(base_args, selected_name)
+            cycle_args._targeted_place_state_cache = place_state_cache
+            cycle_args._single_scene_cycle_idx = int(cycle_idx)
+            cycle_args._next_cycle_prefetch_manager = prefetch_manager
+            cycle_args._next_cycle_prefetch_failed_targets_this_cycle = set(failed_targets_this_cycle)
+            cycle_args._next_cycle_prefetch_deferred_failed_targets = set(deferred_failed_targets)
+            selected_obstacles = targeted._derive_cycle_obstacle_names(
+                base_args,
+                cycle_idx,
+                selected_name,
+                cycle_object_sequence,
+                cached_scene_names,
+            )
+            cycle_args.selected_obstacle_object_names = list(selected_obstacles)
+            cycle_args.required_scene_object_names = list(selected_obstacles)
+            print(f"\n[cycle {cycle_idx}] using object spec: {spec.name}")
+            print(f"[cycle {cycle_idx}] mesh file: {cycle_args.mesh_file}")
+            print(f"[cycle {cycle_idx}] simulation asset file: {cycle_args.sim_asset_file}")
+            print(f"[cycle {cycle_idx}] simulation asset scale: {cycle_args.sim_asset_scale}")
+            print(f"[cycle {cycle_idx}] GroundingDINO target: {cycle_args.target_object_name}")
+            print(f"[cycle {cycle_idx}] targeted place: {rule.primitive} -> {rule.target_object_name}")
+            print(f"[cycle {cycle_idx}] selected obstacles: {cycle_args.selected_obstacle_object_names}")
+            print(f"\n================ cycle {cycle_idx} ================")
+
+            if demo is None:
+                env, demo = create_demo_func(cycle_args, bridge_mod, planner_mod, scene_capture_cache=scene_capture_cache)
+                _single_scene_build_actor_registry(demo, base_args, scene_capture_cache, selected_name, cycle_args)
+                if not _single_scene_activate_object(
+                    demo,
+                    bridge_mod,
+                    base_args,
+                    cycle_args,
+                    selected_name,
+                    selected_obstacles,
+                    scene_capture_cache,
+                ):
+                    final_ok = False
+                    break
+            else:
+                if not _single_scene_activate_object(
+                    demo,
+                    bridge_mod,
+                    base_args,
+                    cycle_args,
+                    selected_name,
+                    selected_obstacles,
+                    scene_capture_cache,
+                ):
+                    final_ok = False
+                    break
+
+            cycle_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7].copy()
+            ok = run_targeted_place_episode_curobo_direct(
+                demo,
+                bridge_mod,
+                real_exec,
+                cycle_args,
+                scene_capture_cache,
+                place_state_cache,
+            )
+            final_sim_arm_q = None
+            if ok:
+                final_sim_arm_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                print(
+                    f"[cycle {cycle_idx}] final sim arm q after place cycle: "
+                    f"{np.round(final_sim_arm_q, 5).tolist()}"
+                )
+
+            print(f"\ncycle {cycle_idx} success = {ok}")
+            if not ok:
+                if bool(getattr(base_args, "reselect_target_on_planning_failure", True)):
+                    if real_exec is None:
+                        _single_scene_restore_after_failed_attempt(
+                            demo,
+                            cycle_args,
+                            scene_capture_cache,
+                            selected_name,
+                            cycle_start_q,
+                        )
+                    else:
+                        print(
+                            "[single_scene] real execution is active; not teleporting simulation back after "
+                            f"failed target={selected_name}"
+                        )
+                    failed_targets_this_cycle.add(selected_name)
+                    deferred_failed_targets.add(selected_name)
+                    print(
+                        f"[cycle {cycle_idx}] planning/execution failed; "
+                        "keeping the current single scene and trying a different target."
+                    )
+                    cycle_idx -= 1
+                    continue
+                final_ok = False
+                break
+
+            failed_targets_this_cycle.clear()
+            deferred_failed_targets.discard(selected_name)
+            targeted.base.cache_successfully_placed_object_world_pose(demo, cycle_args.object_name, cycle_args)
+            registry = _single_scene_registry(demo)
+            if selected_name in registry:
+                registry[selected_name]["object_args"] = cycle_args
+            if not base_args.repeat_forever and cycle_idx >= int(base_args.repeat_count):
+                break
+            if real_exec is not None:
+                real_exec.set_gripper(args.real_gripper_open)
+                print(
+                    f"\n[cycle {cycle_idx}] keeping the current real robot pose; "
+                    "the next cycle will continue in the same scene"
+                )
+            print(f"[cycle {cycle_idx}] ready for the next cycle in the same scene")
+
+        print("\nfinal success =", final_ok)
+    finally:
+        if prefetch_manager is not None:
+            prefetch_manager.shutdown(timeout=0.1)
+        if env is not None:
+            targeted.base.close_env_quietly(env)
+            gc.collect()
+        if real_exec is not None:
+            real_exec.close()
+
+
 def main():
     original_create_demo = targeted.base.create_demo
 
@@ -10952,7 +14040,8 @@ def main():
     targeted.base.create_demo = _profiled_create_demo
     targeted.parse_args = parse_args
     targeted.run_targeted_place_episode = run_targeted_place_episode_curobo_direct
-    targeted.main()
+    _install_dry_run_motion_window_wrappers()
+    _run_single_scene_main(_profiled_create_demo)
 
 
 if __name__ == "__main__":

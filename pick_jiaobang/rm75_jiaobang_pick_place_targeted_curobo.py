@@ -177,6 +177,12 @@ def build_arg_parser():
         help="When an intercepted cuRobo stage fails, run standalone IK and MotionGen-IK diagnostics and print the results.",
     )
     parser.add_argument(
+        "--curobo-profile-motiongen-internal-ik",
+        action="store_true",
+        default=False,
+        help="Run an extra diagnostic IK solve before each plan_to_pose call. Disabled by default because MotionGen already runs IK internally.",
+    )
+    parser.add_argument(
         "--curobo-failure-dump-dir",
         type=Path,
         default=None,
@@ -205,6 +211,7 @@ def parse_args():
 def _planner_cache_key(args) -> tuple[Any, ...]:
     robot_cfg_path = None if args.curobo_rm75_robot_cfg is None else str(args.curobo_rm75_robot_cfg.expanduser().resolve())
     return (
+        str(getattr(args, "_curobo_planner_cache_namespace", "main") or "main"),
         str(args.curobo_root.expanduser().resolve()),
         str(args.curobo_rm75_urdf.expanduser().resolve()),
         robot_cfg_path,
@@ -218,6 +225,7 @@ def _planner_cache_key(args) -> tuple[Any, ...]:
         float(args.curobo_ik_position_threshold),
         float(args.curobo_ik_rotation_threshold),
         float(args.curobo_collision_activation_distance),
+        bool(getattr(args, "curobo_profile_motiongen_internal_ik", False)),
     )
 
 
@@ -241,6 +249,7 @@ def _get_or_create_curobo_planner(args) -> RM75CuRoboPlanner:
             position_threshold=float(args.curobo_ik_position_threshold),
             rotation_threshold=float(args.curobo_ik_rotation_threshold),
             collision_activation_distance=float(args.curobo_collision_activation_distance),
+            profile_motiongen_internal_ik=bool(getattr(args, "curobo_profile_motiongen_internal_ik", False)),
         )
     )
     _PLANNER_CACHE[key] = planner

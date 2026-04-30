@@ -101,6 +101,7 @@ class RM75CuRoboPlannerConfig:
     self_collision_check: bool = True
     self_collision_opt: bool = True
     collision_activation_distance: float = 0.02
+    profile_motiongen_internal_ik: bool = False
 
 
 class RM75CuRoboPlanner:
@@ -127,6 +128,9 @@ class RM75CuRoboPlanner:
         self._empty_world = self.mods["WorldConfig"]()
         self._world = self._empty_world
         self._mesh_world_initialized = False
+        self._disabled_collision_links: set[str] = set()
+        self._cuda_graph_batch_ik_solvers: dict[tuple[int, int], Any] = {}
+        self._cuda_graph_batch_ik_disabled_reason: Optional[str] = None
         self.ik_solver = self._build_ik_solver()
         self.motion_gen = self._build_motion_gen()
 
@@ -171,18 +175,31 @@ class RM75CuRoboPlanner:
         if not link_names:
             return []
         self.motion_gen.toggle_link_collision(link_names, bool(enabled))
+        disabled_before = set(self._disabled_collision_links)
+        if enabled:
+            self._disabled_collision_links.difference_update(link_names)
+        else:
+            self._disabled_collision_links.update(link_names)
+        disabled_changed = disabled_before != set(self._disabled_collision_links)
+        self._set_solver_world_collision_for_links(self.ik_solver, link_names, enabled=enabled)
+        if disabled_changed:
+            for solver in list(self._cuda_graph_batch_ik_solvers.values()):
+                self._set_solver_world_collision_for_links(solver, link_names, enabled=enabled)
+        return link_names
+
+    @staticmethod
+    def _set_solver_world_collision_for_links(solver, link_names: Sequence[str], *, enabled: bool) -> None:
         try:
-            ik_kinematics = getattr(self.ik_solver, "kinematics", None)
+            ik_kinematics = getattr(solver, "kinematics", None)
             ik_kin_cfg = getattr(ik_kinematics, "kinematics_config", None)
             if ik_kin_cfg is not None:
-                for link_name in link_names:
+                for link_name in list(link_names or []):
                     if enabled:
-                        ik_kin_cfg.enable_link_spheres(link_name)
+                        ik_kin_cfg.enable_link_spheres(str(link_name))
                     else:
-                        ik_kin_cfg.disable_link_spheres(link_name)
+                        ik_kin_cfg.disable_link_spheres(str(link_name))
         except Exception:
             pass
-        return link_names
 
     def diagnose_start_state_world_collision(self, q: Sequence[float]) -> dict[str, Any]:
         q_np = self._normalize_q(q)
@@ -413,6 +430,9 @@ class RM75CuRoboPlanner:
         goal_poses: Sequence[Any],
         *,
         num_seeds: Optional[int] = None,
+        use_cuda_graph_batch: bool = False,
+        cuda_graph_batch_size: Optional[int] = None,
+        cuda_graph_fixed_batch_size: Optional[int] = None,
     ) -> list[CuRoboPlanResult]:
         start_qs = list(start_qs or [])
         goal_poses = list(goal_poses or [])
@@ -422,6 +442,24 @@ class RM75CuRoboPlanner:
             raise ValueError(
                 f"start_qs and goal_poses must have the same length, got {len(start_qs)} and {len(goal_poses)}"
             )
+        if (
+            use_cuda_graph_batch
+            and len(goal_poses) > 1
+            and not self.attached_object_active
+            and self._cuda_graph_batch_ik_disabled_reason is None
+        ):
+            try:
+                return self._solve_batch_start_goal_ik_cuda_graph(
+                    start_qs,
+                    goal_poses,
+                    num_seeds=num_seeds,
+                    max_batch_size=cuda_graph_batch_size,
+                    fixed_batch_size=cuda_graph_fixed_batch_size,
+                )
+            except Exception as exc:
+                if "exceeds CUDA graph max batch" not in str(exc):
+                    self._cuda_graph_batch_ik_disabled_reason = str(exc)
+                print(f"[curobo] CUDA graph batch IK failed; falling back to eager batch IK: {exc}")
         if len(goal_poses) == 1:
             return [self.solve_ik(start_qs[0], goal_poses[0], num_seeds=num_seeds)]
 
@@ -465,6 +503,193 @@ class RM75CuRoboPlanner:
                 )
             )
         return outputs
+
+    def _solve_batch_start_goal_ik_cuda_graph(
+        self,
+        start_qs: Sequence[Sequence[float]],
+        goal_poses: Sequence[Any],
+        *,
+        num_seeds: Optional[int] = None,
+        max_batch_size: Optional[int] = None,
+        fixed_batch_size: Optional[int] = None,
+    ) -> list[CuRoboPlanResult]:
+        if self._cuda_graph_batch_ik_disabled_reason:
+            raise RuntimeError(self._cuda_graph_batch_ik_disabled_reason)
+        start_qs = list(start_qs or [])
+        goal_poses = list(goal_poses or [])
+        requested_batch = len(goal_poses)
+        if requested_batch <= 1:
+            return self.solve_batch_start_goal_ik(start_qs, goal_poses, num_seeds=num_seeds)
+        use_num_seeds = self.config.num_ik_seeds if num_seeds is None else int(num_seeds)
+        fixed_batch = self._select_cuda_graph_ik_batch_size(
+            requested_batch,
+            max_batch_size=max_batch_size,
+            fixed_batch_size=fixed_batch_size,
+        )
+        if fixed_batch < requested_batch:
+            if fixed_batch <= 1:
+                raise ValueError(f"requested IK batch {requested_batch} exceeds CUDA graph max batch {fixed_batch}")
+            outputs: list[CuRoboPlanResult] = []
+            chunk_count = int((requested_batch + fixed_batch - 1) // fixed_batch)
+            for chunk_index, start_idx in enumerate(range(0, requested_batch, fixed_batch)):
+                chunk_start_qs = start_qs[start_idx : start_idx + fixed_batch]
+                chunk_goal_poses = goal_poses[start_idx : start_idx + fixed_batch]
+                outputs.extend(
+                    self._solve_batch_start_goal_ik_cuda_graph_once(
+                        chunk_start_qs,
+                        chunk_goal_poses,
+                        fixed_batch=fixed_batch,
+                        num_seeds=use_num_seeds,
+                        total_requested_batch=requested_batch,
+                        chunk_index=chunk_index,
+                        chunk_count=chunk_count,
+                    )
+                )
+            return outputs
+        return self._solve_batch_start_goal_ik_cuda_graph_once(
+            start_qs,
+            goal_poses,
+            fixed_batch=fixed_batch,
+            num_seeds=use_num_seeds,
+            total_requested_batch=requested_batch,
+            chunk_index=0,
+            chunk_count=1,
+        )
+
+    def _solve_batch_start_goal_ik_cuda_graph_once(
+        self,
+        start_qs: Sequence[Sequence[float]],
+        goal_poses: Sequence[Any],
+        *,
+        fixed_batch: int,
+        num_seeds: int,
+        total_requested_batch: int,
+        chunk_index: int,
+        chunk_count: int,
+    ) -> list[CuRoboPlanResult]:
+        start_qs = list(start_qs or [])
+        goal_poses = list(goal_poses or [])
+        requested_batch = len(goal_poses)
+        if requested_batch <= 0:
+            return []
+        fixed_batch = int(fixed_batch)
+        use_num_seeds = int(num_seeds)
+        padded_start_qs = list(start_qs)
+        padded_goal_poses = list(goal_poses)
+        while len(padded_goal_poses) < fixed_batch:
+            padded_start_qs.append(padded_start_qs[-1])
+            padded_goal_poses.append(padded_goal_poses[-1])
+
+        solver = self._get_cuda_graph_batch_ik_solver(fixed_batch, use_num_seeds)
+        start_state = self._make_multi_start_state(padded_start_qs)
+        goal = self._make_batch_pose(padded_goal_poses)
+        solver.reset_seed()
+        result = solver.solve_batch(
+            goal,
+            retract_config=start_state.position.clone(),
+            seed_config=start_state.position.unsqueeze(1).clone(),
+            return_seeds=1,
+            num_seeds=use_num_seeds,
+            use_nn_seed=False,
+        )
+
+        success_arr = self._to_numpy(result.success).reshape(-1).astype(bool)[:requested_batch]
+        flat_solution = None if result.solution is None else self._to_numpy(result.solution).reshape(-1, result.solution.shape[-1])
+        position_error = None if getattr(result, "position_error", None) is None else self._to_numpy(result.position_error).reshape(-1)
+        rotation_error = None if getattr(result, "rotation_error", None) is None else self._to_numpy(result.rotation_error).reshape(-1)
+        outputs: list[CuRoboPlanResult] = []
+        for idx, success in enumerate(success_arr.tolist()):
+            goal_joint = None
+            if bool(success) and flat_solution is not None and idx < flat_solution.shape[0]:
+                goal_joint = np.asarray(flat_solution[idx], dtype=np.float32).reshape(-1)[:7]
+            outputs.append(
+                CuRoboPlanResult(
+                    success=bool(success),
+                    status="Success" if bool(success) else "IK_FAIL",
+                    goal_joint=goal_joint,
+                    solve_time=float(result.solve_time),
+                    ik_time=float(result.solve_time),
+                    raw_result=result,
+                    debug={
+                        "batch_index": int(idx),
+                        "position_error": None if position_error is None or idx >= position_error.shape[0] else float(position_error[idx]),
+                        "rotation_error": None if rotation_error is None or idx >= rotation_error.shape[0] else float(rotation_error[idx]),
+                        "ik_success_count": int(np.count_nonzero(success_arr)),
+                        "cuda_graph_batch": True,
+                        "requested_batch_size": int(requested_batch),
+                        "fixed_batch_size": int(fixed_batch),
+                        "total_requested_batch_size": int(total_requested_batch),
+                        "cuda_graph_chunk_index": int(chunk_index),
+                        "cuda_graph_chunk_count": int(chunk_count),
+                    },
+                )
+            )
+        return outputs
+
+    @staticmethod
+    def _select_cuda_graph_ik_batch_size(
+        requested_batch: int,
+        *,
+        max_batch_size: Optional[int] = None,
+        fixed_batch_size: Optional[int] = None,
+    ) -> int:
+        requested = max(int(requested_batch), 1)
+        fixed_batch = int(fixed_batch_size or 0)
+        if fixed_batch > 0:
+            return fixed_batch
+        max_batch = 128 if max_batch_size is None or int(max_batch_size) <= 0 else int(max_batch_size)
+        buckets = [2, 4, 8, 16, 32, 64, 128, 256]
+        buckets = [x for x in buckets if x <= max_batch]
+        if not buckets or requested > buckets[-1]:
+            return max_batch
+        for bucket in buckets:
+            if requested <= bucket:
+                return bucket
+        return buckets[-1]
+
+    def _get_cuda_graph_batch_ik_solver(self, batch_size: int, num_seeds: int):
+        key = (int(batch_size), int(num_seeds))
+        solver = self._cuda_graph_batch_ik_solvers.get(key)
+        if solver is not None:
+            return solver
+        solver = self._build_ik_solver(
+            use_cuda_graph=True,
+            num_seeds=int(num_seeds),
+            collision_cache=self._cuda_graph_ik_collision_cache(),
+        )
+        self._apply_disabled_collision_links_to_solver(solver)
+        self._cuda_graph_batch_ik_solvers[key] = solver
+        print(f"[curobo] created CUDA graph batch IK solver: batch={int(batch_size)}, seeds={int(num_seeds)}")
+        return solver
+
+    def _invalidate_cuda_graph_batch_ik_solvers(self) -> None:
+        self._cuda_graph_batch_ik_solvers.clear()
+
+    def _update_cuda_graph_batch_ik_world(self, world) -> None:
+        if not self._cuda_graph_batch_ik_solvers:
+            return
+        try:
+            for solver in list(self._cuda_graph_batch_ik_solvers.values()):
+                solver.update_world(world)
+        except Exception as exc:
+            self._cuda_graph_batch_ik_solvers.clear()
+            self._cuda_graph_batch_ik_disabled_reason = str(exc)
+            print(f"[curobo] disabled CUDA graph batch IK after world update failed: {exc}")
+
+    def _cuda_graph_ik_collision_cache(self) -> dict[str, int]:
+        world = self._world
+        cuboid_count = len(list(getattr(world, "cuboid", []) or []))
+        mesh_count = len(list(getattr(world, "mesh", []) or []))
+        return {
+            "obb": max(32, cuboid_count + 8),
+            "mesh": max(8, mesh_count + 4),
+        }
+
+    def _apply_disabled_collision_links_to_solver(self, solver) -> None:
+        disabled = [str(x) for x in sorted(getattr(self, "_disabled_collision_links", set()) or set()) if str(x)]
+        if not disabled:
+            return
+        self._set_solver_world_collision_for_links(solver, disabled, enabled=False)
 
     def estimate_batch_start_goal_ik_errors(
         self,
@@ -545,16 +770,18 @@ class RM75CuRoboPlanner:
             self.config.num_graph_seeds if num_graph_seeds is None else int(num_graph_seeds)
         )
 
-        self.motion_gen.reset_seed()
-        motion_ik_result = self.motion_gen.ik_solver.solve_single(
-            goal,
-            retract_config=start_state.position.clone(),
-            seed_config=start_state.position.view(1, 1, -1).clone(),
-            return_seeds=use_num_trajopt_seeds,
-            num_seeds=use_num_ik_seeds,
-            use_nn_seed=False,
-        )
-        motion_ik_successes = int(self.mods["torch"].count_nonzero(motion_ik_result.success).item())
+        motion_ik_successes = None
+        if bool(getattr(self.config, "profile_motiongen_internal_ik", False)):
+            self.motion_gen.reset_seed()
+            motion_ik_result = self.motion_gen.ik_solver.solve_single(
+                goal,
+                retract_config=start_state.position.clone(),
+                seed_config=start_state.position.view(1, 1, -1).clone(),
+                return_seeds=use_num_trajopt_seeds,
+                num_seeds=use_num_ik_seeds,
+                use_nn_seed=False,
+            )
+            motion_ik_successes = int(self.mods["torch"].count_nonzero(motion_ik_result.success).item())
 
         plan_config = self.mods["MotionGenPlanConfig"](
             enable_graph=bool(enable_graph),
@@ -571,6 +798,9 @@ class RM75CuRoboPlanner:
         result = self.motion_gen.plan_single(start_state, goal, plan_config)
         success = bool(result.success.reshape(-1)[0].item())
         status = None if result.status is None else str(result.status)
+        debug: dict[str, Any] = {}
+        if motion_ik_successes is not None:
+            debug["motion_gen_internal_ik_successes"] = motion_ik_successes
         if not success:
             return CuRoboPlanResult(
                 success=False,
@@ -579,11 +809,12 @@ class RM75CuRoboPlanner:
                 ik_time=float(result.ik_time),
                 trajopt_time=float(result.trajopt_time),
                 raw_result=result,
-                debug={"motion_gen_internal_ik_successes": motion_ik_successes},
+                debug=debug,
             )
 
         traj = result.get_interpolated_plan()
         q_path = self._to_numpy(traj.position).astype(np.float32)
+        debug["interpolation_dt"] = float(result.interpolation_dt)
         return CuRoboPlanResult(
             success=True,
             status=status,
@@ -593,10 +824,7 @@ class RM75CuRoboPlanner:
             ik_time=float(result.ik_time),
             trajopt_time=float(result.trajopt_time),
             raw_result=result,
-            debug={
-                "motion_gen_internal_ik_successes": motion_ik_successes,
-                "interpolation_dt": float(result.interpolation_dt),
-            },
+            debug=debug,
         )
 
     def plan_to_joint_state(
@@ -1116,6 +1344,7 @@ class RM75CuRoboPlanner:
         needs_mesh_world = len(list(meshes or [])) > 0
         if needs_mesh_world and not self._mesh_world_initialized:
             self._world = world_cfg
+            self._invalidate_cuda_graph_batch_ik_solvers()
             self.ik_solver = self._build_ik_solver()
             self.motion_gen = self._build_motion_gen()
             self._mesh_world_initialized = True
@@ -1123,6 +1352,7 @@ class RM75CuRoboPlanner:
         self.motion_gen.update_world(world_cfg)
         self.ik_solver.update_world(world_cfg)
         self._world = world_cfg
+        self._update_cuda_graph_batch_ik_world(world_cfg)
 
     def clear_world(self) -> None:
         if not self.collision_enabled:
@@ -1130,6 +1360,7 @@ class RM75CuRoboPlanner:
         self.motion_gen.update_world(self._empty_world)
         self.ik_solver.update_world(self._empty_world)
         self._world = self._empty_world
+        self._update_cuda_graph_batch_ik_world(self._empty_world)
 
     @staticmethod
     def _quat_wxyz_to_rotmat(quaternion: Sequence[float]) -> np.ndarray:
@@ -1265,6 +1496,7 @@ class RM75CuRoboPlanner:
         """
         if not self.collision_enabled:
             return False
+        self._invalidate_cuda_graph_batch_ik_solvers()
         torch = self.mods["torch"]
         q_np = self._normalize_q(q)
         joint_state = self._make_start_state(q_np)
@@ -1416,6 +1648,7 @@ class RM75CuRoboPlanner:
         if not self.collision_enabled:
             return
         try:
+            self._invalidate_cuda_graph_batch_ik_solvers()
             self.motion_gen.detach_object_from_robot(link_name=str(link_name))
             try:
                 self.ik_solver.detach_object_from_robot(link_name=str(link_name))
@@ -1531,21 +1764,31 @@ class RM75CuRoboPlanner:
             world_dict["mesh"][name] = mesh_entry
         return self.mods["WorldConfig"].from_dict(world_dict)
 
-    def _build_ik_solver(self):
+    def _build_ik_solver(
+        self,
+        *,
+        use_cuda_graph: bool = False,
+        num_seeds: Optional[int] = None,
+        collision_cache: Optional[dict[str, int]] = None,
+    ):
+        use_num_seeds = int(self.config.num_ik_seeds if num_seeds is None else num_seeds)
         ik_config = self.mods["IKSolverConfig"].load_from_robot_config(
             self.robot_cfg,
             self._world,
             tensor_args=self.tensor_args,
-            num_seeds=int(self.config.num_ik_seeds),
+            num_seeds=use_num_seeds,
             position_threshold=float(self.config.position_threshold),
             rotation_threshold=float(self.config.rotation_threshold),
             # IKSolver in this local cuRobo build cannot safely switch between
             # solve_single/solve_batch goal types under cuda graph capture on
             # CUDA < 12 graph reset support. Keep MotionGen graph-enabled, but
-            # leave IK in eager mode to avoid "changing goal type" crashes.
-            use_cuda_graph=False,
+            # leave the shared IK solver in eager mode to avoid "changing goal
+            # type" crashes. Dedicated fixed-size batch IK solvers can opt into
+            # cuda graph capture safely.
+            use_cuda_graph=bool(use_cuda_graph),
             self_collision_check=bool(self.config.self_collision_check),
             self_collision_opt=bool(self.config.self_collision_opt),
+            collision_cache=collision_cache,
         )
         return self.mods["IKSolver"](ik_config)
 
