@@ -197,6 +197,9 @@ def make_tabletop_slot_rule(
 
 
 def make_vertical_long_axis_grasp_bias_variants() -> tuple[GraspBiasVariant, ...]:
+    # The direct cuRobo script treats these signed values as legacy magnitudes
+    # for top-biased grasps and remaps their final sign from the target vertical
+    # placement pose, so "top" follows the end that will point upward.
     return (
         GraspBiasVariant(axis_shift_m=0.000, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="top_bias_center_vertical"),
         GraspBiasVariant(axis_shift_m=-0.002, tilt_toward_robot_deg=0.0, z_lift_m=0.000, label="top_bias_neg2_vertical"),

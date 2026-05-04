@@ -8,6 +8,7 @@ import gc
 import json
 import time
 import os
+import random
 import sys
 import threading
 import traceback
@@ -521,6 +522,7 @@ def build_arg_parser():
         ],
         targeted_place_allow_insert_axis_flip=False,
         tabletop_place_yaw_variant_deg=[0.0, -45.0, 45.0, -90.0, 90.0, -135.0, 135.0, 180.0],
+        carriot_tabletop_place_yaw_variant_deg=[0.0, -45.0, 45.0],
         tabletop_place_tilt_toward_robot_deg=[0.0],
         tabletop_place_axial_spin_deg=[0.0],
         targeted_place_expand_orientation_invariant=False,
@@ -562,6 +564,29 @@ def build_arg_parser():
         dest="planning_profile_enabled",
         action="store_false",
         help="Disable planning stage profiling.",
+    )
+    parser.add_argument(
+        "--random-cycle-targets",
+        dest="target_selection_order",
+        action="store_const",
+        const="random",
+        help=(
+            "Choose each cycle target randomly from the remaining unplaced "
+            "--cycle-object-names pool instead of using the risk-aware priority order."
+        ),
+    )
+    parser.add_argument(
+        "--risk-aware-cycle-targets",
+        dest="target_selection_order",
+        action="store_const",
+        const="risk_aware",
+        help="Use the current risk-aware cycle target priority order.",
+    )
+    parser.add_argument(
+        "--cycle-target-random-seed",
+        type=int,
+        default=None,
+        help="Optional random seed for reproducible random cycle target selection.",
     )
     parser.add_argument(
         "--direct-release-approach-distances",
@@ -886,6 +911,22 @@ def build_arg_parser():
             "Number of IK-ranked grasp->place pairs allowed to reach the transport stage. "
             "Each pair still uses only the middle transport MotionGen; short primitives stay IK/constrained-line."
         ),
+    )
+    parser.add_argument(
+        "--joint-search-primary-fallback-after-fast-ik-fail",
+        dest="joint_search_primary_fallback_after_fast_ik_fail",
+        action="store_true",
+        default=True,
+        help=(
+            "After the IK-ranked fast transport candidates fail, run the broader primary transport "
+            "candidate pass for the same grasp. This preserves fast success while improving random-order robustness."
+        ),
+    )
+    parser.add_argument(
+        "--no-joint-search-primary-fallback-after-fast-ik-fail",
+        dest="joint_search_primary_fallback_after_fast_ik_fail",
+        action="store_false",
+        help="Keep the old fast-chain gate behavior and skip primary transport fallback after IK-ranked candidates.",
     )
     parser.add_argument(
         "--fast-chain-initial-grasp-winners",
@@ -1336,6 +1377,31 @@ def build_arg_parser():
         dest="return_to_start_preplan_prelift_first",
         action="store_false",
         help="Try direct return_to_start preplanning before the prelift rescue branch.",
+    )
+    parser.add_argument(
+        "--return-to-start-self-collision-audit",
+        dest="return_to_start_self_collision_audit",
+        action="store_true",
+        default=True,
+        help="Audit every return_to_start path for cuRobo self-collision clearance before execution.",
+    )
+    parser.add_argument(
+        "--no-return-to-start-self-collision-audit",
+        dest="return_to_start_self_collision_audit",
+        action="store_false",
+        help="Disable return_to_start self-collision clearance audit.",
+    )
+    parser.add_argument(
+        "--return-to-start-self-collision-warning-clearance-m",
+        type=float,
+        default=0.003,
+        help="Warn in the return self-collision audit when minimum clearance drops below this distance.",
+    )
+    parser.add_argument(
+        "--return-to-start-self-collision-audit-stride",
+        type=int,
+        default=1,
+        help="Check every Nth waypoint in return_to_start self-collision audit. The first and last waypoints are always checked.",
     )
     parser.add_argument(
         "--no-post-grasp-lift",
@@ -3560,6 +3626,177 @@ def _print_start_state_self_collision_diagnostics(planner, start_q, *, label: st
         )
 
 
+def _curobo_self_collision_clearance_for_q(planner, q, *, top_k: int = 5) -> dict:
+    q_np = np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+    try:
+        spheres = planner._compute_world_link_spheres(q_np)
+        sphere_link_names = planner._collision_sphere_link_names()
+    except Exception as exc:
+        return {"success": False, "status": "ERROR", "error": str(exc)}
+    spheres = np.asarray(spheres, dtype=np.float32).reshape(-1, 4)
+    if len(sphere_link_names) != spheres.shape[0]:
+        return {
+            "success": False,
+            "status": "SPHERE_LINK_COUNT_MISMATCH",
+            "n_spheres": int(spheres.shape[0]),
+            "n_link_names": int(len(sphere_link_names)),
+        }
+
+    ignore_pairs = planner._self_collision_ignore_pairs()
+    buffer_by_link = planner._self_collision_buffers()
+    records: list[dict] = []
+    link_pair_best: dict[tuple[str, str], dict] = {}
+    min_record = None
+    for i in range(spheres.shape[0]):
+        c_i = spheres[i, :3]
+        r_i = float(spheres[i, 3])
+        link_i = str(sphere_link_names[i])
+        for j in range(i + 1, spheres.shape[0]):
+            link_j = str(sphere_link_names[j])
+            if link_i == link_j:
+                continue
+            pair_key = tuple(sorted((link_i, link_j)))
+            if pair_key in ignore_pairs:
+                continue
+            c_j = spheres[j, :3]
+            r_j = float(spheres[j, 3])
+            center_dist = float(np.linalg.norm(c_i - c_j))
+            threshold = (
+                r_i
+                + r_j
+                + float(buffer_by_link.get(link_i, 0.0))
+                + float(buffer_by_link.get(link_j, 0.0))
+            )
+            clearance = float(center_dist - threshold)
+            record = {
+                "sphere_i": int(i),
+                "sphere_j": int(j),
+                "link_i": link_i,
+                "link_j": link_j,
+                "clearance_m": clearance,
+                "overlap_m": float(max(0.0, -clearance)),
+                "center_distance_m": center_dist,
+                "threshold_m": float(threshold),
+            }
+            if min_record is None or clearance < float(min_record["clearance_m"]):
+                min_record = record
+            current_best = link_pair_best.get(pair_key)
+            if current_best is None or clearance < float(current_best["clearance_m"]):
+                link_pair_best[pair_key] = {
+                    "link_a": pair_key[0],
+                    "link_b": pair_key[1],
+                    "clearance_m": clearance,
+                    "overlap_m": float(max(0.0, -clearance)),
+                    "sphere_i": int(i),
+                    "sphere_j": int(j),
+                }
+            records.append(record)
+
+    if min_record is None:
+        return {"success": False, "status": "NO_CHECKABLE_SPHERE_PAIRS"}
+    records.sort(key=lambda x: (float(x["clearance_m"]), str(x["link_i"]), str(x["link_j"])))
+    link_pair_records = sorted(
+        link_pair_best.values(),
+        key=lambda x: (float(x["clearance_m"]), str(x["link_a"]), str(x["link_b"])),
+    )
+    use_top_k = max(int(top_k), 0)
+    return {
+        "success": True,
+        "status": "Success",
+        "min_clearance_m": float(min_record["clearance_m"]),
+        "min_pair": min_record,
+        "pairs": records if use_top_k <= 0 else records[:use_top_k],
+        "link_pairs": link_pair_records if use_top_k <= 0 else link_pair_records[:use_top_k],
+        "pair_count": int(len(records)),
+    }
+
+
+def _audit_return_to_start_self_collision_path(planner, args, q_path, *, label: str, mode: str) -> dict:
+    if planner is None or not q_path:
+        return {"status": "SKIPPED_NO_PATH", "success": True}
+    path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    stride = int(max(getattr(args, "return_to_start_self_collision_audit_stride", 1), 1))
+    indices = list(range(0, len(path), stride))
+    if 0 not in indices:
+        indices.insert(0, 0)
+    if (len(path) - 1) not in indices:
+        indices.append(len(path) - 1)
+    indices = sorted(set(int(i) for i in indices if 0 <= int(i) < len(path)))
+
+    warning_clearance = float(getattr(args, "return_to_start_self_collision_warning_clearance_m", 0.003))
+    top_k = 5
+    min_diag = None
+    min_index = None
+    overlap_count = 0
+    low_clearance_count = 0
+    checked_count = 0
+    errors: list[str] = []
+    with _CUROBO_GPU_LOCK:
+        for idx in indices:
+            checked_count += 1
+            diag = _curobo_self_collision_clearance_for_q(planner, path[idx], top_k=top_k)
+            if not bool(diag.get("success", False)):
+                errors.append(str(diag.get("status", "ERROR")) + ":" + str(diag.get("error", "")))
+                continue
+            clearance = float(diag.get("min_clearance_m", float("inf")))
+            if clearance < 0.0:
+                overlap_count += 1
+            if clearance < warning_clearance:
+                low_clearance_count += 1
+            if min_diag is None or clearance < float(min_diag.get("min_clearance_m", float("inf"))):
+                min_diag = diag
+                min_index = int(idx)
+
+    if min_diag is None:
+        return {
+            "success": False,
+            "status": "ERROR",
+            "checked_waypoints": int(checked_count),
+            "path_waypoints": int(len(path)),
+            "stride": int(stride),
+            "errors": errors[:5],
+        }
+    min_clearance = float(min_diag.get("min_clearance_m", 0.0))
+    if min_clearance < 0.0:
+        status = "OVERLAP"
+        success = False
+    elif min_clearance < warning_clearance:
+        status = "LOW_CLEARANCE"
+        success = True
+    else:
+        status = "CLEAR"
+        success = True
+
+    min_pair = dict(min_diag.get("min_pair") or {})
+    link_pair = "?"
+    if min_pair:
+        link_pair = f"{min_pair.get('link_i')}<->{min_pair.get('link_j')}"
+    print(
+        f"[return_self_collision] {label}: status={status}, "
+        f"min_clearance={min_clearance * 1000.0:.2f}mm at waypoint {min_index}, "
+        f"pair={link_pair}, checked={checked_count}/{len(path)}, mode={mode}"
+    )
+    return {
+        "success": bool(success),
+        "status": status,
+        "warning": bool(status == "LOW_CLEARANCE"),
+        "mode": str(mode),
+        "path_waypoints": int(len(path)),
+        "checked_waypoints": int(checked_count),
+        "stride": int(stride),
+        "warning_clearance_m": warning_clearance,
+        "min_clearance_m": min_clearance,
+        "min_clearance_mm": float(min_clearance * 1000.0),
+        "min_clearance_waypoint": min_index,
+        "overlap_waypoint_count": int(overlap_count),
+        "low_clearance_waypoint_count": int(low_clearance_count),
+        "min_pair": min_pair,
+        "top_link_pairs": list(min_diag.get("link_pairs") or []),
+        "top_sphere_pairs": list(min_diag.get("pairs") or []),
+        "errors": errors[:5],
+    }
+
+
 def _normalize_quat_wxyz(quat):
     arr = np.asarray(quat, dtype=np.float32).reshape(-1)[:4]
     norm = float(np.linalg.norm(arr))
@@ -5536,6 +5773,21 @@ def _plan_and_execute_return_to_cycle_start(
             elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
         )
         return False
+    if bool(getattr(args, "return_to_start_self_collision_audit", True)) and planner is not None:
+        with _profile_stage(
+            args,
+            "return_to_start_self_collision_audit",
+            mode=return_mode,
+            path_waypoints=len(q_path or []),
+        ) as prof:
+            audit = _audit_return_to_start_self_collision_path(
+                planner,
+                args,
+                q_path,
+                label=label,
+                mode=return_mode,
+            )
+            prof.update(audit)
     with _profile_stage(args, "return_to_start_execute", mode=return_mode, path_waypoints=len(q_path or [])) as prof:
         ok, _ = targeted.base.execute_pose_path_stage(
             demo,
@@ -7274,6 +7526,7 @@ def _build_direct_grasp_candidates(
         grasp_variant_args.topdown_tilt_toward_robot_deg = []
         grasp_variant_args.topdown_tilt_toward_robot_shift_m = [0.0]
     object_axis_world = None
+    object_long_axis_idx = None
     object_long_axis_half = None
     object_extents = None
     try:
@@ -7283,6 +7536,7 @@ def _build_direct_grasp_candidates(
         ).reshape(3)
         object_extents = extents
         axis_idx = int(np.argmax(extents))
+        object_long_axis_idx = axis_idx
         object_long_axis_half = float(extents[axis_idx]) * 0.5
 
         is_spherical = sphere_category
@@ -7340,9 +7594,60 @@ def _build_direct_grasp_candidates(
 
     rule_grasp_bias_variants = list(getattr(place_rule, "grasp_bias_variants", ()) or []) if place_rule is not None else []
     use_rule_bias_variants = bool(rule_grasp_bias_variants) and object_axis_world is not None
+    rule_top_bias_axis_sign = None
+    rule_top_bias_dot_up = None
+
+    if (
+        use_rule_bias_variants
+        and place_rule is not None
+        and bool(getattr(place_rule, "preserve_long_axis_vertical", False))
+        and object_long_axis_idx is not None
+    ):
+        try:
+            target_name = curobo_wrapper.normalize_object_name(getattr(place_rule, "target_object_name", None))
+            T_world_target = targeted._get_scene_object_world_transform(demo, bridge_mod, scene_capture_cache, target_name)
+            target_up_axis = None
+            if T_world_target is not None:
+                target_up_axis = targeted._target_place_up_axis(place_rule, T_world_target)
+            target_up_axis = _normalize(np.array([0.0, 0.0, 1.0], dtype=np.float32) if target_up_axis is None else target_up_axis)
+            pose_spec = None
+            if getattr(place_rule, "primitive", "") == "place_on_slots":
+                slots = list(getattr(place_rule, "slots", ()) or [])
+                if slots:
+                    pose_spec = getattr(slots[0], "object_pose_local", None)
+            else:
+                pose_spec = getattr(place_rule, "object_pose_local", None)
+            if T_world_target is not None and target_up_axis is not None and pose_spec is not None:
+                axis_local = np.zeros(3, dtype=np.float32)
+                axis_local[int(object_long_axis_idx)] = 1.0
+                T_target_obj = targeted._local_pose_spec_to_matrix(pose_spec)
+                T_world_obj_desired = np.asarray(T_world_target, dtype=np.float32).reshape(4, 4) @ T_target_obj
+                target_axis_world = _normalize(T_world_obj_desired[:3, :3] @ axis_local)
+                if target_axis_world is not None:
+                    rule_top_bias_dot_up = float(np.dot(target_axis_world, target_up_axis))
+                    rule_top_bias_axis_sign = 1.0 if rule_top_bias_dot_up >= 0.0 else -1.0
+        except Exception as exc:
+            print(f"[direct_grasp] vertical top-bias axis remap unavailable: {exc}")
+
+    def _rule_bias_actual_axis_shift(rule_bias) -> float:
+        axis_shift = float(getattr(rule_bias, "axis_shift_m", 0.0))
+        if rule_top_bias_axis_sign is None or abs(axis_shift) <= 1e-6:
+            return axis_shift
+        label = str(getattr(rule_bias, "label", "") or "").lower()
+        if "top_bias" not in label:
+            return axis_shift
+        return float(rule_top_bias_axis_sign) * abs(axis_shift)
+
+    def _rule_bias_display_label(label: str, actual_axis_shift: float) -> str:
+        text = str(label or "grasp")
+        if "top_bias" not in text.lower() or abs(float(actual_axis_shift)) <= 1e-6:
+            return text
+        sign_label = "pos" if float(actual_axis_shift) > 0.0 else "neg"
+        magnitude_mm = int(round(abs(float(actual_axis_shift)) * 1000.0))
+        return re.sub(r"top_bias_(?:neg|pos)\d+", f"top_bias_{sign_label}{magnitude_mm}", text)
 
     if use_rule_bias_variants:
-        grasp_axis_shifts = [float(v.axis_shift_m) for v in rule_grasp_bias_variants]
+        grasp_axis_shifts = [_rule_bias_actual_axis_shift(v) for v in rule_grasp_bias_variants]
     else:
         grasp_axis_shifts = _unique_finite_float_list(
             getattr(args, "direct_grasp_object_axis_shifts_m", [0.0]),
@@ -7500,7 +7805,7 @@ def _build_direct_grasp_candidates(
 
     for grasp_variant_item, rule_bias in bias_iter:
         grasp_variant_label, grasp_variant_pose = grasp_variant_item
-        axis_shift_values = [float(rule_bias.axis_shift_m)] if rule_bias is not None else grasp_axis_shifts
+        axis_shift_values = [_rule_bias_actual_axis_shift(rule_bias)] if rule_bias is not None else grasp_axis_shifts
         z_lift_values = [float(rule_bias.z_lift_m)] if rule_bias is not None else grasp_z_lifts
         for axis_shift in axis_shift_values:
             for z_lift in z_lift_values:
@@ -7549,7 +7854,16 @@ def _build_direct_grasp_candidates(
                     if key in seen:
                         continue
                     seen.add(key)
-                    label = "grasp_direct" if grasp_variant_label in (None, "grasp") else f"grasp_direct_{grasp_variant_label}"
+                    display_grasp_variant_label = (
+                        _rule_bias_display_label(grasp_variant_label, float(axis_shift))
+                        if rule_bias is not None
+                        else grasp_variant_label
+                    )
+                    label = (
+                        "grasp_direct"
+                        if display_grasp_variant_label in (None, "grasp")
+                        else f"grasp_direct_{display_grasp_variant_label}"
+                    )
                     if abs(float(axis_shift)) > 1e-6:
                         label = f"{label}_axis_{int(round(float(axis_shift) * 1000.0))}mm"
                     if float(z_lift) > 1e-6:
@@ -7572,7 +7886,18 @@ def _build_direct_grasp_candidates(
                             "grasp_approach_roll_deg": float(approach_roll_deg),
                         }
                     )
-    variant_labels = [label for label, _ in grasp_variants]
+    def _display_variant_label_for_print(label):
+        if not use_rule_bias_variants:
+            return label
+        matched_bias = next(
+            (bias for bias in rule_grasp_bias_variants if str(getattr(bias, "label", "")) == str(label)),
+            None,
+        )
+        if matched_bias is None:
+            return label
+        return _rule_bias_display_label(label, _rule_bias_actual_axis_shift(matched_bias))
+
+    variant_labels = [_display_variant_label_for_print(label) for label, _ in grasp_variants]
     tilt_variants = [l for l in variant_labels if "tilt" in l.lower()]
     if sphere_category and tilt_variants:
         before = len(candidates)
@@ -7582,7 +7907,7 @@ def _build_direct_grasp_candidates(
             f"[direct_grasp] sphere category filtered tilt grasp candidates: "
             f"{before}->{len(candidates)}"
         )
-        variant_labels = [label for label, _ in grasp_variants]
+        variant_labels = [_display_variant_label_for_print(label) for label, _ in grasp_variants]
         tilt_variants = []
     if fixed_tabletop_place_first_candidates:
         merged = []
@@ -7678,10 +8003,19 @@ def _build_direct_grasp_candidates(
         f"grasp_mode={grasp_mode}, tilt={len(tilt_cands)}, non_tilt={len(non_tilt_cands)}"
     )
     if use_rule_bias_variants:
+        if rule_top_bias_axis_sign is not None:
+            sign_text = "+" if float(rule_top_bias_axis_sign) > 0.0 else "-"
+            print(
+                "[direct_grasp] vertical top-bias axis remap: "
+                f"target_long_axis_dot_up={float(rule_top_bias_dot_up):.3f}; "
+                f"top_bias shifts use {sign_text}object-long-axis in the current grasp frame"
+            )
         print(
             "[direct_grasp] place-rule grasp bias variants: "
             + ", ".join(
-                f"{getattr(v, 'label', 'bias')}[axis={float(v.axis_shift_m):.3f}, tilt={float(v.tilt_toward_robot_deg):.1f}, tilt_shift={float(v.tilt_shift_m):.3f}, z_lift={float(v.z_lift_m):.3f}]"
+                f"{_rule_bias_display_label(getattr(v, 'label', 'bias'), _rule_bias_actual_axis_shift(v))}"
+                f"[axis={_rule_bias_actual_axis_shift(v):.3f}, rule_axis={float(v.axis_shift_m):.3f}, "
+                f"tilt={float(v.tilt_toward_robot_deg):.1f}, tilt_shift={float(v.tilt_shift_m):.3f}, z_lift={float(v.z_lift_m):.3f}]"
                 f"/dir={getattr(v, 'tilt_direction', 'toward_robot')}"
                 for v in rule_grasp_bias_variants
             )
@@ -9887,14 +10221,20 @@ def _hongshupian_grasp_chain_eval_sort_key(item) -> tuple:
     """
     base_key = _candidate_sort_key(item)
     label = str(item.get("label", "")).lower()
+    def _has_top_bias_magnitude(mm: int) -> bool:
+        return f"top_bias_neg{int(mm)}" in label or f"top_bias_pos{int(mm)}" in label
+
+    def _has_axis_magnitude(mm: int) -> bool:
+        return f"axis_-{int(mm)}mm" in label or f"axis_{int(mm)}mm" in label
+
     is_center_vertical = "top_bias_center_vertical" in label
     is_neg10_tilt15_away = (
-        "top_bias_neg10" in label
+        _has_top_bias_magnitude(10)
         and "tilt15_away" in label
-        and "axis_-10mm" in label
+        and _has_axis_magnitude(10)
     )
-    is_neg2_vertical = "top_bias_neg2_vertical" in label
-    is_neg6_vertical = "top_bias_neg6_vertical" in label
+    is_neg2_vertical = _has_top_bias_magnitude(2) and "vertical" in label
+    is_neg6_vertical = _has_top_bias_magnitude(6) and "vertical" in label
     is_vertical = "vertical" in label
     is_tilt = "tilt" in label
     if is_center_vertical:
@@ -10368,7 +10708,14 @@ def _evaluate_joint_grasp_place_chains(
                 )
                 preselected_pair_fast_gate = bool(preselected_fast_candidates) and bool(fast_candidates)
                 fixed_tabletop_fast_gate_blocks_primary = fixed_tabletop_fast_gate and bool(fast_candidates)
-                fast_gate_blocks_primary = preselected_pair_fast_gate or fixed_tabletop_fast_gate_blocks_primary
+                primary_after_fast_fail = (
+                    preselected_pair_fast_gate
+                    and bool(getattr(args, "joint_search_primary_fallback_after_fast_ik_fail", True))
+                )
+                fast_gate_blocks_primary = (
+                    fixed_tabletop_fast_gate_blocks_primary
+                    or (preselected_pair_fast_gate and not primary_after_fast_fail)
+                )
                 if primary_candidates:
                     if fast_gate_blocks_primary:
                         gate_reason = (
@@ -10381,6 +10728,11 @@ def _evaluate_joint_grasp_place_chains(
                             "will not run primary transport fallback for this grasp"
                         )
                     else:
+                        if primary_after_fast_fail:
+                            print(
+                                f"[joint_search] {grasp_label}: IK-preselected top pair will run first; "
+                                "primary transport fallback remains available if fast IK transport fails"
+                            )
                         if fixed_tabletop_fast_gate:
                             print(
                                 f"[joint_search] {grasp_label}: fixed-tabletop fast-chain found no "
@@ -13771,6 +14123,13 @@ def _run_single_scene_main(create_demo_func) -> None:
         targeted._validate_cycle_sources_have_place_rules([base_args.object_name])
     if cycle_object_sequence and not base_args.repeat_forever:
         base_args.repeat_count = max(int(base_args.repeat_count), len(cycle_object_sequence))
+    target_random_seed = getattr(base_args, "cycle_target_random_seed", None)
+    if str(getattr(base_args, "target_selection_order", "risk_aware")) == "random":
+        if target_random_seed is None:
+            target_random_seed = int(time.time_ns() % (2**32))
+            base_args.cycle_target_random_seed = int(target_random_seed)
+            args.cycle_target_random_seed = int(target_random_seed)
+        random.seed(int(target_random_seed))
 
     bridge_mod = targeted.base.load_module_from_path("jiaobang_fp_bridge_targeted", args.bridge_script_path)
     planner_mod = targeted.base.load_module_from_path("jiaobang_planner_impl_targeted", args.pick_script_path)
@@ -13783,6 +14142,9 @@ def _run_single_scene_main(create_demo_func) -> None:
         print("Repeat mode: forever")
     else:
         print(f"Repeat mode: {base_args.repeat_count} cycle(s)")
+    print(f"Target selection order: {getattr(base_args, 'target_selection_order', 'risk_aware')}")
+    if target_random_seed is not None:
+        print(f"Target selection random seed: {int(target_random_seed)}")
     if cycle_object_sequence:
         print(f"Planned cycle sequence: {cycle_object_sequence}")
     elif base_args.object_name is not None:
