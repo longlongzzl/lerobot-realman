@@ -9,6 +9,7 @@ import json
 import socket
 import sys
 import time
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -4682,6 +4683,44 @@ def _load_fixed_scene_capture(args, bridge_mod):
     }
 
 
+def _copy_scene_cache_namespace(args) -> argparse.Namespace:
+    if not isinstance(args, argparse.Namespace):
+        return argparse.Namespace()
+    copied = {}
+    for key, value in vars(args).items():
+        if key.startswith("_") or isinstance(value, types.ModuleType) or callable(value):
+            continue
+        if isinstance(value, np.ndarray):
+            copied[key] = value.copy()
+            continue
+        try:
+            copied[key] = copy.deepcopy(value)
+        except Exception:
+            continue
+    return argparse.Namespace(**copied)
+
+
+def _copy_scene_cache_entry(item: dict, *, object_args=None) -> dict:
+    box = item.get("box")
+    if box is None:
+        box = np.zeros(4, dtype=np.float32)
+    entry = {
+        "object_name": normalize_object_name(item.get("object_name")) or str(item.get("object_name", "")),
+        "label": str(item.get("label", item.get("object_name", ""))),
+        "score": float(item.get("score", 1.0)),
+        "box": np.asarray(box, dtype=np.float32).reshape(4).copy(),
+        "placed": bool(item.get("placed", False)),
+    }
+    if item.get("T_cam_obj") is not None:
+        entry["T_cam_obj"] = np.asarray(item["T_cam_obj"], dtype=np.float32).reshape(4, 4).copy()
+    if item.get("T_world_obj") is not None:
+        entry["T_world_obj"] = np.asarray(item["T_world_obj"], dtype=np.float32).reshape(4, 4).copy()
+    source_args = object_args if object_args is not None else item.get("object_args")
+    if isinstance(source_args, argparse.Namespace):
+        entry["object_args"] = _copy_scene_cache_namespace(source_args)
+    return entry
+
+
 def capture_or_reuse_foundationpose_scene(args, bridge_mod, scene_capture_cache=None):
     cache_key = build_foundationpose_scene_cache_key(args)
     target_name = normalize_object_name(getattr(args, "object_name", None))
@@ -4702,7 +4741,7 @@ def capture_or_reuse_foundationpose_scene(args, bridge_mod, scene_capture_cache=
             for name in selected_obstacle_names:
                 if name == target_name:
                     continue
-                scene_obstacles.append(copy.deepcopy(cached_objects[name]))
+                scene_obstacles.append(_copy_scene_cache_entry(cached_objects[name]))
             print("[foundationpose] reusing cached scene capture from the previous cycle")
             return (
                 scene_capture_cache["fp_rt"],
@@ -4725,12 +4764,14 @@ def capture_or_reuse_foundationpose_scene(args, bridge_mod, scene_capture_cache=
                     "placed": bool(item.get("placed", False)),
                 }
                 if object_name == target_name:
-                    cached_entry["object_args"] = argparse.Namespace(**vars(args).copy())
+                    cached_entry["object_args"] = _copy_scene_cache_namespace(args)
                 else:
                     try:
-                        cached_entry["object_args"] = bridge_mod._make_object_specific_args(args, object_name)
+                        cached_entry["object_args"] = _copy_scene_cache_namespace(
+                            bridge_mod._make_object_specific_args(args, object_name)
+                        )
                     except Exception:
-                        cached_entry["object_args"] = argparse.Namespace(**vars(args).copy())
+                        cached_entry["object_args"] = _copy_scene_cache_namespace(args)
                 cached_objects[object_name] = cached_entry
             scene_capture_cache.clear()
             scene_capture_cache.update(
@@ -4764,13 +4805,13 @@ def capture_or_reuse_foundationpose_scene(args, bridge_mod, scene_capture_cache=
                 "score": 1.0,
                 "box": np.zeros(4, dtype=np.float32),
                 "T_cam_obj": np.asarray(T_cam_obj, dtype=np.float32),
-                "object_args": argparse.Namespace(**vars(args).copy()),
+                "object_args": _copy_scene_cache_namespace(args),
             }
         for item in scene_obstacles:
             object_name = normalize_object_name(item.get("object_name"))
             if object_name is None:
                 continue
-            cached_objects[object_name] = copy.deepcopy(item)
+            cached_objects[object_name] = _copy_scene_cache_entry(item)
         scene_capture_cache.clear()
         scene_capture_cache.update(
             {
@@ -4800,7 +4841,7 @@ def update_scene_capture_cache_object(demo, object_name: str, T_cam_obj: np.ndar
         "score": float(old_entry.get("score", 1.0)),
         "box": np.asarray(old_entry.get("box", np.zeros(4, dtype=np.float32)), dtype=np.float32).reshape(4),
         "T_cam_obj": np.asarray(T_cam_obj, dtype=np.float32),
-        "object_args": argparse.Namespace(**vars(object_args).copy()),
+        "object_args": _copy_scene_cache_namespace(object_args),
         "placed": False,
     }
 
@@ -4833,7 +4874,7 @@ def cache_successfully_placed_object_world_pose(demo, object_name: str, object_a
         "box": np.asarray(old_entry.get("box", np.zeros(4, dtype=np.float32)), dtype=np.float32).reshape(4),
         "T_cam_obj": np.asarray(old_entry.get("T_cam_obj", np.eye(4, dtype=np.float32)), dtype=np.float32).reshape(4, 4),
         "T_world_obj": T_world_obj,
-        "object_args": argparse.Namespace(**vars(object_args).copy()),
+        "object_args": _copy_scene_cache_namespace(object_args),
         "placed": True,
     }
     print(f"[scene cache] kept placed object {normalized} in the cached scene at world translation={np.round(T_world_obj[:3, 3], 6).tolist()}")

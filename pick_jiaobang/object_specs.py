@@ -48,8 +48,8 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
     "bitong": ObjectSpec(
         name="bitong",
         grounding_prompt="yellow pen holder.",
-        mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/holder.glb",
-        sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/holder_sim.glb",
+        mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/holder_85x95.glb",
+        sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/holder_sim_85x95.glb",
         real_longest_axis_m=0.095,
         fixed_goal_joints_deg=DEFAULT_FIXED_GOAL_JOINTS_DEG,
     ),

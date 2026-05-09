@@ -31,6 +31,7 @@ _PROFILE_COUNTERS: Counter = Counter()
 _PROFILE_IK_BATCH_SIZE_HIST: Counter = Counter()
 _PROFILE_THREAD_LOCAL = threading.local()
 _CUROBO_GPU_LOCK = threading.RLock()
+_PREFETCH_PLANNER_CACHE_NAMESPACE = "next_cycle_prefetch"
 _PROFILE_COUNTER_FIELDS = (
     "ik_batch_call_count",
     "ik_goal_count",
@@ -42,6 +43,9 @@ _PROFILE_COUNTER_FIELDS = (
     "graph_call_count",
     "prefilter_q_goal_motiongen_count",
     "prefilter_q_goal_success_count",
+    "release_endpoint_precheck_count",
+    "release_endpoint_precheck_success_count",
+    "release_endpoint_precheck_reject_count",
     "timeout_count",
     "fallback_count",
     "world_refresh_count",
@@ -420,6 +424,8 @@ def _profile_stage(args, stage_name: str, **fields):
     except Exception as exc:
         rec.setdefault("success", False)
         rec.setdefault("status", type(exc).__name__)
+        rec.setdefault("error", str(exc))
+        rec.setdefault("traceback_tail", traceback.format_exc()[-4000:])
         raise
     finally:
         rec["elapsed_ms"] = round((time.perf_counter() - start_t) * 1000.0, 3)
@@ -527,6 +533,20 @@ def build_arg_parser():
         tabletop_place_axial_spin_deg=[0.0],
         targeted_place_expand_orientation_invariant=False,
         targeted_place_hover_extra_height_m=[0.0, 0.01],
+        place_clearance_score=False,
+        place_clearance_soft_margin_m=0.015,
+        place_clearance_penalty_weight=0.75,
+        place_clearance_overlap_penalty_weight=1.5,
+        place_clearance_max_penalty=4.0,
+        place_clearance_candidate_box_scale=1.0,
+        place_clearance_obstacle_box_scale=1.0,
+        place_clearance_retry=False,
+        place_clearance_retry_max_base_candidates=2,
+        place_clearance_retry_offsets_m=[0.008, 0.016],
+        place_clearance_retry_include_perpendicular=True,
+        place_clearance_retry_max_generated_candidates=12,
+        place_clearance_retry_min_penalty=0.01,
+        place_clearance_retry_allow_unscored=True,
         topdown_grasp_yaw_variant_deg=[0.0, -30.0, 30.0, -60.0, 60.0, -90.0, 90.0, 180.0],
         topdown_tilt_toward_robot_deg=[12.0, 20.0, 30.0, 45.0],
         topdown_tilt_toward_robot_shift_m=[0.0, 0.02],
@@ -564,6 +584,125 @@ def build_arg_parser():
         dest="planning_profile_enabled",
         action="store_false",
         help="Disable planning stage profiling.",
+    )
+    parser.add_argument(
+        "--place-clearance-score",
+        dest="place_clearance_score",
+        action="store_true",
+        default=False,
+        help="Add a soft score penalty when a target release footprint is close to other scene obstacles.",
+    )
+    parser.add_argument(
+        "--no-place-clearance-score",
+        dest="place_clearance_score",
+        action="store_false",
+        help="Disable soft obstacle-clearance scoring for place candidates.",
+    )
+    parser.add_argument(
+        "--place-clearance-soft-margin-m",
+        type=float,
+        default=0.015,
+        help="Desired minimum XY footprint clearance used by soft place-candidate scoring.",
+    )
+    parser.add_argument(
+        "--place-clearance-penalty-weight",
+        type=float,
+        default=0.75,
+        help="Penalty weight for place candidates inside the soft clearance margin.",
+    )
+    parser.add_argument(
+        "--place-clearance-overlap-penalty-weight",
+        type=float,
+        default=1.5,
+        help="Additional penalty weight for predicted footprint overlap with scene obstacles.",
+    )
+    parser.add_argument(
+        "--place-clearance-max-penalty",
+        type=float,
+        default=4.0,
+        help="Cap for the soft obstacle-clearance score penalty.",
+    )
+    parser.add_argument(
+        "--place-clearance-candidate-box-scale",
+        type=float,
+        default=1.0,
+        help="Scale the active object's footprint box for soft place-clearance scoring.",
+    )
+    parser.add_argument(
+        "--place-clearance-obstacle-box-scale",
+        type=float,
+        default=1.0,
+        help="Scale scene obstacle footprint boxes for soft place-clearance scoring.",
+    )
+    parser.add_argument(
+        "--place-clearance-retry",
+        dest="place_clearance_retry",
+        action="store_true",
+        default=False,
+        help=(
+            "After the normal place candidates fail, retry a few high-risk candidates with "
+            "small XY offsets away from the nearest obstacle. This does not affect the first pass."
+        ),
+    )
+    parser.add_argument(
+        "--no-place-clearance-retry",
+        dest="place_clearance_retry",
+        action="store_false",
+        help="Disable the failure-only place clearance micro-adjust retry.",
+    )
+    parser.add_argument(
+        "--place-clearance-retry-max-base-candidates",
+        type=int,
+        default=2,
+        help="Maximum risky base place candidates to micro-adjust after the normal path fails.",
+    )
+    parser.add_argument(
+        "--place-clearance-retry-offsets-m",
+        type=float,
+        nargs="*",
+        default=[0.008, 0.016],
+        help="XY offset magnitudes used by the failure-only place clearance retry.",
+    )
+    parser.add_argument(
+        "--place-clearance-retry-include-perpendicular",
+        dest="place_clearance_retry_include_perpendicular",
+        action="store_true",
+        default=True,
+        help="Also try perpendicular XY offsets around the nearest obstacle during clearance retry.",
+    )
+    parser.add_argument(
+        "--no-place-clearance-retry-include-perpendicular",
+        dest="place_clearance_retry_include_perpendicular",
+        action="store_false",
+        help="Only try the direct away-from-obstacle offset during clearance retry.",
+    )
+    parser.add_argument(
+        "--place-clearance-retry-max-generated-candidates",
+        type=int,
+        default=12,
+        help="Maximum micro-adjusted place candidates generated per retry pass.",
+    )
+    parser.add_argument(
+        "--place-clearance-retry-min-penalty",
+        type=float,
+        default=0.01,
+        help="Minimum forced clearance penalty required before a candidate is micro-adjusted.",
+    )
+    parser.add_argument(
+        "--place-clearance-retry-allow-unscored",
+        dest="place_clearance_retry_allow_unscored",
+        action="store_true",
+        default=True,
+        help=(
+            "If no candidate exceeds the clearance penalty threshold after failure, still micro-adjust "
+            "the top-ranked surface/vertical candidates as an exploratory fallback."
+        ),
+    )
+    parser.add_argument(
+        "--no-place-clearance-retry-allow-unscored",
+        dest="place_clearance_retry_allow_unscored",
+        action="store_false",
+        help="Skip clearance retry when no candidate exceeds the forced clearance penalty threshold.",
     )
     parser.add_argument(
         "--random-cycle-targets",
@@ -976,6 +1115,31 @@ def build_arg_parser():
             "Maximum cheap-IK grasp candidates allowed to build/rank place candidates in winner-chain preselect. "
             "Set <=0 to rank place candidates for every grasp with valid pregrasp/grasp IK."
         ),
+    )
+    parser.add_argument(
+        "--fixed-tabletop-fast-chain-place-rank-grasp-limit",
+        type=int,
+        default=6,
+        help=(
+            "Minimum cheap-IK grasp candidates to place-rank for fixed-tabletop objects. "
+            "This only broadens IK screening; MotionGen is still capped by --fast-chain-top-pairs."
+        ),
+    )
+    parser.add_argument(
+        "--fast-chain-diverse-top-grasps",
+        dest="fast_chain_diverse_top_grasps",
+        action="store_true",
+        default=True,
+        help=(
+            "Prefer top fast-chain pairs from distinct grasp candidates before filling extra slots. "
+            "This keeps top-K MotionGen bounded while avoiding three nearly identical place variants."
+        ),
+    )
+    parser.add_argument(
+        "--no-fast-chain-diverse-top-grasps",
+        dest="fast_chain_diverse_top_grasps",
+        action="store_false",
+        help="Disable distinct-grasp preference when selecting fast-chain top pairs.",
     )
     parser.add_argument(
         "--fast-chain-place-ik-chunk-candidates",
@@ -1567,6 +1731,34 @@ def build_arg_parser():
         help="Disable joint-search final-contact prevalidation.",
     )
     parser.add_argument(
+        "--joint-search-release-endpoint-precheck",
+        dest="joint_search_release_endpoint_precheck",
+        action="store_true",
+        default=True,
+        help=(
+            "Before accepting a joint-search transport hover winner, verify that "
+            "hover->release has endpoint IK and a validated short straight segment. "
+            "This is cheaper than full final-contact MotionGen validation."
+        ),
+    )
+    parser.add_argument(
+        "--no-joint-search-release-endpoint-precheck",
+        dest="joint_search_release_endpoint_precheck",
+        action="store_false",
+        help="Disable the lightweight release endpoint precheck for joint-search transport winners.",
+    )
+    parser.add_argument(
+        "--joint-search-release-endpoint-precheck-object-names",
+        type=str,
+        nargs="*",
+        default=["gluestick", "carriot"],
+        help=(
+            "Object names for which the lightweight release endpoint precheck is enabled. "
+            "Default checks gluestick and carriot. Pass the option with no names to check "
+            "all non-drop candidates when --joint-search-release-endpoint-precheck is enabled."
+        ),
+    )
+    parser.add_argument(
         "--insert-joint-search-max-final-contact-checks",
         type=int,
         default=2,
@@ -1583,11 +1775,21 @@ def build_arg_parser():
     )
     parser.add_argument(
         "--strict-return-to-cycle-start",
+        dest="strict_return_to_cycle_start",
         action="store_true",
-        default=False,
+        default=True,
         help=(
             "Treat empty-gripper return_to_cycle_start failure after a completed place as fatal. "
-            "By default the object placement remains successful and the next cycle starts from the current arm pose."
+            "This is enabled by default so the next cycle cannot start from a stale post-place arm pose."
+        ),
+    )
+    parser.add_argument(
+        "--no-strict-return-to-cycle-start",
+        dest="strict_return_to_cycle_start",
+        action="store_false",
+        help=(
+            "Allow the next cycle to start from the current arm pose when return_to_cycle_start fails. "
+            "This is only intended for debugging."
         ),
     )
     parser.add_argument(
@@ -3057,6 +3259,493 @@ def _candidate_place_orientation_penalty(candidate, demo, args) -> float:
     return float((1.0 - alignment) * 0.5 * weight)
 
 
+def _asset_box_size_cached(args, asset_file, asset_scale) -> np.ndarray | None:
+    if asset_file is None:
+        return None
+    try:
+        path = str(Path(str(asset_file)).expanduser())
+        scale = float(asset_scale or 1.0)
+    except Exception:
+        return None
+    cache = getattr(args, "_place_clearance_asset_box_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(args, "_place_clearance_asset_box_cache", cache)
+        except Exception:
+            pass
+    key = (path, round(scale, 9))
+    if key in cache:
+        return np.asarray(cache[key], dtype=np.float32).reshape(3).copy()
+    try:
+        dims = np.asarray(targeted.base.get_asset_box_size(path, scale), dtype=np.float32).reshape(3)
+    except Exception:
+        return None
+    if not np.all(np.isfinite(dims)):
+        return None
+    cache[key] = dims.astype(np.float32).copy()
+    return dims.astype(np.float32)
+
+
+def _convex_hull_xy(points) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    pts = pts[np.all(np.isfinite(pts), axis=1)]
+    if pts.shape[0] <= 1:
+        return pts
+    pts = np.unique(np.round(pts, 7), axis=0)
+    if pts.shape[0] <= 2:
+        return pts.astype(np.float32)
+    order = np.lexsort((pts[:, 1], pts[:, 0]))
+    pts = pts[order]
+
+    def cross(o, a, b):
+        return float((a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 1e-8:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 1e-8:
+            upper.pop()
+        upper.append(p)
+    hull = np.asarray(lower[:-1] + upper[:-1], dtype=np.float32)
+    return hull if hull.size else pts.astype(np.float32)
+
+
+def _box_xy_polygon(T_world_obj, dims) -> np.ndarray | None:
+    try:
+        T = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4)
+        dims = np.asarray(dims, dtype=np.float32).reshape(3)
+    except Exception:
+        return None
+    if not np.all(np.isfinite(T)) or not np.all(np.isfinite(dims)):
+        return None
+    half = np.maximum(dims, 1e-5) * 0.5
+    signs = np.asarray(
+        [
+            [-1.0, -1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, -1.0],
+            [1.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    corners = (T[:3, :3] @ (signs * half).T).T + T[:3, 3]
+    return _convex_hull_xy(corners[:, :2])
+
+
+def _point_segment_distance_xy(p, a, b) -> float:
+    p = np.asarray(p, dtype=np.float32).reshape(2)
+    a = np.asarray(a, dtype=np.float32).reshape(2)
+    b = np.asarray(b, dtype=np.float32).reshape(2)
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom <= 1e-12:
+        return float(np.linalg.norm(p - a))
+    t = float(np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def _segments_intersect_xy(a, b, c, d) -> bool:
+    a = np.asarray(a, dtype=np.float32).reshape(2)
+    b = np.asarray(b, dtype=np.float32).reshape(2)
+    c = np.asarray(c, dtype=np.float32).reshape(2)
+    d = np.asarray(d, dtype=np.float32).reshape(2)
+
+    def orient(p, q, r):
+        return float((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]))
+
+    def on_segment(p, q, r):
+        return (
+            min(p[0], r[0]) - 1e-8 <= q[0] <= max(p[0], r[0]) + 1e-8
+            and min(p[1], r[1]) - 1e-8 <= q[1] <= max(p[1], r[1]) + 1e-8
+        )
+
+    o1 = orient(a, b, c)
+    o2 = orient(a, b, d)
+    o3 = orient(c, d, a)
+    o4 = orient(c, d, b)
+    if o1 * o2 < 0.0 and o3 * o4 < 0.0:
+        return True
+    if abs(o1) <= 1e-8 and on_segment(a, c, b):
+        return True
+    if abs(o2) <= 1e-8 and on_segment(a, d, b):
+        return True
+    if abs(o3) <= 1e-8 and on_segment(c, a, d):
+        return True
+    if abs(o4) <= 1e-8 and on_segment(c, b, d):
+        return True
+    return False
+
+
+def _convex_polygon_signed_distance_xy(poly_a, poly_b) -> float | None:
+    a = np.asarray(poly_a, dtype=np.float32).reshape(-1, 2)
+    b = np.asarray(poly_b, dtype=np.float32).reshape(-1, 2)
+    if a.shape[0] == 0 or b.shape[0] == 0:
+        return None
+    if a.shape[0] == 1 and b.shape[0] == 1:
+        return float(np.linalg.norm(a[0] - b[0]))
+    min_overlap = float("inf")
+    separated = False
+    for poly in (a, b):
+        if poly.shape[0] < 2:
+            continue
+        for i in range(poly.shape[0]):
+            edge = poly[(i + 1) % poly.shape[0]] - poly[i]
+            norm = float(np.linalg.norm(edge))
+            if norm <= 1e-9:
+                continue
+            axis = np.asarray([-edge[1], edge[0]], dtype=np.float32) / norm
+            a_proj = a @ axis
+            b_proj = b @ axis
+            gap = max(float(np.min(b_proj) - np.max(a_proj)), float(np.min(a_proj) - np.max(b_proj)))
+            if gap > 0.0:
+                separated = True
+                break
+            overlap = min(float(np.max(a_proj)), float(np.max(b_proj))) - max(
+                float(np.min(a_proj)),
+                float(np.min(b_proj)),
+            )
+            min_overlap = min(min_overlap, overlap)
+        if separated:
+            break
+    if not separated:
+        return -float(max(min_overlap, 0.0)) if np.isfinite(min_overlap) else 0.0
+
+    min_dist = float("inf")
+    for i in range(a.shape[0]):
+        a0 = a[i]
+        a1 = a[(i + 1) % a.shape[0]] if a.shape[0] > 1 else a[i]
+        for j in range(b.shape[0]):
+            b0 = b[j]
+            b1 = b[(j + 1) % b.shape[0]] if b.shape[0] > 1 else b[j]
+            if a.shape[0] > 1 and b.shape[0] > 1 and _segments_intersect_xy(a0, a1, b0, b1):
+                return 0.0
+            min_dist = min(
+                min_dist,
+                _point_segment_distance_xy(a0, b0, b1),
+                _point_segment_distance_xy(a1, b0, b1),
+                _point_segment_distance_xy(b0, a0, a1),
+                _point_segment_distance_xy(b1, a0, a1),
+            )
+    return float(min_dist) if np.isfinite(min_dist) else None
+
+
+def _candidate_place_clearance_measure(candidate, demo, args) -> dict | None:
+    margin = float(max(getattr(args, "place_clearance_soft_margin_m", 0.015), 0.0))
+    weight = float(max(getattr(args, "place_clearance_penalty_weight", 0.75), 0.0))
+    if margin <= 1e-6 or weight <= 0.0:
+        return None
+    place_plan = candidate.get("place_plan") if isinstance(candidate, dict) else None
+    T_world_obj = candidate.get("T_world_obj_desired") if isinstance(candidate, dict) else None
+    if T_world_obj is None:
+        T_world_obj = getattr(place_plan, "T_world_obj_desired", None)
+    if T_world_obj is None:
+        return None
+    asset_file = getattr(args, "sim_asset_file", None) or getattr(args, "mesh_file", None)
+    asset_scale = getattr(args, "sim_asset_scale", None) or getattr(args, "mesh_scale", 1.0)
+    active_dims = _asset_box_size_cached(args, asset_file, asset_scale)
+    if active_dims is None:
+        return None
+    active_dims = active_dims * float(max(getattr(args, "place_clearance_candidate_box_scale", 1.0), 1e-3))
+    active_poly = _box_xy_polygon(T_world_obj, active_dims)
+    if active_poly is None or active_poly.shape[0] == 0:
+        return None
+
+    source_name = curobo_wrapper.normalize_object_name(getattr(args, "object_name", None))
+    target_name = curobo_wrapper.normalize_object_name(candidate.get("target_name")) if isinstance(candidate, dict) else None
+    excluded = {None, source_name, target_name, "desk", "table", "virtual_side_wall", "virtual_top_wall"}
+    min_clearance = None
+    min_obstacle = None
+    min_obstacle_xy = None
+    checked = 0
+    active_center_xy = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4)[:2, 3].astype(np.float32)
+    for obstacle in list(getattr(demo, "scene_obstacles", []) or []):
+        if not isinstance(obstacle, dict):
+            continue
+        if not bool(obstacle.get("planner_collision", True)):
+            continue
+        obs_name = curobo_wrapper.normalize_object_name(obstacle.get("object_name") or obstacle.get("label"))
+        actor_name = str(obstacle.get("actor_name") or "")
+        if isinstance(obs_name, str) and obs_name.startswith("scene_obstacle_"):
+            obs_name = curobo_wrapper.normalize_object_name(obs_name.removeprefix("scene_obstacle_"))
+        actor_object_name = curobo_wrapper.normalize_object_name(actor_name.removeprefix("scene_obstacle_"))
+        if obs_name in excluded or actor_object_name in excluded or actor_name in {"virtual_side_wall", "virtual_top_wall"}:
+            continue
+        if actor_name.startswith("scene_obstacle_virtual_") or str(obs_name or "").startswith("virtual_"):
+            continue
+        T_obs = obstacle.get("T_world_obj")
+        obs_dims = obstacle.get("planner_box_size", obstacle.get("visual_box_size"))
+        if T_obs is None or obs_dims is None:
+            continue
+        try:
+            obs_dims = np.asarray(obs_dims, dtype=np.float32).reshape(3)
+        except Exception:
+            continue
+        obs_dims = obs_dims * float(max(getattr(args, "place_clearance_obstacle_box_scale", 1.0), 1e-3))
+        obs_poly = _box_xy_polygon(T_obs, obs_dims)
+        if obs_poly is None or obs_poly.shape[0] == 0:
+            continue
+        clearance = _convex_polygon_signed_distance_xy(active_poly, obs_poly)
+        if clearance is None or not np.isfinite(float(clearance)):
+            continue
+        checked += 1
+        clearance = float(clearance)
+        if min_clearance is None or clearance < min_clearance:
+            min_clearance = clearance
+            min_obstacle = obs_name or actor_name or "unknown"
+            try:
+                min_obstacle_xy = np.asarray(T_obs, dtype=np.float32).reshape(4, 4)[:2, 3].astype(np.float32)
+            except Exception:
+                min_obstacle_xy = None
+    if min_clearance is None:
+        return {
+            "penalty": 0.0,
+            "debug": {"checked_obstacles": checked},
+            "min_clearance_m": None,
+            "away_xy": None,
+        }
+    deficit = max(0.0, margin - float(min_clearance))
+    penalty = weight * (deficit / margin)
+    if min_clearance < 0.0:
+        overlap_weight = float(max(getattr(args, "place_clearance_overlap_penalty_weight", 1.5), 0.0))
+        penalty += overlap_weight * min((-float(min_clearance)) / margin, 3.0)
+    penalty = min(float(max(penalty, 0.0)), float(max(getattr(args, "place_clearance_max_penalty", 4.0), 0.0)))
+    away_xy = None
+    if min_obstacle_xy is not None:
+        away = active_center_xy - np.asarray(min_obstacle_xy, dtype=np.float32).reshape(2)
+        norm = float(np.linalg.norm(away))
+        if norm > 1e-6:
+            away_xy = (away / norm).astype(np.float32)
+    if away_xy is None:
+        try:
+            robot_xy = targeted.base.flatten_np(demo.robot.pose.p)[:2].astype(np.float32)
+            away = active_center_xy - robot_xy
+            norm = float(np.linalg.norm(away))
+            if norm > 1e-6:
+                away_xy = (away / norm).astype(np.float32)
+        except Exception:
+            away_xy = None
+    if away_xy is None:
+        away_xy = np.asarray([1.0, 0.0], dtype=np.float32)
+    debug = {
+        "min_clearance_m": float(min_clearance),
+        "min_obstacle": min_obstacle,
+        "checked_obstacles": int(checked),
+        "soft_margin_m": float(margin),
+    }
+    return {
+        "penalty": float(penalty),
+        "debug": debug,
+        "min_clearance_m": float(min_clearance),
+        "min_obstacle": min_obstacle,
+        "away_xy": away_xy.astype(np.float32),
+    }
+
+
+def _candidate_place_clearance_penalty(candidate, demo, args, *, force: bool = False) -> tuple[float, dict]:
+    if not force and not bool(getattr(args, "place_clearance_score", False)):
+        return 0.0, {}
+    measure = _candidate_place_clearance_measure(candidate, demo, args)
+    if measure is None:
+        return 0.0, {}
+    return float(measure.get("penalty", 0.0) or 0.0), dict(measure.get("debug", {}) or {})
+
+
+def _shift_pose_world_xy(pose, offset_xy) -> object:
+    offset_xy = np.asarray(offset_xy, dtype=np.float32).reshape(2)
+    p = _get_pose_position(pose).astype(np.float32)
+    p[:2] += offset_xy
+    return targeted.base.make_pose_with_position(pose, p.astype(np.float32))
+
+
+def _shift_place_candidate_world_xy(candidate, offset_xy, *, label_suffix: str, grasp_choice=None) -> dict:
+    item = dict(candidate)
+    for key in ("pose", "hover_pose", "pre_place_pose", "place_pose", "release_pose", "raw_release_pose", "retreat_pose"):
+        pose = item.get(key)
+        if pose is not None:
+            item[key] = _shift_pose_world_xy(pose, offset_xy)
+    base_label = str(item.get("label", "place"))
+    item["label"] = f"{base_label}_{label_suffix}"
+    variant = item.get("variant_label")
+    item["variant_label"] = f"{variant}+{label_suffix}" if variant else label_suffix
+    item["place_clearance_retry"] = True
+    item["place_clearance_retry_source_label"] = base_label
+    item["place_clearance_retry_offset_xy_m"] = np.asarray(offset_xy, dtype=np.float32).reshape(2).copy()
+    T_world_obj = item.get("T_world_obj_desired")
+    place_plan = item.get("place_plan")
+    if T_world_obj is None:
+        T_world_obj = getattr(place_plan, "T_world_obj_desired", None)
+    if T_world_obj is not None:
+        T_shifted = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4).copy()
+        T_shifted[:2, 3] += np.asarray(offset_xy, dtype=np.float32).reshape(2)
+        item["T_world_obj_desired"] = T_shifted.astype(np.float32)
+    else:
+        release_pose = item.get("release_pose", item.get("place_pose"))
+        T_tcp_obj = None
+        if isinstance(grasp_choice, dict):
+            T_tcp_obj = grasp_choice.get("T_tcp_obj")
+        if T_tcp_obj is None and isinstance(item.get("grasp_choice"), dict):
+            T_tcp_obj = item["grasp_choice"].get("T_tcp_obj")
+        if release_pose is not None and T_tcp_obj is not None:
+            try:
+                T_world_tcp = _pose_to_matrix_from_pose_obj(release_pose)
+                item["T_world_obj_desired"] = (
+                    T_world_tcp @ np.asarray(T_tcp_obj, dtype=np.float32).reshape(4, 4)
+                ).astype(np.float32)
+            except Exception:
+                pass
+    for stale_key in (
+        "result",
+        "q_path",
+        "q_goal",
+        "q_hover",
+        "q_release",
+        "fast_chain_hover_q",
+        "fast_chain_release_q",
+        "fast_chain_ik_record",
+        "prefilter_q_goal",
+        "prefilter_start_q",
+        "metrics",
+        "score",
+        "terminal_align",
+        "planner_pose",
+    ):
+        item.pop(stale_key, None)
+    return item
+
+
+def _build_place_clearance_retry_candidates(candidates, demo, args, *, label: str, grasp_choice=None) -> list[dict]:
+    if not bool(getattr(args, "place_clearance_retry", True)):
+        return []
+    base_candidates = []
+    measured_candidates = []
+    min_penalty = float(max(getattr(args, "place_clearance_retry_min_penalty", 0.01), 0.0))
+    for candidate in list(candidates or []):
+        place_mode = str(candidate.get("place_mode", "drop_place"))
+        if place_mode in {"drop_place", "insert_place"}:
+            continue
+        measure = _candidate_place_clearance_measure(candidate, demo, args)
+        if measure is None:
+            continue
+        penalty = float(measure.get("penalty", 0.0) or 0.0)
+        away_xy = measure.get("away_xy")
+        if away_xy is None:
+            continue
+        min_clearance_raw = measure.get("min_clearance_m", None)
+        min_clearance = float(min_clearance_raw) if min_clearance_raw is not None else float("inf")
+        measured_candidates.append((penalty, min_clearance, candidate, measure))
+        if penalty >= min_penalty:
+            base_candidates.append((penalty, min_clearance, candidate, measure))
+    if not base_candidates:
+        if not bool(getattr(args, "place_clearance_retry_allow_unscored", True)) or not measured_candidates:
+            print(f"[place_clearance_retry] {label}: no risky surface/vertical candidate exceeded penalty {min_penalty:.3f}")
+            return []
+        measured_candidates.sort(key=lambda item: (item[1], _pre_place_screen_sort_key(item[2])))
+        max_base = int(getattr(args, "place_clearance_retry_max_base_candidates", 2) or 0)
+        base_candidates = measured_candidates[:max_base] if max_base > 0 else measured_candidates
+        print(
+            f"[place_clearance_retry] {label}: no candidate exceeded penalty {min_penalty:.3f}; "
+            f"exploring {len(base_candidates)} top surface/vertical candidate(s)"
+        )
+    else:
+        base_candidates.sort(key=lambda item: (-item[0], item[1], _pre_place_screen_sort_key(item[2])))
+        max_base = int(getattr(args, "place_clearance_retry_max_base_candidates", 2) or 0)
+        if max_base > 0:
+            base_candidates = base_candidates[:max_base]
+    offsets = _unique_finite_float_list(
+        getattr(args, "place_clearance_retry_offsets_m", [0.008, 0.016]),
+        min_value=0.001,
+    )
+    if not offsets:
+        return []
+    max_generated = int(getattr(args, "place_clearance_retry_max_generated_candidates", 12) or 0)
+    include_perp = bool(getattr(args, "place_clearance_retry_include_perpendicular", True))
+    generated = []
+    seen = set()
+    summaries = []
+    for penalty, min_clearance, candidate, measure in base_candidates:
+        away = np.asarray(measure.get("away_xy"), dtype=np.float32).reshape(2)
+        norm = float(np.linalg.norm(away))
+        if norm <= 1e-6:
+            continue
+        away = away / norm
+        directions = [("away", away)]
+        if include_perp:
+            perp = np.asarray([-away[1], away[0]], dtype=np.float32)
+            directions.extend([("perp_pos", perp), ("perp_neg", -perp)])
+        for offset in offsets:
+            for direction_label, direction in directions:
+                offset_xy = np.asarray(direction, dtype=np.float32).reshape(2) * float(offset)
+                suffix = f"clearance_{direction_label}_{int(round(float(offset) * 1000.0))}mm"
+                shifted = _shift_place_candidate_world_xy(
+                    candidate,
+                    offset_xy,
+                    label_suffix=suffix,
+                    grasp_choice=grasp_choice,
+                )
+                key = (
+                    _pose_dedupe_key(shifted.get("pose")),
+                    _pose_dedupe_key(shifted.get("place_pose")),
+                )
+                if key is None or key in seen:
+                    continue
+                seen.add(key)
+                generated.append(shifted)
+                if len(summaries) < 6:
+                    summaries.append(
+                        (
+                            str(candidate.get("label", "")),
+                            round(float(penalty), 3),
+                            round(float(min_clearance), 4),
+                            suffix,
+                        )
+                    )
+                if max_generated > 0 and len(generated) >= max_generated:
+                    break
+            if max_generated > 0 and len(generated) >= max_generated:
+                break
+        if max_generated > 0 and len(generated) >= max_generated:
+            break
+    print(
+        f"[place_clearance_retry] {label}: generated {len(generated)} micro-adjusted candidate(s) "
+        f"from {len(base_candidates)} base candidate(s): {summaries}"
+    )
+    return generated
+
+
+def _candidate_soft_penalties(candidate, demo, args) -> tuple[float, float, float, dict]:
+    selection_penalty = float(_candidate_selection_penalty(candidate, args))
+    place_pref_penalty = float(_candidate_place_orientation_penalty(candidate, demo, args))
+    clearance_penalty, clearance_debug = _candidate_place_clearance_penalty(candidate, demo, args)
+    return selection_penalty, place_pref_penalty, float(clearance_penalty), clearance_debug
+
+
+def _score_with_candidate_soft_penalties(base_score, candidate, demo, args) -> tuple[float, float, float, float, dict]:
+    selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug = _candidate_soft_penalties(
+        candidate,
+        demo,
+        args,
+    )
+    score = float(base_score) + selection_penalty + place_pref_penalty + clearance_penalty
+    return score, selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug
+
+
+def _store_candidate_soft_penalty_fields(item, selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug):
+    item["selection_penalty"] = float(selection_penalty)
+    item["place_preference_penalty"] = float(place_pref_penalty)
+    item["place_clearance_penalty"] = float(clearance_penalty)
+    if clearance_debug:
+        item["place_clearance_debug"] = dict(clearance_debug)
+
+
 def _candidate_sort_key(item):
     metrics = item["metrics"]
     return (
@@ -3471,7 +4160,9 @@ def _final_contact_validation_sort_key(item) -> tuple:
     hover_extra = float(item.get("hover_extra_height_m", 0.0) or 0.0)
     spin_deg = _variant_yaw_deg_from_labels(item.get("variant_label"), item.get("label"))
     metrics = item.get("metrics") or {}
+    clearance_penalty = float(item.get("place_clearance_penalty", 0.0) or 0.0)
     return (
+        clearance_penalty,
         1 if hover_extra > 1e-6 else 0,
         hover_extra,
         float(item.get("score", 0.0) or 0.0),
@@ -3497,8 +4188,10 @@ def _bi_final_contact_validation_sort_key(item) -> tuple:
     release_up_match = re.search(r"release_up_([-+]?\d+(?:\.\d+)?)mm", text)
     release_up_mm = float(release_up_match.group(1)) if release_up_match else 0.0
     is_insert = str(item.get("place_mode", "")) == "insert_place"
+    clearance_penalty = float(item.get("place_clearance_penalty", 0.0) or 0.0)
     return (
         0 if is_insert else 1,
+        clearance_penalty,
         0 if abs(approach_mm - 50.0) <= 1.0 else 1,
         _yaw_distance_deg(spin_deg, 0.0),
         release_up_mm,
@@ -3531,7 +4224,9 @@ def _vertical_long_axis_final_contact_sort_key(item, source_name: str | None) ->
         yaw_pref = min(_yaw_distance_deg(yaw, target) for target in targets)
     else:
         yaw_pref = _yaw_distance_deg(yaw, 0.0)
+    clearance_penalty = float(item.get("place_clearance_penalty", 0.0) or 0.0)
     return (
+        clearance_penalty,
         yaw_pref,
         hover_extra,
         1 if "hover_plus_60mm" in text else 0,
@@ -5010,6 +5705,167 @@ def _validate_candidate_joint_path_with_demo_planner(demo, start_q, q_path, *, u
     return bool(ok)
 
 
+def _collision_record_for_profile(collision) -> dict:
+    text_func = getattr(targeted.base, "collision_to_text", None)
+    try:
+        text = str(text_func(collision)) if callable(text_func) else ""
+    except Exception:
+        text = ""
+    if not text:
+        link1 = getattr(collision, "link_name1", "?")
+        obj1 = getattr(collision, "object_name1", "?")
+        link2 = getattr(collision, "link_name2", "?")
+        obj2 = getattr(collision, "object_name2", "?")
+        text = f"{link1} of entity {obj1} <-> {link2} of entity {obj2}"
+    return {
+        "text": text,
+        "link_name1": str(getattr(collision, "link_name1", "")),
+        "object_name1": str(getattr(collision, "object_name1", "")),
+        "link_name2": str(getattr(collision, "link_name2", "")),
+        "object_name2": str(getattr(collision, "object_name2", "")),
+    }
+
+
+def _collision_records_for_profile(collisions, *, limit: int = 10) -> list[dict]:
+    return [_collision_record_for_profile(item) for item in list(collisions or [])[: max(int(limit), 0)]]
+
+
+def _retarget_path_goal_to_nearest_equivalent(demo, q_target, q_prev) -> np.ndarray:
+    q_target = np.asarray(q_target, dtype=np.float32).reshape(-1)[:7]
+    retarget = getattr(targeted.base, "retarget_goal_q_to_nearest_equivalent", None)
+    if callable(retarget):
+        try:
+            return np.asarray(retarget(demo, q_target, q_prev), dtype=np.float32).reshape(-1)[:7]
+        except Exception:
+            pass
+    return q_target
+
+
+def _diagnose_dense_linear_segment_collision(
+    demo,
+    q_start,
+    q_goal,
+    *,
+    use_attach: bool,
+    max_delta: float,
+    allow_start_in_collision: bool,
+) -> dict:
+    q_start = np.asarray(q_start, dtype=np.float32).reshape(-1)[:7]
+    q_goal = np.asarray(q_goal, dtype=np.float32).reshape(-1)[:7]
+    q_delta = q_goal - q_start
+    max_delta = float(max(max_delta, 1e-3))
+    num_steps = max(2, int(np.ceil(np.max(np.abs(q_delta)) / max_delta)))
+
+    start_self = list(demo.planner.check_for_self_collision(qpos=q_start) or [])
+    start_env = list(demo.planner.check_for_env_collision(qpos=q_start, with_point_cloud=False, use_attach=use_attach) or [])
+    if (start_self or start_env) and not allow_start_in_collision:
+        self_records = _collision_records_for_profile(start_self)
+        env_records = _collision_records_for_profile(start_env)
+        return {
+            "success": False,
+            "status": "START_STATE_COLLISION",
+            "collision_kind": "segment_start",
+            "segment_step": 0,
+            "segment_steps": int(num_steps),
+            "alpha": 0.0,
+            "self_collision_count": len(start_self),
+            "env_collision_count": len(start_env),
+            "self_collisions": self_records,
+            "env_collisions": env_records,
+            "collision_pair_texts": [item["text"] for item in self_records + env_records],
+        }
+
+    for step_idx, alpha in enumerate(np.linspace(0.0, 1.0, num_steps + 1)[1:], start=1):
+        q = ((1.0 - float(alpha)) * q_start + float(alpha) * q_goal).astype(np.float32)
+        self_collisions = list(demo.planner.check_for_self_collision(qpos=q) or [])
+        env_collisions = list(
+            demo.planner.check_for_env_collision(qpos=q, with_point_cloud=False, use_attach=use_attach) or []
+        )
+        if self_collisions or env_collisions:
+            self_records = _collision_records_for_profile(self_collisions)
+            env_records = _collision_records_for_profile(env_collisions)
+            return {
+                "success": False,
+                "status": "PATH_COLLISION",
+                "collision_kind": "segment_waypoint",
+                "segment_step": int(step_idx),
+                "segment_steps": int(num_steps),
+                "alpha": float(alpha),
+                "self_collision_count": len(self_collisions),
+                "env_collision_count": len(env_collisions),
+                "self_collisions": self_records,
+                "env_collisions": env_records,
+                "collision_pair_texts": [item["text"] for item in self_records + env_records],
+            }
+    return {
+        "success": True,
+        "status": "CLEAR",
+        "segment_steps": int(num_steps),
+    }
+
+
+def _diagnose_dense_joint_path_collision(
+    demo,
+    q_start,
+    q_path,
+    *,
+    use_attach: bool,
+    max_delta: float,
+    allow_start_in_collision: bool = False,
+) -> dict:
+    q_prev = _q7_or_none(q_start)
+    if q_prev is None:
+        return {"success": False, "status": "INVALID_START_Q"}
+    points = [_q7_or_none(q) for q in list(q_path or [])]
+    points = [q for q in points if q is not None]
+    if not points:
+        return {"success": True, "status": "EMPTY_PATH", "path_waypoints": 0}
+    for idx, q_target in enumerate(points):
+        q_target = _retarget_path_goal_to_nearest_equivalent(demo, q_target, q_prev)
+        seg_diag = _diagnose_dense_linear_segment_collision(
+            demo,
+            q_prev,
+            q_target,
+            use_attach=use_attach,
+            max_delta=max_delta,
+            allow_start_in_collision=bool(allow_start_in_collision and idx == 0),
+        )
+        if not bool(seg_diag.get("success", False)):
+            seg_diag.update(
+                {
+                    "path_segment_idx": int(idx),
+                    "path_waypoint_idx": int(idx),
+                    "path_waypoints": int(len(points)),
+                    "max_delta": float(max_delta),
+                    "use_attach": bool(use_attach),
+                }
+            )
+            return seg_diag
+        q_prev = q_target
+    return {
+        "success": True,
+        "status": "CLEAR",
+        "path_waypoints": int(len(points)),
+        "max_delta": float(max_delta),
+        "use_attach": bool(use_attach),
+    }
+
+
+def _print_dense_collision_diagnosis(label: str, diag: dict) -> None:
+    if bool(diag.get("success", False)):
+        return
+    print(
+        f"[collision] {label}: dense path validation failed "
+        f"status={diag.get('status')} segment={diag.get('path_segment_idx')} "
+        f"step={diag.get('segment_step')}/{diag.get('segment_steps')}"
+    )
+    pair_texts = list(diag.get("collision_pair_texts") or [])
+    for text in pair_texts[:10]:
+        print(f"[collision]   - {text}")
+    if len(pair_texts) > 10:
+        print(f"[collision]   ... {len(pair_texts) - 10} more")
+
+
 def _start_state_is_world_collision(
     planner,
     demo,
@@ -5540,6 +6396,7 @@ def _consume_return_to_start_preplan(demo, args, current_q, goal_q, *, use_attac
         prelift_waypoints=payload.get("prelift_waypoints"),
         return_waypoints=payload.get("return_waypoints"),
     )
+    args._return_to_start_preplan_state = None
     return q_path
 
 
@@ -5601,6 +6458,42 @@ def _plan_and_execute_return_to_cycle_start(
         cached_plan_mode = str(getattr(args, "_return_to_start_preplan_last_mode", "direct") or "direct")
         return_mode = f"preplan_cached_{cached_plan_mode}"
         print(f"[return_preplan] using cached return_to_start path ({len(q_path)} waypoint(s))")
+        with _profile_stage(
+            args,
+            "return_to_start_cached_path_validate",
+            mode=return_mode,
+            path_waypoints=len(q_path or []),
+        ) as prof:
+            dense_validate_delta = 0.01 if use_attach else 0.03
+            cached_diag = _diagnose_dense_joint_path_collision(
+                demo,
+                q_current,
+                q_path,
+                use_attach=use_attach,
+                max_delta=dense_validate_delta,
+            )
+            cached_path_ok = bool(cached_diag.get("success", False))
+            prof["success"] = bool(cached_path_ok)
+            prof["status"] = "Success" if cached_path_ok else "DENSE_COLLISION_VALIDATE_FAIL"
+            prof["max_delta"] = float(dense_validate_delta)
+            if not cached_path_ok:
+                _print_dense_collision_diagnosis("return_to_start_cached_pre_execute", cached_diag)
+                prof["collision_status"] = cached_diag.get("status")
+                prof["collision_kind"] = cached_diag.get("collision_kind")
+                prof["path_segment_idx"] = cached_diag.get("path_segment_idx")
+                prof["path_waypoint_idx"] = cached_diag.get("path_waypoint_idx")
+                prof["segment_step"] = cached_diag.get("segment_step")
+                prof["segment_steps"] = cached_diag.get("segment_steps")
+                prof["alpha"] = cached_diag.get("alpha")
+                prof["self_collision_count"] = cached_diag.get("self_collision_count")
+                prof["env_collision_count"] = cached_diag.get("env_collision_count")
+                prof["collision_pair_texts"] = cached_diag.get("collision_pair_texts")
+                prof["self_collisions"] = cached_diag.get("self_collisions")
+                prof["env_collisions"] = cached_diag.get("env_collisions")
+        if not cached_path_ok:
+            print("[return_preplan] cached return_to_start path failed dense validation; replanning live")
+            q_path = None
+            return_mode = "live_after_cached_validate_fail"
 
     clearance_lift_m, clearance_lift_debug = _return_start_clearance_lift_m(args, return_extra_obstacles)
     if q_path is None and clearance_lift_m > 1e-5:
@@ -5788,22 +6681,61 @@ def _plan_and_execute_return_to_cycle_start(
                 mode=return_mode,
             )
             prof.update(audit)
+    execute_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     with _profile_stage(args, "return_to_start_execute", mode=return_mode, path_waypoints=len(q_path or [])) as prof:
-        ok, _ = targeted.base.execute_pose_path_stage(
-            demo,
-            bridge_mod,
-            real_exec,
-            label,
-            target_pose,
-            q_path,
-            args.real_gripper_open if gripper_pos is None else float(gripper_pos),
-            args,
-            use_attach=use_attach,
-        )
-        prof["success"] = bool(ok)
-        prof["status"] = "Success" if ok else "EXEC_FAIL"
+        try:
+            ok, _ = targeted.base.execute_pose_path_stage(
+                demo,
+                bridge_mod,
+                real_exec,
+                label,
+                target_pose,
+                q_path,
+                args.real_gripper_open if gripper_pos is None else float(gripper_pos),
+                args,
+                use_attach=use_attach,
+            )
+            prof["success"] = bool(ok)
+            prof["status"] = "Success" if ok else "EXEC_FAIL"
+        except Exception as exc:
+            ok = False
+            prof["success"] = False
+            prof["status"] = type(exc).__name__
+            prof["error"] = str(exc)
+            prof["traceback_tail"] = traceback.format_exc()[-4000:]
+            print(f"[FAIL] {label} execution raised {type(exc).__name__}: {exc}")
     if not ok:
         print(f"[FAIL] {label} execution failed")
+        dense_validate_delta = 0.01 if use_attach else 0.03
+        exec_diag = _diagnose_dense_joint_path_collision(
+            demo,
+            execute_start_q,
+            q_path,
+            use_attach=use_attach,
+            max_delta=dense_validate_delta,
+        )
+        if not bool(exec_diag.get("success", False)):
+            _print_dense_collision_diagnosis(f"{label}_execute", exec_diag)
+        _record_profile(
+            args,
+            "return_to_start_execute_collision_diagnosis",
+            success=bool(exec_diag.get("success", False)),
+            status=str(exec_diag.get("status", "UNKNOWN")),
+            mode=return_mode,
+            path_waypoints=len(q_path or []),
+            max_delta=float(dense_validate_delta),
+            collision_kind=exec_diag.get("collision_kind"),
+            path_segment_idx=exec_diag.get("path_segment_idx"),
+            path_waypoint_idx=exec_diag.get("path_waypoint_idx"),
+            segment_step=exec_diag.get("segment_step"),
+            segment_steps=exec_diag.get("segment_steps"),
+            alpha=exec_diag.get("alpha"),
+            self_collision_count=exec_diag.get("self_collision_count"),
+            env_collision_count=exec_diag.get("env_collision_count"),
+            collision_pair_texts=exec_diag.get("collision_pair_texts"),
+            self_collisions=exec_diag.get("self_collisions"),
+            env_collisions=exec_diag.get("env_collisions"),
+        )
         _record_profile(
             args,
             "return_to_start",
@@ -5976,22 +6908,28 @@ def _evaluate_curobo_pose_candidates(
             ):
                 continue
             metrics, score = _path_metrics_and_score(start_q, q_path)
-            selection_penalty = _candidate_selection_penalty(candidate, args)
-            place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
-            score = float(score) + float(selection_penalty) + float(place_pref_penalty)
+            score, selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug = (
+                _score_with_candidate_soft_penalties(score, candidate, demo, args)
+            )
             item = dict(candidate)
             item["result"] = result
             item["q_path"] = q_path
             item["metrics"] = metrics
             item["score"] = score
-            item["selection_penalty"] = selection_penalty
-            item["place_preference_penalty"] = place_pref_penalty
+            _store_candidate_soft_penalty_fields(
+                item,
+                selection_penalty,
+                place_pref_penalty,
+                clearance_penalty,
+                clearance_debug,
+            )
             item["terminal_align"] = terminal_align
             item["planner_pose"] = planner_pose
             print(
                 f"[curobo] {candidate_label} success: score={score:.3f}, "
                 f"selection_penalty={selection_penalty:.3f}, "
                 f"place_pref_penalty={place_pref_penalty:.3f}, "
+                f"clearance_penalty={clearance_penalty:.3f}, "
                 f"total_motion={metrics['total_motion']:.3f} rad, "
                 f"joint7_total={metrics['joint7_total_motion']:.3f} rad, "
                 f"joint7_excursion={metrics['joint7_max_excursion']:.3f} rad, "
@@ -6197,6 +7135,21 @@ def _q7_or_none(q) -> np.ndarray | None:
     return arr.astype(np.float32, copy=True)
 
 
+def _joint_angle_delta_wrapped(q_a, q_b) -> np.ndarray | None:
+    a = _q7_or_none(q_a)
+    b = _q7_or_none(q_b)
+    if a is None or b is None:
+        return None
+    return (((a - b) + np.pi) % (2.0 * np.pi) - np.pi).astype(np.float32, copy=False)
+
+
+def _max_joint_angle_delta_wrapped(q_a, q_b) -> float | None:
+    delta = _joint_angle_delta_wrapped(q_a, q_b)
+    if delta is None:
+        return None
+    return float(np.max(np.abs(delta)))
+
+
 def _ik_debug_errors(ik_result) -> tuple[float, float]:
     dbg = getattr(ik_result, "debug", {}) or {}
     pos_err = float(dbg.get("position_error", np.nan))
@@ -6217,7 +7170,8 @@ def _candidate_start_matches_prefilter(candidate: dict, start_q=None) -> bool:
     current = _q7_or_none(start_q)
     if stored is None or current is None:
         return False
-    return bool(np.allclose(stored, current, atol=1e-5, rtol=0.0))
+    delta = _max_joint_angle_delta_wrapped(stored, current)
+    return bool(delta is not None and delta <= 1e-5)
 
 
 def _candidate_reusable_prefilter_q(candidate: dict, *, start_q=None) -> np.ndarray | None:
@@ -6252,6 +7206,147 @@ def _store_candidate_prefilter_record(
     candidate["_prefilter_ik_score"] = float(_ik_score(pos_err, rot_err) if ik_score is None else ik_score)
     if role:
         candidate[f"q_{role}"] = q
+
+
+def _transport_candidate_needs_release_precheck(args, candidate: dict) -> bool:
+    if not bool(getattr(args, "joint_search_release_endpoint_precheck", True)):
+        return False
+    if not isinstance(candidate, dict):
+        return False
+    object_allowlist_raw = getattr(args, "joint_search_release_endpoint_precheck_object_names", ["gluestick"])
+    object_allowlist: set[str] = set()
+    for raw_name in list(object_allowlist_raw or []):
+        normalized = curobo_wrapper.normalize_object_name(raw_name)
+        if normalized:
+            object_allowlist.add(normalized)
+    if object_allowlist:
+        source_name = _current_source_object_name(args)
+        if source_name not in object_allowlist:
+            return False
+    place_mode = str(candidate.get("place_mode", "drop_place"))
+    if place_mode == "drop_place":
+        return False
+    hover_pose = candidate.get("hover_pose", candidate.get("pre_place_pose", candidate.get("pose")))
+    release_pose = candidate.get("release_pose", candidate.get("place_pose"))
+    if hover_pose is None or release_pose is None:
+        return False
+    try:
+        distance = float(np.linalg.norm(_get_pose_position(release_pose) - _get_pose_position(hover_pose)))
+    except Exception:
+        distance = 0.0
+    return bool(distance > 1e-5)
+
+
+def _precheck_transport_winner_release_endpoint(
+    planner,
+    demo,
+    args,
+    item: dict,
+    *,
+    q_hover,
+    label: str,
+    disabled_world_collision_links: list[str] | None = None,
+) -> bool:
+    """Cheaply reject transport winners whose final contact endpoint is already impossible."""
+    if not _transport_candidate_needs_release_precheck(args, item):
+        return True
+    q_hover = _q7_or_none(q_hover)
+    if q_hover is None:
+        print(f"[place_state] {label}: release endpoint precheck rejected winner because q_hover is missing")
+        _bump_profile_counter("release_endpoint_precheck_reject_count")
+        return False
+
+    _bump_profile_counter("release_endpoint_precheck_count")
+    place_mode = str(item.get("place_mode", "surface_place"))
+    hover_pose = item.get("hover_pose", item.get("pre_place_pose", item.get("pose")))
+    release_pose = item.get("release_pose", item.get("place_pose"))
+    if hover_pose is None or release_pose is None:
+        _bump_profile_counter("release_endpoint_precheck_success_count")
+        return True
+
+    base_disabled = set(_normalize_disabled_world_collision_links(planner, disabled_world_collision_links))
+    base_disabled.update(set(getattr(planner, "_disabled_collision_links", set()) or set()))
+    contact_disabled = set(_final_contact_disabled_world_links(planner, place_mode))
+    extra_disabled = sorted(contact_disabled - base_disabled)
+    disabled_extra = _set_world_collision_for_links(
+        planner,
+        extra_disabled,
+        enabled=False,
+        label=f"{label}_release_precheck",
+    )
+    try:
+        backtrack_tol_m = float(max(getattr(args, "strict_final_contact_waypoint_backtrack_tol_m", 0.008), 0.0))
+        pos_tol_m = float(max(getattr(args, "strict_final_contact_waypoint_pos_tol_m", 0.012), 0.0))
+        release_q_path = None
+        q_release = _q7_or_none(item.get("q_release", item.get("fast_chain_release_q")))
+        if q_release is not None:
+            release_q_path = _build_validated_linear_path_to_q(
+                demo,
+                args,
+                q_hover,
+                q_release,
+                hover_pose,
+                release_pose,
+                label=f"{label}_release_precheck_cached_q",
+                use_attach=False,
+                validation_pos_tol_m=pos_tol_m,
+                max_backtrack_m=backtrack_tol_m,
+            )
+
+        if release_q_path is None:
+            planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
+                demo,
+                release_pose,
+                ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
+            )
+            ik_result = _profile_solve_ik(
+                planner,
+                q_hover,
+                planner_pose,
+                num_seeds=int(getattr(args, "short_linear_ik_seeds", getattr(args, "curobo_num_ik_seeds", 64))),
+            )
+            if not bool(ik_result.success) or ik_result.goal_joint is None:
+                pos_err, rot_err = _ik_debug_errors(ik_result)
+                print(
+                    f"[place_state] {label}: release endpoint precheck rejected winner "
+                    f"(endpoint IK failed, status={ik_result.status}, "
+                    f"pos_err={pos_err:.5f}, rot_err={rot_err:.5f})"
+                )
+                _bump_profile_counter("release_endpoint_precheck_reject_count")
+                return False
+            q_release = np.asarray(ik_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
+            release_q_path = _build_validated_linear_path_to_q(
+                demo,
+                args,
+                q_hover,
+                q_release,
+                hover_pose,
+                release_pose,
+                label=f"{label}_release_precheck_endpoint_ik",
+                use_attach=False,
+                validation_pos_tol_m=pos_tol_m,
+                max_backtrack_m=backtrack_tol_m,
+            )
+
+        if release_q_path is None or q_release is None:
+            print(f"[place_state] {label}: release endpoint precheck rejected winner (no validated straight segment)")
+            _bump_profile_counter("release_endpoint_precheck_reject_count")
+            return False
+
+        item["q_release"] = np.asarray(q_release, dtype=np.float32).reshape(-1)[:7]
+        item["_release_endpoint_precheck_q_path"] = [
+            np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in release_q_path
+        ]
+        item["_release_endpoint_precheck"] = True
+        _bump_profile_counter("release_endpoint_precheck_success_count")
+        return True
+    finally:
+        _set_world_collision_for_links(
+            planner,
+            disabled_extra,
+            enabled=True,
+            label=f"{label}_release_precheck",
+        )
 
 
 def _evaluate_curobo_pose_candidates_goalset(
@@ -6519,16 +7614,21 @@ def _evaluate_curobo_pose_candidates_goalset(
                         label=candidate_label,
                     ):
                         metrics, score = _path_metrics_and_score(start_q, q_path)
-                        selection_penalty = _candidate_selection_penalty(candidate, args)
-                        place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
-                        score = float(score) + float(selection_penalty) + float(place_pref_penalty)
+                        score, selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug = (
+                            _score_with_candidate_soft_penalties(score, candidate, demo, args)
+                        )
                         item = dict(candidate)
                         item["result"] = goalset_result
                         item["q_path"] = q_path
                         item["metrics"] = metrics
                         item["score"] = score
-                        item["selection_penalty"] = selection_penalty
-                        item["place_preference_penalty"] = place_pref_penalty
+                        _store_candidate_soft_penalty_fields(
+                            item,
+                            selection_penalty,
+                            place_pref_penalty,
+                            clearance_penalty,
+                            clearance_debug,
+                        )
                         item["terminal_align"] = terminal_align
                         item["planner_pose"] = planner_poses[goal_idx]
                         item["q_goal"] = q_path[-1]
@@ -6536,14 +7636,29 @@ def _evaluate_curobo_pose_candidates_goalset(
                             item["q_pregrasp"] = q_path[-1]
                         elif "hover" in str(label).lower() or "transport" in str(label).lower():
                             item["q_hover"] = q_path[-1]
-                        winners.append(item)
-                        print(
-                            f"[curobo] {candidate_label} goalset success: score={score:.3f}, "
-                            f"selection_penalty={selection_penalty:.3f}, "
-                            f"place_pref_penalty={place_pref_penalty:.3f}, "
-                            f"waypoints={metrics['waypoint_count']}"
-                        )
-                        return winners
+                        if not _precheck_transport_winner_release_endpoint(
+                            planner,
+                            demo,
+                            args,
+                            item,
+                            q_hover=q_path[-1],
+                            label=candidate_label,
+                            disabled_world_collision_links=disabled_world_collision_links,
+                        ):
+                            print(
+                                f"[curobo] {candidate_label} goalset winner rejected by release endpoint precheck; "
+                                "falling back to pair batch"
+                            )
+                        else:
+                            winners.append(item)
+                            print(
+                                f"[curobo] {candidate_label} goalset success: score={score:.3f}, "
+                                f"selection_penalty={selection_penalty:.3f}, "
+                                f"place_pref_penalty={place_pref_penalty:.3f}, "
+                                f"clearance_penalty={clearance_penalty:.3f}, "
+                                f"waypoints={metrics['waypoint_count']}"
+                            )
+                            return winners
         ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
         for chunk_idx, start_idx in enumerate(range(0, len(remaining), chunk_size), start=1):
             chunk = remaining[start_idx : start_idx + chunk_size]
@@ -6602,16 +7717,21 @@ def _evaluate_curobo_pose_candidates_goalset(
                 ):
                     continue
                 metrics, score = _path_metrics_and_score(start_q, q_path)
-                selection_penalty = _candidate_selection_penalty(candidate, args)
-                place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
-                score = float(score) + float(selection_penalty) + float(place_pref_penalty)
+                score, selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug = (
+                    _score_with_candidate_soft_penalties(score, candidate, demo, args)
+                )
                 item = dict(candidate)
                 item["result"] = result
                 item["q_path"] = q_path
                 item["metrics"] = metrics
                 item["score"] = score
-                item["selection_penalty"] = selection_penalty
-                item["place_preference_penalty"] = place_pref_penalty
+                _store_candidate_soft_penalty_fields(
+                    item,
+                    selection_penalty,
+                    place_pref_penalty,
+                    clearance_penalty,
+                    clearance_debug,
+                )
                 item["terminal_align"] = terminal_align
                 item["planner_pose"] = planner_pose
                 item["q_goal"] = q_path[-1]
@@ -6619,10 +7739,21 @@ def _evaluate_curobo_pose_candidates_goalset(
                     item["q_pregrasp"] = q_path[-1]
                 elif "hover" in str(label).lower() or "transport" in str(label).lower():
                     item["q_hover"] = q_path[-1]
+                if not _precheck_transport_winner_release_endpoint(
+                    planner,
+                    demo,
+                    args,
+                    item,
+                    q_hover=q_path[-1],
+                    label=candidate_label,
+                    disabled_world_collision_links=disabled_world_collision_links,
+                ):
+                    continue
                 print(
                     f"[curobo] {candidate_label} success: score={score:.3f}, "
                     f"selection_penalty={selection_penalty:.3f}, "
                     f"place_pref_penalty={place_pref_penalty:.3f}, "
+                    f"clearance_penalty={clearance_penalty:.3f}, "
                     f"total_motion={metrics['total_motion']:.3f} rad, "
                     f"joint7_total={metrics['joint7_total_motion']:.3f} rad, "
                     f"joint7_excursion={metrics['joint7_max_excursion']:.3f} rad, "
@@ -6783,14 +7914,18 @@ def _fast_chain_rank_place_candidates(
                 transport_score = float(np.linalg.norm(joint_delta))
                 release_score = float(np.linalg.norm(release_delta))
                 joint7_score = float(abs(joint_delta[6])) if joint_delta.shape[0] >= 7 else 0.0
-                selection_penalty = float(_candidate_selection_penalty(item, args))
-                place_pref_penalty = float(_candidate_place_orientation_penalty(item, demo, args))
+                selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug = _candidate_soft_penalties(
+                    item,
+                    demo,
+                    args,
+                )
                 heuristic_score = (
                     transport_score
                     + 0.35 * release_score
                     + 0.15 * joint7_score
                     + selection_penalty
                     + place_pref_penalty
+                    + clearance_penalty
                 )
                 ranked_item = dict(item)
                 max_pos_err = float(np.nanmax([hover_pos_err, release_pos_err]))
@@ -6806,6 +7941,9 @@ def _fast_chain_rank_place_candidates(
                 ranked_item["fast_chain_release_q"] = q_release
                 ranked_item["fast_chain_transport_joint_norm"] = transport_score
                 ranked_item["fast_chain_release_joint_norm"] = release_score
+                ranked_item["place_clearance_penalty"] = float(clearance_penalty)
+                if clearance_debug:
+                    ranked_item["place_clearance_debug"] = dict(clearance_debug)
                 ranked_item["q_hover"] = q_hover
                 ranked_item["q_release"] = q_release
                 ranked_item["ik_pos_error"] = max_pos_err
@@ -7129,23 +8267,39 @@ def _evaluate_curobo_pose_candidates_multi_start(
         ):
             return None
         metrics, score = _path_metrics_and_score(start_q, q_path)
-        selection_penalty = _candidate_selection_penalty(candidate, args)
-        place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
-        score = float(score) + float(selection_penalty) + float(place_pref_penalty)
+        score, selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug = (
+            _score_with_candidate_soft_penalties(score, candidate, demo, args)
+        )
         item = dict(candidate)
         item["result"] = result
         item["q_path"] = q_path
         item["metrics"] = metrics
         item["score"] = score
-        item["selection_penalty"] = selection_penalty
-        item["place_preference_penalty"] = place_pref_penalty
+        _store_candidate_soft_penalty_fields(
+            item,
+            selection_penalty,
+            place_pref_penalty,
+            clearance_penalty,
+            clearance_debug,
+        )
         item["terminal_align"] = terminal_align
         item["planner_pose"] = planner_pose
         item.setdefault("q_hover", q_path[-1])
+        if not _precheck_transport_winner_release_endpoint(
+            planner,
+            demo,
+            args,
+            item,
+            q_hover=q_path[-1],
+            label=candidate_label,
+            disabled_world_collision_links=disabled_world_collision_links,
+        ):
+            return None
         print(
             f"[curobo] {candidate_label} {mode_label} success: score={score:.3f}, "
             f"selection_penalty={selection_penalty:.3f}, "
             f"place_pref_penalty={place_pref_penalty:.3f}, "
+            f"clearance_penalty={clearance_penalty:.3f}, "
             f"total_motion={metrics['total_motion']:.3f} rad, "
             f"joint7_total={metrics['joint7_total_motion']:.3f} rad, "
             f"joint7_excursion={metrics['joint7_max_excursion']:.3f} rad, "
@@ -7291,27 +8445,47 @@ def _evaluate_curobo_pose_candidates_multi_start(
                             label=candidate_label,
                         ):
                             metrics, score = _path_metrics_and_score(start_q0, q_path)
-                            selection_penalty = _candidate_selection_penalty(candidate, args)
-                            place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
-                            score = float(score) + float(selection_penalty) + float(place_pref_penalty)
+                            score, selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug = (
+                                _score_with_candidate_soft_penalties(score, candidate, demo, args)
+                            )
                             item = dict(candidate)
                             item["result"] = goalset_result
                             item["q_path"] = q_path
                             item["metrics"] = metrics
                             item["score"] = score
-                            item["selection_penalty"] = selection_penalty
-                            item["place_preference_penalty"] = place_pref_penalty
+                            _store_candidate_soft_penalty_fields(
+                                item,
+                                selection_penalty,
+                                place_pref_penalty,
+                                clearance_penalty,
+                                clearance_debug,
+                            )
                             item["terminal_align"] = terminal_align
                             item["planner_pose"] = planner_poses[goal_idx]
                             item.setdefault("q_hover", q_path[-1])
-                            winners.append(item)
-                            print(
-                                f"[curobo] {candidate_label} goalset success: score={score:.3f}, "
-                                f"selection_penalty={selection_penalty:.3f}, "
-                                f"place_pref_penalty={place_pref_penalty:.3f}, "
-                                f"waypoints={metrics['waypoint_count']}"
-                            )
-                            return winners
+                            if not _precheck_transport_winner_release_endpoint(
+                                planner,
+                                demo,
+                                args,
+                                item,
+                                q_hover=q_path[-1],
+                                label=candidate_label,
+                                disabled_world_collision_links=disabled_world_collision_links,
+                            ):
+                                print(
+                                    f"[curobo] {candidate_label} goalset winner rejected by release endpoint precheck; "
+                                    "falling back to pair batch"
+                                )
+                            else:
+                                winners.append(item)
+                                print(
+                                    f"[curobo] {candidate_label} goalset success: score={score:.3f}, "
+                                    f"selection_penalty={selection_penalty:.3f}, "
+                                    f"place_pref_penalty={place_pref_penalty:.3f}, "
+                                    f"clearance_penalty={clearance_penalty:.3f}, "
+                                    f"waypoints={metrics['waypoint_count']}"
+                                )
+                                return winners
                 else:
                     print(f"[curobo] {label} goalset fast-path failed with status={goalset_result.status}; falling back to pair batch")
                     _bump_profile_counter("fallback_count")
@@ -7381,23 +8555,40 @@ def _evaluate_curobo_pose_candidates_multi_start(
                 ):
                     continue
                 metrics, score = _path_metrics_and_score(start_q, q_path)
-                selection_penalty = _candidate_selection_penalty(candidate, args)
-                place_pref_penalty = _candidate_place_orientation_penalty(candidate, demo, args)
-                score = float(score) + float(selection_penalty) + float(place_pref_penalty)
+                score, selection_penalty, place_pref_penalty, clearance_penalty, clearance_debug = (
+                    _score_with_candidate_soft_penalties(score, candidate, demo, args)
+                )
                 item = dict(candidate)
                 item["result"] = result
                 item["q_path"] = q_path
                 item["metrics"] = metrics
                 item["score"] = score
-                item["selection_penalty"] = selection_penalty
-                item["place_preference_penalty"] = place_pref_penalty
+                _store_candidate_soft_penalty_fields(
+                    item,
+                    selection_penalty,
+                    place_pref_penalty,
+                    clearance_penalty,
+                    clearance_debug,
+                )
                 item["terminal_align"] = terminal_align
                 item["planner_pose"] = planner_pose
                 item.setdefault("q_hover", q_path[-1])
+                if not _precheck_transport_winner_release_endpoint(
+                    planner,
+                    demo,
+                    args,
+                    item,
+                    q_hover=q_path[-1],
+                    label=candidate_label,
+                    disabled_world_collision_links=disabled_world_collision_links,
+                ):
+                    batch_failures.append((candidate_label, "RELEASE_ENDPOINT_PRECHECK_FAIL"))
+                    continue
                 print(
                     f"[curobo] {candidate_label} success: score={score:.3f}, "
                     f"selection_penalty={selection_penalty:.3f}, "
                     f"place_pref_penalty={place_pref_penalty:.3f}, "
+                    f"clearance_penalty={clearance_penalty:.3f}, "
                     f"total_motion={metrics['total_motion']:.3f} rad, "
                     f"joint7_total={metrics['joint7_total_motion']:.3f} rad, "
                     f"joint7_excursion={metrics['joint7_max_excursion']:.3f} rad, "
@@ -9573,6 +10764,9 @@ def _fast_chain_preselect_grasp_place_pair(
             label="winner_chain_ik_preselect_grasp",
         )
         grasp_ik_candidates: list[dict] = []
+        pregrasp_ok: list[dict] = []
+        grasp_ik_success_count = 0
+        grasp_approach_valid_count = 0
         try:
             pregrasp_poses = [
                 _convert_demo_tcp_pose_to_curobo_ee_pose(
@@ -9589,7 +10783,6 @@ def _fast_chain_preselect_grasp_place_pair(
                 pregrasp_poses,
                 num_seeds=int(getattr(args, "fast_chain_ik_seeds", 32) or getattr(args, "curobo_num_ik_seeds", 64)),
             )
-            pregrasp_ok: list[dict] = []
             for candidate, ik_result in zip(candidates, pregrasp_results):
                 if not bool(ik_result.success) or ik_result.goal_joint is None:
                     continue
@@ -9627,6 +10820,7 @@ def _fast_chain_preselect_grasp_place_pair(
                     pos_err, rot_err = _ik_debug_errors(ik_result)
                     if not bool(ik_result.success) or ik_result.goal_joint is None:
                         continue
+                    grasp_ik_success_count += 1
                     q_grasp = np.asarray(ik_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
                     approach_q_path = _build_validated_linear_path_to_q(
                         demo,
@@ -9647,6 +10841,7 @@ def _fast_chain_preselect_grasp_place_pair(
                             f"{candidate.get('label')} has IK but no validated straight pregrasp->grasp primitive"
                         )
                         continue
+                    grasp_approach_valid_count += 1
                     grasp_score = _ik_score(pos_err, rot_err)
                     candidate["_winner_preselect_q_grasp"] = q_grasp
                     candidate["q_grasp"] = q_grasp
@@ -9663,6 +10858,9 @@ def _fast_chain_preselect_grasp_place_pair(
                 label="winner_chain_ik_preselect_grasp",
             )
 
+        prof["pregrasp_ok_count"] = len(pregrasp_ok)
+        prof["grasp_ik_success_count"] = int(grasp_ik_success_count)
+        prof["grasp_approach_valid_count"] = int(grasp_approach_valid_count)
         prof["candidate_count_after_ik"] = len(grasp_ik_candidates)
         if not grasp_ik_candidates:
             prof["success"] = False
@@ -9675,6 +10873,10 @@ def _fast_chain_preselect_grasp_place_pair(
 
         prof["grasp_candidate_count_before_place_rank"] = len(grasp_ik_candidates)
         place_rank_grasp_limit = int(getattr(args, "fast_chain_place_rank_grasp_limit", 3) or 0)
+        if _is_fixed_tabletop_source(source_name):
+            fixed_tabletop_limit = int(getattr(args, "fixed_tabletop_fast_chain_place_rank_grasp_limit", 6) or 0)
+            if fixed_tabletop_limit > 0:
+                place_rank_grasp_limit = max(place_rank_grasp_limit, fixed_tabletop_limit)
         if place_rank_grasp_limit > 0 and len(grasp_ik_candidates) > place_rank_grasp_limit:
             print(
                 "[winner_chain] limiting place IK ranking to "
@@ -9764,7 +10966,29 @@ def _fast_chain_preselect_grasp_place_pair(
             )
             return None
         pair_records.sort(key=lambda item: float(item["score"]))
-        top_pair_records = pair_records[:top_pair_count]
+        if bool(getattr(args, "fast_chain_diverse_top_grasps", True)) and top_pair_count > 1:
+            top_pair_records = []
+            selected_ids = set()
+            selected_grasp_keys = set()
+            for rec in pair_records:
+                grasp_key = str(rec["grasp_candidate"].get("label", f"grasp_{len(selected_grasp_keys)}"))
+                if grasp_key in selected_grasp_keys:
+                    continue
+                top_pair_records.append(rec)
+                selected_ids.add(id(rec))
+                selected_grasp_keys.add(grasp_key)
+                if len(top_pair_records) >= top_pair_count:
+                    break
+            if len(top_pair_records) < top_pair_count:
+                for rec in pair_records:
+                    if id(rec) in selected_ids:
+                        continue
+                    top_pair_records.append(rec)
+                    selected_ids.add(id(rec))
+                    if len(top_pair_records) >= top_pair_count:
+                        break
+        else:
+            top_pair_records = pair_records[:top_pair_count]
         top_pair_grasps: list[dict] = []
         grouped_grasps: dict[str, dict] = {}
         for rec in top_pair_records:
@@ -10756,10 +11980,24 @@ def _evaluate_joint_grasp_place_chains(
                         fallback_candidates = [item for item in expanded_candidates if id(item) not in primary_ids]
                         if fallback_candidates:
                             candidate_passes.append(("fallback", fallback_candidates))
+                if bool(getattr(args, "place_clearance_retry", True)):
+                    candidate_passes.append(("clearance_retry", []))
 
                 safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", grasp_label)[:48]
-                for pass_label, direct_place_candidates in candidate_passes:
-                    pass_is_fallback = pass_label == "fallback"
+                for pass_label, direct_place_candidates_seed in candidate_passes:
+                    if pass_label == "clearance_retry":
+                        direct_place_candidates = _build_place_clearance_retry_candidates(
+                            all_direct_place_candidates,
+                            demo,
+                            args,
+                            label=f"{grasp_label}_clearance_retry",
+                            grasp_choice=grasp_choice,
+                        )
+                        if not direct_place_candidates:
+                            continue
+                    else:
+                        direct_place_candidates = direct_place_candidates_seed
+                    pass_is_fallback = pass_label in {"fallback", "clearance_retry"}
                     pass_enable_graph = None
                     pass_timeout = screen_timeout_arg
                     pass_max_attempts = screen_max_attempts_arg
@@ -11439,6 +12677,20 @@ def run_targeted_place_episode_curobo_direct(
     place_state_cache,
 ) -> bool:
     args._skip_remaining_step_confirms_in_object = False
+    args._episode_real_motion_started = False
+    args._episode_failure_phase = ""
+    args._episode_object_grasped = False
+
+    def _mark_real_motion_started(phase: str) -> None:
+        if real_exec is not None:
+            args._episode_real_motion_started = True
+            args._episode_failure_phase = str(phase)
+
+    def _mark_object_grasped() -> None:
+        args._episode_object_grasped = True
+
+    def _mark_object_released() -> None:
+        args._episode_object_grasped = False
 
     rule = None
     selected_joint_chain = None
@@ -11917,6 +13169,7 @@ def run_targeted_place_episode_curobo_direct(
     if pregrasp_waypoints > 0:
         q_pregrasp_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in grasp_choice["q_path"][:pregrasp_waypoints]]
         pregrasp_pose = grasp_choice.get("deferred_pregrasp_pose", grasp_choice.get("pregrasp_pose", grasp_choice["pose"]))
+        _mark_real_motion_started("grasp_pregrasp_execute")
         ok, _ = targeted.base.execute_pose_path_stage(
             demo,
             bridge_mod,
@@ -11931,6 +13184,7 @@ def run_targeted_place_episode_curobo_direct(
             return False
 
         q_approach_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in grasp_choice["q_path"][pregrasp_waypoints - 1 :]]
+        _mark_real_motion_started("grasp_final_approach_execute")
         ok, _ = targeted.base.execute_pose_path_stage(
             demo,
             bridge_mod,
@@ -11944,6 +13198,7 @@ def run_targeted_place_episode_curobo_direct(
         if not ok:
             return False
     else:
+        _mark_real_motion_started("grasp_execute")
         ok, _ = targeted.base.execute_pose_path_stage(
             demo,
             bridge_mod,
@@ -11962,6 +13217,7 @@ def run_targeted_place_episode_curobo_direct(
         print("[abort] user cancelled before closing the real gripper")
         return False
     if real_exec is not None:
+        _mark_real_motion_started("gripper_close")
         real_exec.set_gripper(args.real_gripper_close)
         targeted.base.sync_demo_gripper_state(demo, closed=True, steps=4)
         targeted.base.set_pregrasp_object_freeze(demo, False)
@@ -11975,10 +13231,12 @@ def run_targeted_place_episode_curobo_direct(
                 f"[real] gripper.pos after close: {gripper_pos:.4f} "
                 f"blocked_before_full_close={blocked}"
             )
+        _mark_object_grasped()
     else:
         print("[dry-run] skipped real gripper close")
         targeted.base.sync_demo_gripper_state(demo, closed=True, steps=4)
         targeted.base.set_pregrasp_object_freeze(demo, False)
+        _mark_object_grasped()
 
     _stabilize_post_grasp_attached_state(demo, args, grasp_choice)
 
@@ -12026,6 +13284,7 @@ def run_targeted_place_episode_curobo_direct(
             prof["status"] = "SKIPPED_REUSE_JOINT_SEARCH_CHAIN"
             prof["path_waypoints"] = 0
         else:
+            _mark_real_motion_started("post_grasp_lift_execute")
             post_lift_ok = _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, "post_grasp_lift", use_attach=True)
             prof["success"] = bool(post_lift_ok)
             prof["status"] = "Success" if post_lift_ok else "PLAN_OR_EXEC_FAIL"
@@ -12235,6 +13494,7 @@ def run_targeted_place_episode_curobo_direct(
         )
         if lift_path is not None and len(lift_path) >= 2:
             lift_pose = _lift_pose_world_z(demo.tcp.pose, lift_m)
+            _mark_real_motion_started("transport_start_lift_execute")
             ok, _ = targeted.base.execute_pose_path_stage(
                 demo,
                 bridge_mod,
@@ -12333,6 +13593,61 @@ def run_targeted_place_episode_curobo_direct(
                 )
                 if place_choice is not None:
                     break
+    if place_choice is None and bool(getattr(args, "place_clearance_retry", True)):
+        retry_candidates = _build_place_clearance_retry_candidates(
+            direct_place_candidates,
+            demo,
+            args,
+            label="final_contact_clearance_retry",
+            grasp_choice=grasp_choice,
+        )
+        if retry_candidates:
+            print(
+                "[place_clearance_retry] final contact failed on normal candidates; "
+                f"retrying {len(retry_candidates)} micro-adjusted hover/release candidate(s)"
+            )
+            _bump_profile_counter("fallback_count")
+            retry_transport_successes = []
+            with _profile_stage(
+                args,
+                "place_clearance_retry",
+                candidate_count=len(retry_candidates),
+                max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
+                num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
+                num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+                enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+            ) as prof:
+                retry_transport_successes = plan_transport_to_hover(
+                    planner,
+                    demo,
+                    transport_screen_args,
+                    place_start_q,
+                    retry_candidates,
+                    include_table=bool(getattr(args, "curobo_table_collision", True)),
+                    exclude_object_names=exclude_names_place,
+                    disabled_world_collision_links=direct_place_disabled_links,
+                )
+                prof["transport_winner_count"] = len(retry_transport_successes)
+                for transport_choice in retry_transport_successes:
+                    place_choice = plan_final_contact_approach(
+                        planner,
+                        demo,
+                        args,
+                        place_start_q,
+                        transport_choice,
+                        disabled_world_collision_links=direct_place_disabled_links,
+                    )
+                    if place_choice is not None:
+                        break
+                prof["success"] = bool(place_choice is not None)
+                prof["status"] = "Success" if place_choice is not None else "NO_FINAL_CONTACT"
+                if place_choice is not None:
+                    prof["selected_label"] = str(place_choice.get("label", ""))
+            if place_choice is not None:
+                print(
+                    "[place_clearance_retry] selected micro-adjusted place candidate: "
+                    f"{place_choice.get('label')}"
+                )
     if place_choice is None:
         print("[FAIL] final_contact_approach failed for all reachable hover candidates")
         failure_candidates = list(transport_successes or direct_place_candidates or [])
@@ -12464,6 +13779,7 @@ def run_targeted_place_episode_curobo_direct(
         )
 
     if bool(place_choice.get("two_stage_place", False)):
+        _mark_real_motion_started("place_hover_execute")
         ok, _ = targeted.base.execute_pose_path_stage(
             demo,
             bridge_mod,
@@ -12476,6 +13792,7 @@ def run_targeted_place_episode_curobo_direct(
             use_attach=True,
         )
         if ok:
+            _mark_real_motion_started("place_release_execute")
             ok, _ = targeted.base.execute_pose_path_stage(
                 demo,
                 bridge_mod,
@@ -12488,6 +13805,7 @@ def run_targeted_place_episode_curobo_direct(
                 use_attach=True,
             )
     else:
+        _mark_real_motion_started("place_execute")
         ok, _ = targeted.base.execute_pose_path_stage(
             demo,
             bridge_mod,
@@ -12520,11 +13838,14 @@ def run_targeted_place_episode_curobo_direct(
             targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
         return False
     if real_exec is not None:
+        _mark_real_motion_started("gripper_open_at_place")
         real_exec.set_gripper(args.real_gripper_open)
         targeted.base.sync_demo_gripper_state(demo, closed=False, steps=4)
+        _mark_object_released()
     else:
         print("[dry-run] skipped real gripper open at the targeted place")
         targeted.base.sync_demo_gripper_state(demo, closed=False, steps=4)
+        _mark_object_released()
 
     if planner.attached_object_active:
         planner.detach_object_from_robot()
@@ -12680,6 +14001,7 @@ def run_targeted_place_episode_curobo_direct(
             )
     clearance_executed = False
     if q_clearance_path:
+        _mark_real_motion_started("post_place_clearance_execute")
         ok, _ = targeted.base.execute_pose_path_stage(
             demo,
             bridge_mod,
@@ -12705,6 +14027,7 @@ def run_targeted_place_episode_curobo_direct(
 
     if not settled_before_clearance:
         targeted.base.settle_released_active_object_for_scene_cache(demo, args)
+    _record_placed_pose_prediction_error(args, demo, place_choice)
     targeted._mark_place_rule_success(rule, place_state_cache, place_choice["slot_name"])
 
     if relaxed_target_collision:
@@ -12716,6 +14039,7 @@ def run_targeted_place_episode_curobo_direct(
                 "[place] insert post_place_clearance failed; falling back to return_to_cycle_start "
                 "despite --skip-return-to-cycle-start so the next object does not start from insertion"
             )
+            _mark_real_motion_started("return_to_cycle_start_execute")
             return_ok = _plan_and_execute_return_to_cycle_start(
                 demo,
                 bridge_mod,
@@ -12739,6 +14063,7 @@ def run_targeted_place_episode_curobo_direct(
         print("[place] completed targeted place and clearance; returning to the cycle start pose")
     else:
         print("[place] completed targeted place without clearance; returning to the cycle start pose from the current release state")
+    _mark_real_motion_started("return_to_cycle_start_execute")
     return_ok = _plan_and_execute_return_to_cycle_start(
         demo,
         bridge_mod,
@@ -13196,7 +14521,6 @@ def _single_scene_restore_after_failed_attempt(
         restored_object_pose=T_world_obj is not None,
     )
 
-
 _PREFETCH_DROP_KEYS = {
     "result",
     "raw_result",
@@ -13344,6 +14668,53 @@ def _apply_predicted_place_to_scene_cache(scene_capture_cache: dict, object_name
     return T_world_obj
 
 
+def _record_placed_pose_prediction_error(args, demo, place_choice) -> None:
+    predicted_T = _predicted_place_T_world_obj(place_choice)
+    actual_T = getattr(demo, "_scene_cache_placed_object_world_pose", None)
+    if predicted_T is None or actual_T is None:
+        _record_profile(
+            args,
+            "placed_pose_prediction_compare",
+            success=False,
+            status="MISSING_POSE",
+            has_predicted_pose=predicted_T is not None,
+            has_actual_pose=actual_T is not None,
+        )
+        return
+    try:
+        predicted_T = np.asarray(predicted_T, dtype=np.float32).reshape(4, 4)
+        actual_T = np.asarray(actual_T, dtype=np.float32).reshape(4, 4)
+        predicted_p = predicted_T[:3, 3].astype(np.float32)
+        actual_p = actual_T[:3, 3].astype(np.float32)
+        predicted_q = targeted.base.bridge_mod_mat2quat(predicted_T[:3, :3]).astype(np.float32)
+        actual_q = targeted.base.bridge_mod_mat2quat(actual_T[:3, :3]).astype(np.float32)
+        delta_m = float(np.linalg.norm(actual_p - predicted_p))
+        delta_deg = float(np.degrees(_quat_angle_rad_wxyz(predicted_q, actual_q)))
+        _record_profile(
+            args,
+            "placed_pose_prediction_compare",
+            success=True,
+            status="Success",
+            place_label=str(place_choice.get("label", "")) if isinstance(place_choice, dict) else "",
+            place_mode=str(place_choice.get("place_mode", "")) if isinstance(place_choice, dict) else "",
+            target_name=str(place_choice.get("target_name", "")) if isinstance(place_choice, dict) else "",
+            position_delta_m=delta_m,
+            rotation_delta_deg=delta_deg,
+            predicted_xyz=[float(v) for v in predicted_p.tolist()],
+            actual_xyz=[float(v) for v in actual_p.tolist()],
+            predicted_quat_wxyz=[float(v) for v in predicted_q.tolist()],
+            actual_quat_wxyz=[float(v) for v in actual_q.tolist()],
+        )
+    except Exception as exc:
+        _record_profile(
+            args,
+            "placed_pose_prediction_compare",
+            success=False,
+            status=type(exc).__name__,
+            error=str(exc),
+        )
+
+
 def _copy_place_state_cache_for_prefetch(place_state_cache) -> dict:
     if isinstance(place_state_cache, dict):
         try:
@@ -13476,6 +14847,42 @@ class _NextCyclePlanPrefetchManager:
         self._thread: threading.Thread | None = None
         self._reserved: dict | None = None
         self._result: dict | None = None
+
+    def warmup_planner(self) -> None:
+        """Create the shared prefetch cuRobo planner before foreground CUDA graphs exist."""
+        warmup_args = SimpleNamespace(**vars(self.base_args).copy())
+        warmup_args._curobo_planner_cache_namespace = _PREFETCH_PLANNER_CACHE_NAMESPACE
+        warmup_args.execute_real = False
+        warmup_args.render_mode = "rgb_array"
+        warmup_args.next_cycle_plan_prefetch = False
+        started = time.perf_counter()
+        try:
+            _get_or_create_curobo_planner_serialized(warmup_args)
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            _record_prefetch_profile(
+                self.base_args,
+                "__prefetch__",
+                "next_cycle_prefetch_planner_warmup",
+                success=True,
+                status="Success",
+                elapsed_ms=elapsed_ms,
+                planner_namespace=_PREFETCH_PLANNER_CACHE_NAMESPACE,
+            )
+            print(f"[prefetch] warmed shared cuRobo planner namespace={_PREFETCH_PLANNER_CACHE_NAMESPACE} in {elapsed_ms:.1f}ms")
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            _record_prefetch_profile(
+                self.base_args,
+                "__prefetch__",
+                "next_cycle_prefetch_planner_warmup",
+                success=False,
+                status=type(exc).__name__,
+                elapsed_ms=elapsed_ms,
+                error=str(exc),
+                traceback_tail=traceback.format_exc()[-4000:],
+                planner_namespace=_PREFETCH_PLANNER_CACHE_NAMESPACE,
+            )
+            print(f"[prefetch] warning: failed to warm shared cuRobo planner: {type(exc).__name__}: {exc}")
 
     def reserved_target_for_cycle(self, cycle_idx: int, scene_capture_cache, failed_targets, deferred_targets) -> str | None:
         with self._lock:
@@ -13664,7 +15071,7 @@ class _NextCyclePlanPrefetchManager:
                 prefetch_args.next_cycle_plan_prefetch = False
                 prefetch_args.single_confirm_per_object = False
                 prefetch_args._planning_prefetch_capture_only = True
-                prefetch_args._curobo_planner_cache_namespace = f"prefetch_{target_name}"
+                prefetch_args._curobo_planner_cache_namespace = _PREFETCH_PLANNER_CACHE_NAMESPACE
                 prefetch_args._targeted_place_state_cache = place_state_snapshot
                 print(
                     f"[prefetch] worker planning cycle {int(next_cycle_idx)} target={target_name} "
@@ -13812,13 +15219,20 @@ class _NextCyclePlanPrefetchManager:
                 worker_elapsed_ms=payload.get("elapsed_ms"),
             )
             return None
-        q_delta = float(np.max(np.abs(current_q - predicted_q)))
+        q_delta_raw = float(np.max(np.abs(current_q - predicted_q)))
+        q_delta_wrapped = _max_joint_angle_delta_wrapped(current_q, predicted_q)
+        q_delta = q_delta_raw if q_delta_wrapped is None else float(q_delta_wrapped)
         q_tol = float(max(getattr(args, "next_cycle_prefetch_start_q_tolerance", 0.08), 0.0))
         if q_delta > q_tol:
-            print(f"[prefetch] rejected plan for {target_name}: start_q_delta={q_delta:.4f} > tol={q_tol:.4f}")
+            raw_suffix = "" if abs(q_delta_raw - q_delta) < 1e-6 else f" (raw={q_delta_raw:.4f})"
+            print(
+                f"[prefetch] rejected plan for {target_name}: "
+                f"start_q_delta={q_delta:.4f}{raw_suffix} > tol={q_tol:.4f}"
+            )
             record_consume(
                 "START_Q_MISMATCH",
                 q_delta=q_delta,
+                q_delta_raw=q_delta_raw,
                 q_tol=q_tol,
                 worker_elapsed_ms=payload.get("elapsed_ms"),
             )
@@ -13847,6 +15261,7 @@ class _NextCyclePlanPrefetchManager:
                             pos_delta=pos_delta,
                             pos_tol=pos_tol,
                             q_delta=q_delta,
+                            q_delta_raw=q_delta_raw,
                             q_tol=q_tol,
                             worker_elapsed_ms=payload.get("elapsed_ms"),
                         )
@@ -13856,6 +15271,7 @@ class _NextCyclePlanPrefetchManager:
                         "SCENE_POSE_COMPARE_ERROR",
                         placed_object_name=placed_name,
                         q_delta=q_delta,
+                        q_delta_raw=q_delta_raw,
                         q_tol=q_tol,
                         worker_elapsed_ms=payload.get("elapsed_ms"),
                     )
@@ -13868,6 +15284,7 @@ class _NextCyclePlanPrefetchManager:
             "HIT",
             success=True,
             q_delta=q_delta,
+            q_delta_raw=q_delta_raw,
             q_tol=q_tol,
             placed_object_name=placed_name,
             pos_delta=pos_delta,
@@ -13880,11 +15297,15 @@ class _NextCyclePlanPrefetchManager:
         )
         return plan
 
-    def shutdown(self, timeout: float = 0.1) -> None:
+    def shutdown(self, timeout: float = 30.0) -> None:
         with self._lock:
             thread = self._thread
         if thread is not None and thread.is_alive():
-            thread.join(float(max(timeout, 0.0)))
+            timeout = float(max(timeout, 0.0))
+            print(f"[prefetch] waiting up to {timeout:.1f}s for background worker shutdown")
+            thread.join(timeout)
+            if thread.is_alive():
+                print("[prefetch] warning: background worker still alive after shutdown timeout")
 
 
 def _estimate_real_waypoint_stream_duration_s(q_start, q_path, args) -> float:
@@ -14029,7 +15450,11 @@ def _install_dry_run_motion_window_wrappers() -> None:
                 print(f"[planner] auto-executing {label} without separate preview/confirmation")
             q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
             print(f"[dry-run] executing {label} in simulation with preserved motion window")
-            _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+            try:
+                _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+            except Exception as exc:
+                print(f"[dry-run] motion window for {label} raised {type(exc).__name__}: {exc}")
+                return False, None
             return True, q_path[-1]
         q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
         ok, q_sent = original_pose_stage(
@@ -14044,8 +15469,57 @@ def _install_dry_run_motion_window_wrappers() -> None:
             *extra_args,
             **kwargs,
         )
+        if not ok and real_exec is not None:
+            use_attach = bool(kwargs.get("use_attach", False))
+            allow_start_in_collision = bool(kwargs.get("allow_start_in_collision", False))
+            dense_validate_delta = 0.01 if use_attach else 0.03
+            try:
+                exec_diag = _diagnose_dense_joint_path_collision(
+                    demo,
+                    q_start,
+                    q_path,
+                    use_attach=use_attach,
+                    max_delta=dense_validate_delta,
+                    allow_start_in_collision=allow_start_in_collision,
+                )
+            except Exception as exc:
+                exec_diag = {
+                    "success": False,
+                    "status": type(exc).__name__,
+                    "error": str(exc),
+                }
+            if not bool(exec_diag.get("success", False)):
+                _print_dense_collision_diagnosis(f"{label}_execute", exec_diag)
+            _record_profile(
+                args,
+                "pose_stage_execute_collision_diagnosis",
+                success=bool(exec_diag.get("success", False)),
+                status=str(exec_diag.get("status", "UNKNOWN")),
+                execution_label=str(label),
+                failure_phase=str(getattr(args, "_episode_failure_phase", "") or ""),
+                path_waypoints=len(list(q_path or [])),
+                max_delta=float(dense_validate_delta),
+                use_attach=use_attach,
+                allow_start_in_collision=allow_start_in_collision,
+                collision_kind=exec_diag.get("collision_kind"),
+                path_segment_idx=exec_diag.get("path_segment_idx"),
+                path_waypoint_idx=exec_diag.get("path_waypoint_idx"),
+                segment_step=exec_diag.get("segment_step"),
+                segment_steps=exec_diag.get("segment_steps"),
+                alpha=exec_diag.get("alpha"),
+                self_collision_count=exec_diag.get("self_collision_count"),
+                env_collision_count=exec_diag.get("env_collision_count"),
+                collision_pair_texts=exec_diag.get("collision_pair_texts"),
+                self_collisions=exec_diag.get("self_collisions"),
+                env_collisions=exec_diag.get("env_collisions"),
+                error=exec_diag.get("error"),
+            )
         if ok and real_exec is None and _dry_run_motion_window_enabled(args):
-            _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+            try:
+                _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+            except Exception as exc:
+                print(f"[dry-run] motion window for {label} raised {type(exc).__name__}: {exc}")
+                return False, None
         return ok, q_sent
 
     targeted.base.execute_pose_path_stage = _execute_pose_path_stage_with_motion_window
@@ -14075,7 +15549,11 @@ def _install_dry_run_motion_window_wrappers() -> None:
                     return False, None
                 q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
                 print(f"[dry-run] executing {label} in simulation with preserved motion window")
-                _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+                try:
+                    _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+                except Exception as exc:
+                    print(f"[dry-run] motion window for {label} raised {type(exc).__name__}: {exc}")
+                    return False, None
                 return True, q_path[-1]
             q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
             ok, q_sent = original_joint_stage(
@@ -14090,7 +15568,11 @@ def _install_dry_run_motion_window_wrappers() -> None:
                 **kwargs,
             )
             if ok and real_exec is None and _dry_run_motion_window_enabled(args):
-                _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+                try:
+                    _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
+                except Exception as exc:
+                    print(f"[dry-run] motion window for {label} raised {type(exc).__name__}: {exc}")
+                    return False, None
             return ok, q_sent
 
         targeted.base.execute_joint_path_stage = _execute_joint_path_stage_with_motion_window
@@ -14168,6 +15650,8 @@ def _run_single_scene_main(create_demo_func) -> None:
         if bool(getattr(base_args, "next_cycle_plan_prefetch", True))
         else None
     )
+    if prefetch_manager is not None:
+        prefetch_manager.warmup_planner()
     try:
         if args.execute_real:
             real_exec = targeted.base.RealmanJointExecutor(args)
@@ -14312,6 +15796,9 @@ def _run_single_scene_main(create_demo_func) -> None:
 
             print(f"\ncycle {cycle_idx} success = {ok}")
             if not ok:
+                real_motion_started = bool(getattr(cycle_args, "_episode_real_motion_started", False))
+                failure_phase = str(getattr(cycle_args, "_episode_failure_phase", "") or "")
+                object_grasped = bool(getattr(cycle_args, "_episode_object_grasped", False))
                 if bool(getattr(base_args, "reselect_target_on_planning_failure", True)):
                     if real_exec is None:
                         _single_scene_restore_after_failed_attempt(
@@ -14322,9 +15809,85 @@ def _run_single_scene_main(create_demo_func) -> None:
                             cycle_start_q,
                         )
                     else:
+                        if object_grasped:
+                            _record_profile(
+                                cycle_args,
+                                "held_object_failure_stop",
+                                success=False,
+                                status="STOP_RESELECT_WITH_OBJECT_IN_GRIPPER",
+                                failure_phase=failure_phase,
+                                target_name=selected_name,
+                            )
+                            print(
+                                "[single_scene] target failed after the gripper had closed "
+                                f"(target={selected_name}, phase={failure_phase or 'unknown'}); "
+                                "not opening the gripper or reselecting another target."
+                            )
+                            final_ok = False
+                            break
+                        if real_motion_started:
+                            return_ok = False
+                            try:
+                                q_real_now = np.asarray(real_exec.get_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                            except Exception:
+                                q_real_now = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                            q_cycle_start = np.asarray(cycle_start_q, dtype=np.float32).reshape(-1)[:7]
+                            q_start_delta = (q_real_now - q_cycle_start + np.pi) % (2.0 * np.pi) - np.pi
+                            max_start_delta = float(np.max(np.abs(q_start_delta)))
+                            _record_profile(
+                                cycle_args,
+                                "pregrasp_failure_return_to_cycle_start",
+                                success=True,
+                                status="STARTED",
+                                failure_phase=failure_phase,
+                                target_name=selected_name,
+                                start_delta=max_start_delta,
+                            )
+                            if max_start_delta <= 0.03:
+                                targeted.base.sync_demo_arm_qpos(demo, q_cycle_start)
+                                try:
+                                    targeted.base.sync_demo_gripper_state(demo, closed=False, steps=4)
+                                except Exception:
+                                    pass
+                                return_ok = True
+                                return_status = "ALREADY_AT_START"
+                            else:
+                                return_ok = _plan_and_execute_return_to_cycle_start(
+                                    demo,
+                                    bridge_mod,
+                                    real_exec,
+                                    cycle_args,
+                                    cycle_start_q,
+                                    use_attach=False,
+                                    gripper_pos=cycle_args.real_gripper_open,
+                                )
+                                return_status = "Success" if return_ok else "RETURN_FAIL"
+                            _record_profile(
+                                cycle_args,
+                                "pregrasp_failure_return_to_cycle_start",
+                                success=bool(return_ok),
+                                status=return_status,
+                                failure_phase=failure_phase,
+                                target_name=selected_name,
+                                start_delta=max_start_delta,
+                            )
+                            if not return_ok:
+                                print(
+                                    "[single_scene] failed to return the real robot to the cycle start after "
+                                    f"failed target={selected_name}; stopping to avoid planning from a stale default pose."
+                                )
+                                final_ok = False
+                                break
+                        _single_scene_restore_after_failed_attempt(
+                            demo,
+                            cycle_args,
+                            scene_capture_cache,
+                            selected_name,
+                            cycle_start_q,
+                        )
                         print(
-                            "[single_scene] real execution is active; not teleporting simulation back after "
-                            f"failed target={selected_name}"
+                            "[single_scene] real execution failed before grasp close; returned/restored to "
+                            f"cycle start after failed target={selected_name}"
                         )
                     failed_targets_this_cycle.add(selected_name)
                     deferred_failed_targets.add(selected_name)
@@ -14356,7 +15919,7 @@ def _run_single_scene_main(create_demo_func) -> None:
         print("\nfinal success =", final_ok)
     finally:
         if prefetch_manager is not None:
-            prefetch_manager.shutdown(timeout=0.1)
+            prefetch_manager.shutdown(timeout=30.0)
         if env is not None:
             targeted.base.close_env_quietly(env)
             gc.collect()
