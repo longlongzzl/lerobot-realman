@@ -586,6 +586,61 @@ def build_arg_parser():
         help="Disable planning stage profiling.",
     )
     parser.add_argument(
+        "--empty-grasp-check-after-lift",
+        dest="empty_grasp_check_after_lift",
+        action="store_true",
+        default=True,
+        help=(
+            "Read the real gripper position before placement descent; if it reached the close command, "
+            "treat the grasp as empty and skip placement. In normal place mode this check runs after "
+            "transport reaches pre-place hover."
+        ),
+    )
+    parser.add_argument(
+        "--no-empty-grasp-check-after-lift",
+        dest="empty_grasp_check_after_lift",
+        action="store_false",
+        help="Disable the real-gripper empty-grasp check after post-grasp lift.",
+    )
+    parser.add_argument(
+        "--empty-grasp-relocalize-target",
+        dest="empty_grasp_relocalize_target",
+        action="store_true",
+        default=True,
+        help=(
+            "When an empty grasp is detected, run GroundingDINO/FoundationPose again for only "
+            "the active target object before retrying."
+        ),
+    )
+    parser.add_argument(
+        "--no-empty-grasp-relocalize-target",
+        dest="empty_grasp_relocalize_target",
+        action="store_false",
+        help="Do not relocalize the active target after an empty grasp.",
+    )
+    parser.add_argument(
+        "--empty-grasp-max-relocalize-retries",
+        type=int,
+        default=1,
+        help="Maximum same-target retries after empty-grasp relocalization.",
+    )
+    parser.add_argument(
+        "--empty-grasp-execute-reusable-lift-before-check",
+        dest="empty_grasp_execute_reusable_lift_before_check",
+        action="store_true",
+        default=False,
+        help=(
+            "When a joint_search chain already contains a reusable pre-transport lift, execute that lift before "
+            "the empty-grasp check. Disabled by default because it changes the previously validated transport split."
+        ),
+    )
+    parser.add_argument(
+        "--no-empty-grasp-execute-reusable-lift-before-check",
+        dest="empty_grasp_execute_reusable_lift_before_check",
+        action="store_false",
+        help="Keep reusable joint_search transport chains intact before the empty-grasp check.",
+    )
+    parser.add_argument(
         "--place-clearance-score",
         dest="place_clearance_score",
         action="store_true",
@@ -2030,6 +2085,267 @@ def parse_args():
     args = build_arg_parser().parse_args()
     _configure_curobo_torch_extensions(args)
     return args
+
+
+def _detect_empty_grasp_after_lift(
+    real_exec,
+    args,
+    *,
+    stage_name: str = "empty_grasp_after_lift_check",
+    check_phase: str = "after_lift",
+) -> dict:
+    result = {
+        "checked": False,
+        "empty_grasp": False,
+        "gripper_pos": None,
+        "blocked_before_full_close": None,
+        "check_phase": str(check_phase),
+    }
+    if real_exec is None:
+        return result
+    if not bool(getattr(args, "empty_grasp_check_after_lift", True)):
+        _record_profile(
+            args,
+            stage_name,
+            success=True,
+            status="DISABLED",
+            check_phase=str(check_phase),
+        )
+        return result
+    close_cmd = float(getattr(args, "real_gripper_close", 0.91))
+    blocked_margin = float(getattr(args, "real_gripper_blocked_margin", 0.05))
+    with _profile_stage(
+        args,
+        stage_name,
+        check_phase=str(check_phase),
+        close_cmd=close_cmd,
+        blocked_margin=blocked_margin,
+        full_close_threshold=close_cmd - blocked_margin,
+    ) as prof:
+        gripper_pos, blocked = targeted.base.real_gripper_blocked_after_close(
+            real_exec,
+            close_cmd=close_cmd,
+            blocked_margin=blocked_margin,
+        )
+        result["checked"] = True
+        result["gripper_pos"] = gripper_pos
+        result["blocked_before_full_close"] = blocked
+        prof["gripper_pos"] = gripper_pos
+        prof["blocked_before_full_close"] = blocked
+        if gripper_pos is None or blocked is None:
+            prof["success"] = True
+            prof["status"] = "UNAVAILABLE"
+            return result
+        empty_grasp = not bool(blocked)
+        result["empty_grasp"] = bool(empty_grasp)
+        prof["empty_grasp"] = bool(empty_grasp)
+        prof["success"] = not bool(empty_grasp)
+        prof["status"] = "EMPTY_GRASP_FULLY_CLOSED" if empty_grasp else "GRASP_HELD"
+    return result
+
+
+def _clear_transport_attachment_after_empty_grasp(planner, demo) -> None:
+    try:
+        if planner is not None and getattr(planner, "attached_object_active", False):
+            planner.detach_object_from_robot()
+    except Exception:
+        pass
+    try:
+        demo._attached_box_visual_visible = False
+        demo._attached_object_visual_active = False
+        targeted.base.update_attached_box_visual(demo, visible=False)
+    except Exception:
+        pass
+    _clear_visualized_attached_spheres(demo)
+    _restore_transport_payload_state(
+        demo,
+        {
+            "_transport_attached_T_tcp_obj": _MISSING_ATTR,
+            "attached_box_size": _MISSING_ATTR,
+            "attached_box_pose_tcp": _MISSING_ATTR,
+            "_attached_object_visual_active": False,
+            "_attached_box_visual_visible": False,
+        },
+    )
+
+
+def _target_only_foundationpose_args(args) -> SimpleNamespace:
+    relocalize_args = SimpleNamespace(**vars(args).copy())
+    relocalize_args.selected_obstacle_object_names = []
+    relocalize_args.required_scene_object_names = []
+    relocalize_args.tracked_scene_object_names = []
+    relocalize_args.reuse_foundationpose_scene_across_cycles = False
+    return relocalize_args
+
+
+def _copy_args_for_scene_cache(args):
+    copier = getattr(targeted.base, "_copy_scene_cache_namespace", None)
+    if callable(copier):
+        try:
+            return copier(args)
+        except Exception:
+            pass
+    copied = {}
+    for key, value in vars(args).items():
+        if str(key).startswith("_") or isinstance(value, types.ModuleType) or callable(value):
+            continue
+        if isinstance(value, np.ndarray):
+            copied[key] = value.copy()
+        else:
+            try:
+                copied[key] = copy.deepcopy(value)
+            except Exception:
+                copied[key] = value
+    return SimpleNamespace(**copied)
+
+
+def _update_relocalized_target_scene_cache(demo, scene_capture_cache, target_name: str | None, T_cam_obj, T_world_obj, args) -> bool:
+    target_name = curobo_wrapper.normalize_object_name(target_name)
+    if target_name is None:
+        return False
+    if not isinstance(scene_capture_cache, dict):
+        scene_capture_cache = getattr(demo, "scene_capture_cache_ref", None)
+    if not isinstance(scene_capture_cache, dict):
+        return False
+    objects = scene_capture_cache.setdefault("objects", {})
+    if not isinstance(objects, dict):
+        return False
+    old_entry = objects.get(target_name, {}) if isinstance(objects.get(target_name), dict) else {}
+    objects[target_name] = {
+        "object_name": target_name,
+        "label": str(old_entry.get("label", getattr(args, "target_object_name", "") or target_name)),
+        "score": float(old_entry.get("score", 1.0)),
+        "box": np.asarray(old_entry.get("box", np.zeros(4, dtype=np.float32)), dtype=np.float32).reshape(4).copy(),
+        "T_cam_obj": np.asarray(T_cam_obj, dtype=np.float32).reshape(4, 4).copy(),
+        "T_world_obj": np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4).copy(),
+        "object_args": _copy_args_for_scene_cache(args),
+        "placed": False,
+        "relocalized": True,
+        "relocalized_ts": time.time(),
+        "pose_source": "empty_grasp_relocalize",
+    }
+    try:
+        demo.scene_capture_cache_ref = scene_capture_cache
+    except Exception:
+        pass
+    return True
+
+
+def _relocalize_active_target_after_empty_grasp(demo, bridge_mod, args, scene_capture_cache=None) -> bool:
+    target_name = curobo_wrapper.normalize_object_name(getattr(args, "object_name", None))
+    with _profile_stage(args, "empty_grasp_target_relocalize", target_name=target_name) as prof:
+        if not bool(getattr(args, "empty_grasp_relocalize_target", True)):
+            prof["success"] = False
+            prof["status"] = "DISABLED"
+            return False
+        if bool(getattr(args, "skip_foundationpose", False)):
+            prof["success"] = False
+            prof["status"] = "SKIP_FOUNDATIONPOSE"
+            print("[empty_grasp] --skip-foundationpose is enabled; cannot relocalize the target")
+            return False
+        fp_rt = getattr(demo, "foundationpose_runtime", None)
+        T_base_cam = getattr(demo, "T_base_cam", None)
+        if fp_rt is None or T_base_cam is None:
+            prof["success"] = False
+            prof["status"] = "FOUNDATIONPOSE_RUNTIME_UNAVAILABLE"
+            print("[empty_grasp] FoundationPose runtime is unavailable; cannot relocalize the target")
+            return False
+        try:
+            relocalize_args = _target_only_foundationpose_args(args)
+            torch_mod = getattr(targeted.base, "torch", None)
+            if torch_mod is not None and hasattr(torch_mod, "cuda"):
+                try:
+                    torch_mod.cuda.synchronize()
+                except Exception:
+                    pass
+            with _CUROBO_GPU_LOCK:
+                T_cam_obj, scene_obstacles = bridge_mod.capture_scene_poses_from_foundationpose(fp_rt, relocalize_args)
+            if torch_mod is not None and hasattr(torch_mod, "cuda"):
+                try:
+                    torch_mod.cuda.synchronize()
+                except Exception:
+                    pass
+            prof["returned_obstacle_count"] = len(list(scene_obstacles or []))
+            try:
+                bridge_mod.print_foundationpose_mapping_diagnostics(
+                    T_cam_obj,
+                    T_base_cam,
+                    demo.env,
+                    args,
+                    label="empty-grasp relocalized target",
+                )
+            except Exception:
+                pass
+            T_world_obj = bridge_mod.map_camera_pose_to_pick_world(T_cam_obj, T_base_cam, demo.env, args)
+            pose = _pose_from_world_matrix(np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4))
+            actor = getattr(getattr(demo, "base_env", None), "obj", None)
+            if actor is not None:
+                actor.set_pose(pose)
+                zero_vel = np.zeros(3, dtype=np.float32)
+                for method_name in ("set_linear_velocity", "set_velocity"):
+                    method = getattr(actor, method_name, None)
+                    if callable(method):
+                        method(zero_vel)
+                ang_method = getattr(actor, "set_angular_velocity", None)
+                if callable(ang_method):
+                    ang_method(zero_vel)
+            else:
+                bridge_mod.apply_pose_to_pick_object(demo.env, T_world_obj)
+            try:
+                demo.refresh_runtime_handles(rebuild_visual=False)
+            except Exception as exc:
+                prof["refresh_warning"] = f"{type(exc).__name__}: {exc}"
+            lift_delta = 0.0
+            try:
+                lift_delta = float(
+                    targeted.base.lift_active_object_above_table_if_needed(
+                        demo,
+                        args,
+                        min_clearance=max(0.001, 0.5 * float(getattr(args, "min_object_center_z_margin", 0.0))),
+                    )
+                    or 0.0
+                )
+            except Exception as exc:
+                prof["post_apply_lift_warning"] = f"{type(exc).__name__}: {exc}"
+            T_world_after = _single_scene_actor_pose_matrix(getattr(getattr(demo, "base_env", None), "obj", None))
+            if T_world_after is None:
+                T_world_after = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4).copy()
+            cache_updated = _update_relocalized_target_scene_cache(
+                demo,
+                scene_capture_cache,
+                target_name,
+                T_cam_obj,
+                T_world_after,
+                args,
+            )
+            _single_scene_refresh_after_pose_change(demo)
+            prof["cache_updated"] = bool(cache_updated)
+            prof["world_translation"] = np.asarray(T_world_after, dtype=np.float32).reshape(4, 4)[:3, 3].tolist()
+            prof["lift_delta_m"] = float(lift_delta)
+            try:
+                if bool(getattr(args, "freeze_active_object_before_grasp", True)):
+                    targeted.base.set_pregrasp_object_freeze(demo, True)
+                    targeted.base.refresh_frozen_active_object_pose(demo)
+            except Exception as exc:
+                prof["freeze_warning"] = f"{type(exc).__name__}: {exc}"
+            registry = _single_scene_registry(demo)
+            if target_name in registry:
+                registry[target_name]["object_args"] = args
+            prof["success"] = True
+            prof["status"] = "Success"
+            print(f"[empty_grasp] relocalized active target only: {target_name}")
+            return True
+        except SystemExit:
+            prof["success"] = False
+            prof["status"] = "USER_CANCELLED"
+            raise
+        except Exception as exc:
+            prof["success"] = False
+            prof["status"] = type(exc).__name__
+            prof["error"] = str(exc)
+            prof["traceback_tail"] = traceback.format_exc()[-4000:]
+            print(f"[empty_grasp] target-only FoundationPose relocalization failed: {exc}")
+            return False
 
 
 def _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, label: str, *, use_attach: bool) -> bool:
@@ -12679,7 +12995,11 @@ def run_targeted_place_episode_curobo_direct(
     args._skip_remaining_step_confirms_in_object = False
     args._episode_real_motion_started = False
     args._episode_failure_phase = ""
+    args._episode_failure_kind = ""
     args._episode_object_grasped = False
+    args._episode_empty_grasp_after_lift = False
+    args._episode_empty_grasp_gripper_pos = None
+    args._episode_empty_grasp_blocked_before_full_close = None
 
     def _mark_real_motion_started(phase: str) -> None:
         if real_exec is not None:
@@ -12691,6 +13011,15 @@ def run_targeted_place_episode_curobo_direct(
 
     def _mark_object_released() -> None:
         args._episode_object_grasped = False
+
+    def _mark_empty_grasp_after_lift(check: dict, *, phase: str = "empty_grasp_after_lift") -> None:
+        args._episode_failure_kind = "empty_grasp_after_lift"
+        args._episode_failure_phase = str(phase)
+        args._episode_empty_grasp_after_lift = True
+        args._episode_empty_grasp_check_phase = check.get("check_phase")
+        args._episode_empty_grasp_gripper_pos = check.get("gripper_pos")
+        args._episode_empty_grasp_blocked_before_full_close = check.get("blocked_before_full_close")
+        _mark_object_released()
 
     rule = None
     selected_joint_chain = None
@@ -13280,9 +13609,63 @@ def run_targeted_place_episode_curobo_direct(
                     f"joint_search chain start_delta={start_delta:.4f} > tol={reuse_tol:.4f}"
                 )
         if skip_independent_post_lift:
-            prof["success"] = True
-            prof["status"] = "SKIPPED_REUSE_JOINT_SEARCH_CHAIN"
-            prof["path_waypoints"] = 0
+            reusable_lift_path = [
+                np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                for q in list((selected_joint_chain.get("pre_place_choice") or {}).get("pre_transport_lift_path") or [])
+            ]
+            execute_reusable_lift_for_empty_check = (
+                real_exec is not None
+                and bool(getattr(args, "empty_grasp_check_after_lift", True))
+                and bool(getattr(args, "empty_grasp_execute_reusable_lift_before_check", False))
+                and len(reusable_lift_path) >= 2
+                and len(planned_transport_path) >= len(reusable_lift_path)
+                and float(np.max(np.abs(current_after_grasp_q - reusable_lift_path[0]))) <= reuse_tol
+                and all(
+                    float(np.max(np.abs(planned_transport_path[idx] - reusable_lift_path[idx]))) <= reuse_tol
+                    for idx in range(len(reusable_lift_path))
+                )
+            )
+            if execute_reusable_lift_for_empty_check:
+                reusable_lift_path[0] = current_after_grasp_q.copy()
+                _mark_real_motion_started("post_grasp_lift_execute")
+                print(
+                    "[post_grasp_lift] executing reusable joint_search lift before empty-grasp check "
+                    f"(waypoints={len(reusable_lift_path)})"
+                )
+                post_lift_ok, _ = targeted.base.execute_joint_path_stage(
+                    demo,
+                    bridge_mod,
+                    real_exec,
+                    "post_grasp_lift_reuse_chain",
+                    reusable_lift_path,
+                    args.real_gripper_close,
+                    args,
+                    use_attach=True,
+                )
+                prof["success"] = bool(post_lift_ok)
+                prof["status"] = "EXECUTED_REUSE_CHAIN_LIFT" if post_lift_ok else "REUSE_CHAIN_LIFT_EXEC_FAIL"
+                prof["path_waypoints"] = len(reusable_lift_path)
+                if post_lift_ok:
+                    targeted.base.lift_active_object_above_table_if_needed(
+                        demo,
+                        args,
+                        min_clearance=max(0.001, 0.5 * float(getattr(args, "min_object_center_z_margin", 0.0))),
+                    )
+                    targeted._register_transport_attached_box(
+                        demo,
+                        args,
+                        T_tcp_obj_override=getattr(demo, "_transport_attached_T_tcp_obj", None),
+                    )
+                    if bool(getattr(args, "curobo_attach_object", True)):
+                        _attach_transport_payload_to_curobo(planner, demo, args, label="transport_after_reuse_lift")
+                    selected_joint_chain["q_pre_place_path"] = [
+                        np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                        for q in planned_transport_path[len(reusable_lift_path) - 1 :]
+                    ]
+            else:
+                prof["success"] = True
+                prof["status"] = "SKIPPED_REUSE_JOINT_SEARCH_CHAIN"
+                prof["path_waypoints"] = 0
         else:
             _mark_real_motion_started("post_grasp_lift_execute")
             post_lift_ok = _skip_post_grasp_escape(demo, bridge_mod, real_exec, args, "post_grasp_lift", use_attach=True)
@@ -13290,6 +13673,44 @@ def run_targeted_place_episode_curobo_direct(
             prof["status"] = "Success" if post_lift_ok else "PLAN_OR_EXEC_FAIL"
     if not post_lift_ok:
         print("[warn] post-grasp lift failed; continuing to transport from current pose")
+
+    if real_exec is not None and bool(post_lift_ok):
+        early_empty_grasp_check = _detect_empty_grasp_after_lift(
+            real_exec,
+            args,
+            stage_name="empty_grasp_after_post_lift_probe",
+            check_phase="after_post_lift_probe",
+        )
+        if (
+            bool(early_empty_grasp_check.get("empty_grasp", False))
+            and not bool(getattr(args, "skip_goal_motion", False))
+        ):
+            print(
+                "[empty_grasp][probe] gripper appears fully closed after post-grasp lift stage; "
+                "skipping transport and returning to cycle start"
+            )
+        empty_grasp_check = early_empty_grasp_check
+    if (
+        real_exec is not None
+        and bool(post_lift_ok)
+        and bool(empty_grasp_check.get("empty_grasp", False))
+    ):
+        gripper_pos = empty_grasp_check.get("gripper_pos")
+        if gripper_pos is None:
+            pos_text = "unknown"
+        else:
+            pos_text = f"{float(gripper_pos):.4f}"
+        print(
+            "[empty_grasp][FAIL] gripper fully closed after post-grasp lift "
+            f"(pos={pos_text}); skipping placement and returning to cycle start"
+        )
+        _clear_transport_attachment_after_empty_grasp(planner, demo)
+        try:
+            targeted.base.set_pregrasp_object_freeze(demo, False)
+        except Exception:
+            pass
+        _mark_empty_grasp_after_lift(empty_grasp_check)
+        return False
 
     if args.skip_goal_motion:
         print("[place] skipped place motion as requested; returning to the cycle start pose before finishing")
@@ -13780,43 +14201,93 @@ def run_targeted_place_episode_curobo_direct(
 
     if bool(place_choice.get("two_stage_place", False)):
         _mark_real_motion_started("place_hover_execute")
-        ok, _ = targeted.base.execute_pose_path_stage(
-            demo,
-            bridge_mod,
-            real_exec,
-            f"{place_choice['label']}_hover",
-            place_choice["pre_place_pose"],
-            q_pre_place_path,
-            args.real_gripper_close,
+        with _profile_stage(
             args,
+            "place_hover_execute",
+            label=f"{place_choice['label']}_hover",
+            path_waypoints=len(q_pre_place_path),
             use_attach=True,
-        )
+        ) as prof:
+            ok, _ = targeted.base.execute_pose_path_stage(
+                demo,
+                bridge_mod,
+                real_exec,
+                f"{place_choice['label']}_hover",
+                place_choice["pre_place_pose"],
+                q_pre_place_path,
+                args.real_gripper_close,
+                args,
+                use_attach=True,
+            )
+            prof["success"] = bool(ok)
+            prof["status"] = "Success" if ok else "EXEC_FAIL"
         if ok:
+            if real_exec is not None:
+                empty_grasp_check = _detect_empty_grasp_after_lift(
+                    real_exec,
+                    args,
+                    stage_name="empty_grasp_pre_place_check",
+                    check_phase="pre_place_hover",
+                )
+                if bool(empty_grasp_check.get("empty_grasp", False)):
+                    gripper_pos = empty_grasp_check.get("gripper_pos")
+                    pos_text = "unknown" if gripper_pos is None else f"{float(gripper_pos):.4f}"
+                    print(
+                        "[empty_grasp][FAIL] gripper fully closed at pre-place hover "
+                        f"(pos={pos_text}); skipping final descent and returning to cycle start"
+                    )
+                    _clear_transport_attachment_after_empty_grasp(planner, demo)
+                    if relaxed_target_collision:
+                        targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
+                    try:
+                        targeted.base.set_pregrasp_object_freeze(demo, False)
+                    except Exception:
+                        pass
+                    _mark_empty_grasp_after_lift(empty_grasp_check, phase="empty_grasp_pre_place")
+                    return False
             _mark_real_motion_started("place_release_execute")
+            with _profile_stage(
+                args,
+                "place_release_execute",
+                label=str(place_choice["label"]),
+                path_waypoints=len(q_place_path),
+                use_attach=True,
+            ) as prof:
+                ok, _ = targeted.base.execute_pose_path_stage(
+                    demo,
+                    bridge_mod,
+                    real_exec,
+                    place_choice["label"],
+                    place_choice["place_pose"],
+                    q_place_path,
+                    args.real_gripper_close,
+                    args,
+                    use_attach=True,
+                )
+                prof["success"] = bool(ok)
+                prof["status"] = "Success" if ok else "EXEC_FAIL"
+    else:
+        _mark_real_motion_started("place_execute")
+        with _profile_stage(
+            args,
+            "place_execute",
+            label=str(place_choice["label"]),
+            path_waypoints=len(q_pre_place_path),
+            use_attach=True,
+        ) as prof:
             ok, _ = targeted.base.execute_pose_path_stage(
                 demo,
                 bridge_mod,
                 real_exec,
                 place_choice["label"],
-                place_choice["place_pose"],
-                q_place_path,
+                place_choice["pose"],
+                q_pre_place_path,
                 args.real_gripper_close,
                 args,
                 use_attach=True,
             )
-    else:
-        _mark_real_motion_started("place_execute")
-        ok, _ = targeted.base.execute_pose_path_stage(
-            demo,
-            bridge_mod,
-            real_exec,
-            place_choice["label"],
-            place_choice["pose"],
-            q_pre_place_path,
-            args.real_gripper_close,
-            args,
-            use_attach=True,
-        )
+            prof["success"] = bool(ok)
+            prof["status"] = "Success" if ok else "EXEC_FAIL"
     if not ok:
         if planner.attached_object_active:
             planner.detach_object_from_robot()
@@ -13839,13 +14310,35 @@ def run_targeted_place_episode_curobo_direct(
         return False
     if real_exec is not None:
         _mark_real_motion_started("gripper_open_at_place")
-        real_exec.set_gripper(args.real_gripper_open)
-        targeted.base.sync_demo_gripper_state(demo, closed=False, steps=4)
-        _mark_object_released()
+        with _profile_stage(
+            args,
+            "place_open_gripper",
+            gripper_pos=float(args.real_gripper_open),
+            real_exec=True,
+        ) as prof:
+            try:
+                real_exec.set_gripper(args.real_gripper_open)
+                targeted.base.sync_demo_gripper_state(demo, closed=False, steps=4)
+                _mark_object_released()
+                prof["success"] = True
+                prof["status"] = "Success"
+            except Exception as exc:
+                prof["success"] = False
+                prof["status"] = type(exc).__name__
+                prof["error"] = str(exc)
+                raise
     else:
         print("[dry-run] skipped real gripper open at the targeted place")
-        targeted.base.sync_demo_gripper_state(demo, closed=False, steps=4)
-        _mark_object_released()
+        with _profile_stage(
+            args,
+            "place_open_gripper",
+            gripper_pos=float(args.real_gripper_open),
+            real_exec=False,
+        ) as prof:
+            targeted.base.sync_demo_gripper_state(demo, closed=False, steps=4)
+            _mark_object_released()
+            prof["success"] = True
+            prof["status"] = "DRY_RUN"
 
     if planner.attached_object_active:
         planner.detach_object_from_robot()
@@ -14106,6 +14599,113 @@ def _single_scene_actor_pose_matrix(actor) -> np.ndarray | None:
         return targeted.base.pose_to_matrix(p, q).astype(np.float32)
     except Exception:
         return None
+
+
+def _single_scene_zero_actor_velocity(actor) -> None:
+    if actor is None:
+        return
+    zero_vel = np.zeros(3, dtype=np.float32)
+    for method_name in ("set_linear_velocity", "set_velocity"):
+        method = getattr(actor, method_name, None)
+        if callable(method):
+            try:
+                method(zero_vel)
+            except Exception:
+                pass
+    ang_method = getattr(actor, "set_angular_velocity", None)
+    if callable(ang_method):
+        try:
+            ang_method(zero_vel)
+        except Exception:
+            pass
+
+
+def _single_scene_refresh_after_pose_change(demo) -> None:
+    try:
+        demo.refresh_runtime_handles(rebuild_visual=False)
+    except Exception:
+        pass
+    scene = getattr(getattr(demo, "base_env", None), "scene", None)
+    if scene is None:
+        scene = getattr(getattr(getattr(demo, "env", None), "unwrapped", None), "scene", None)
+    update_render = getattr(scene, "update_render", None)
+    if callable(update_render):
+        try:
+            update_render(update_sensors=False, update_human_render_cameras=True)
+        except TypeError:
+            try:
+                update_render()
+            except Exception:
+                pass
+        except Exception:
+            pass
+    try:
+        if str(getattr(getattr(demo, "args", None), "render_mode", "") or "") == "human":
+            demo.env.render()
+    except Exception:
+        pass
+
+
+def _single_scene_apply_cached_active_pose(
+    demo,
+    args,
+    selected_name: str | None,
+    scene_capture_cache,
+    *,
+    reason: str = "activate_object",
+) -> bool:
+    selected_name = curobo_wrapper.normalize_object_name(selected_name)
+    entry = _single_scene_cache_entry(scene_capture_cache, selected_name)
+    if not isinstance(entry, dict) or bool(entry.get("placed", False)) or entry.get("T_world_obj") is None:
+        return False
+    actor = getattr(getattr(demo, "base_env", None), "obj", None)
+    if actor is None:
+        return False
+    try:
+        T_world_obj = np.asarray(entry["T_world_obj"], dtype=np.float32).reshape(4, 4)
+    except Exception:
+        return False
+    before_T = _single_scene_actor_pose_matrix(actor)
+    before_xyz = None if before_T is None else before_T[:3, 3].astype(np.float32)
+    cache_xyz = T_world_obj[:3, 3].astype(np.float32)
+    delta_m = None if before_xyz is None else float(np.linalg.norm(before_xyz - cache_xyz))
+    should_apply = before_xyz is None or delta_m is None or delta_m > 1e-5 or bool(entry.get("relocalized", False))
+    if not should_apply:
+        return False
+    try:
+        actor.set_pose(_pose_from_world_matrix(T_world_obj))
+        _single_scene_zero_actor_velocity(actor)
+        _single_scene_refresh_after_pose_change(demo)
+    except Exception as exc:
+        _record_profile(
+            args,
+            "active_target_pose_refresh",
+            success=False,
+            status=type(exc).__name__,
+            target_name=selected_name,
+            reason=str(reason),
+            cache_translation=cache_xyz.tolist(),
+            actor_cache_delta_m=delta_m,
+            error=str(exc),
+        )
+        return False
+    after_T = _single_scene_actor_pose_matrix(actor)
+    after_xyz = None if after_T is None else after_T[:3, 3].astype(np.float32)
+    _record_profile(
+        args,
+        "active_target_pose_refresh",
+        success=True,
+        status="APPLIED",
+        target_name=selected_name,
+        reason=str(reason),
+        before_translation=None if before_xyz is None else before_xyz.tolist(),
+        cache_translation=cache_xyz.tolist(),
+        after_translation=None if after_xyz is None else after_xyz.tolist(),
+        actor_cache_delta_m=delta_m,
+        relocalized=bool(entry.get("relocalized", False)),
+    )
+    entry["relocalized_pose_applied"] = bool(entry.get("relocalized", False))
+    return True
 
 
 def _single_scene_cache_entry(scene_capture_cache, object_name: str | None):
@@ -14413,6 +15013,13 @@ def _single_scene_activate_object(
     if callable(apply_physics_profile):
         apply_physics_profile(demo.env, cycle_args)
     _single_scene_sync_obstacles(demo, cycle_args, selected_name, obstacle_names, scene_capture_cache)
+    _single_scene_apply_cached_active_pose(
+        demo,
+        cycle_args,
+        selected_name,
+        scene_capture_cache,
+        reason="activate_object",
+    )
     try:
         demo.refresh_runtime_handles(rebuild_visual=False)
     except Exception:
@@ -14473,23 +15080,20 @@ def _single_scene_restore_after_failed_attempt(
     )
     entry = _single_scene_cache_entry(scene_capture_cache, selected_name)
     T_world_obj = None if not isinstance(entry, dict) else entry.get("T_world_obj")
+    restored_world_translation = None
     if T_world_obj is not None and not bool((entry or {}).get("placed", False)):
         try:
-            pose = _pose_from_world_matrix(np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4))
+            T_world_obj_arr = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4)
+            pose = _pose_from_world_matrix(T_world_obj_arr)
             registry = _single_scene_registry(demo)
             actor = (registry.get(selected_name) or {}).get("actor")
             if actor is not None:
                 actor.set_pose(pose)
-                zero_vel = np.zeros(3, dtype=np.float32)
-                for method_name in ("set_linear_velocity", "set_velocity"):
-                    method = getattr(actor, method_name, None)
-                    if callable(method):
-                        method(zero_vel)
-                ang_method = getattr(actor, "set_angular_velocity", None)
-                if callable(ang_method):
-                    ang_method(zero_vel)
+                _single_scene_zero_actor_velocity(actor)
             elif selected_name == curobo_wrapper.normalize_object_name(getattr(args, "object_name", None)):
                 _set_active_object_pose_quiet(demo, pose.p, pose.q)
+            _single_scene_refresh_after_pose_change(demo)
+            restored_world_translation = T_world_obj_arr[:3, 3].astype(np.float32).tolist()
             restored_fields.append("object_pose")
         except Exception as exc:
             print(f"[single_scene] warning: failed to restore object pose for {selected_name}: {exc}")
@@ -14519,6 +15123,7 @@ def _single_scene_restore_after_failed_attempt(
         restored_fields=sorted(set(restored_fields)),
         restored_arm_q=q_restore is not None,
         restored_object_pose=T_world_obj is not None,
+        restored_world_translation=restored_world_translation,
     )
 
 _PREFETCH_DROP_KEYS = {
@@ -15411,9 +16016,66 @@ def _play_dry_run_motion_window(demo, bridge_mod, label: str, q_start, q_path, a
     targeted.base.sync_demo_arm_qpos(demo, points[-1])
 
 
+def _install_cuda_render_sync_wrappers() -> None:
+    if bool(getattr(targeted.base, "_direct_pre_place_cuda_render_sync_wrapped", False)):
+        return
+
+    original_sync_demo_arm_qpos = getattr(targeted.base, "sync_demo_arm_qpos", None)
+    if callable(original_sync_demo_arm_qpos):
+
+        def _sync_demo_arm_qpos_serialized(*args, **kwargs):
+            with _CUROBO_GPU_LOCK:
+                return original_sync_demo_arm_qpos(*args, **kwargs)
+
+        targeted.base.sync_demo_arm_qpos = _sync_demo_arm_qpos_serialized
+
+    original_update_attached_box_visual = getattr(targeted.base, "update_attached_box_visual", None)
+    if callable(original_update_attached_box_visual):
+
+        def _update_attached_box_visual_serialized(*args, **kwargs):
+            with _CUROBO_GPU_LOCK:
+                return original_update_attached_box_visual(*args, **kwargs)
+
+        targeted.base.update_attached_box_visual = _update_attached_box_visual_serialized
+
+    for func_name in (
+        "sync_demo_gripper_state",
+        "refresh_frozen_active_object_pose",
+        "force_active_object_to_attached_pose",
+        "settle_released_active_object_for_scene_cache",
+        "update_robot_collision_sphere_visuals",
+    ):
+        original_func = getattr(targeted.base, func_name, None)
+        if not callable(original_func):
+            continue
+
+        def _serialized_base_gpu_func(*args, __original_func=original_func, **kwargs):
+            with _CUROBO_GPU_LOCK:
+                return __original_func(*args, **kwargs)
+
+        setattr(targeted.base, func_name, _serialized_base_gpu_func)
+
+    original_render_real_shadow_step = getattr(targeted.base, "_render_real_shadow_step", None)
+    if callable(original_render_real_shadow_step):
+
+        def _render_real_shadow_step_serialized(*args, **kwargs):
+            acquired = _CUROBO_GPU_LOCK.acquire(blocking=False)
+            if not acquired:
+                return None
+            try:
+                return original_render_real_shadow_step(*args, **kwargs)
+            finally:
+                _CUROBO_GPU_LOCK.release()
+
+        targeted.base._render_real_shadow_step = _render_real_shadow_step_serialized
+
+    targeted.base._direct_pre_place_cuda_render_sync_wrapped = True
+
+
 def _install_dry_run_motion_window_wrappers() -> None:
     if bool(getattr(targeted.base, "_direct_pre_place_dry_run_motion_window_wrapped", False)):
         return
+    _install_cuda_render_sync_wrappers()
     original_pose_stage = targeted.base.execute_pose_path_stage
 
     def _execute_pose_path_stage_with_motion_window(
@@ -15469,6 +16131,13 @@ def _install_dry_run_motion_window_wrappers() -> None:
             *extra_args,
             **kwargs,
         )
+        if ok and real_exec is not None:
+            q_sync = _q7_or_none(q_sent)
+            if q_sync is None:
+                path_points = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+                q_sync = path_points[-1] if path_points else None
+            if q_sync is not None:
+                targeted.base.sync_demo_arm_qpos(demo, q_sync)
         if not ok and real_exec is not None:
             use_attach = bool(kwargs.get("use_attach", False))
             allow_start_in_collision = bool(kwargs.get("allow_start_in_collision", False))
@@ -15567,6 +16236,13 @@ def _install_dry_run_motion_window_wrappers() -> None:
                 *extra_args,
                 **kwargs,
             )
+            if ok and real_exec is not None:
+                q_sync = _q7_or_none(q_sent)
+                if q_sync is None:
+                    path_points = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+                    q_sync = path_points[-1] if path_points else None
+                if q_sync is not None:
+                    targeted.base.sync_demo_arm_qpos(demo, q_sync)
             if ok and real_exec is None and _dry_run_motion_window_enabled(args):
                 try:
                     _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
@@ -15645,6 +16321,8 @@ def _run_single_scene_main(create_demo_func) -> None:
     place_state_cache: dict = {"used_slots_by_target": {}}
     failed_targets_this_cycle: set[str] = set()
     deferred_failed_targets: set[str] = set()
+    forced_retry_target_name: str | None = None
+    empty_grasp_retry_counts: Counter = Counter()
     prefetch_manager = (
         _NextCyclePlanPrefetchManager(create_demo_func, bridge_mod, planner_mod, base_args, cycle_object_sequence)
         if bool(getattr(base_args, "next_cycle_plan_prefetch", True))
@@ -15670,17 +16348,43 @@ def _run_single_scene_main(create_demo_func) -> None:
             ok = False
             cached_scene_names = targeted.base.list_cached_scene_object_names(scene_capture_cache)
             available_rule_names = targeted._list_cached_unplaced_rule_names(scene_capture_cache)
-            reserved_name = (
-                prefetch_manager.reserved_target_for_cycle(
+            selected_name = None
+            target_pool = []
+            target_candidates = []
+            forced_name = curobo_wrapper.normalize_object_name(forced_retry_target_name)
+            forced_retry_target_name = None
+            if forced_name is not None:
+                forced_entry = _single_scene_cache_entry(scene_capture_cache, forced_name)
+                forced_available = (
+                    (not available_rule_names or forced_name in set(available_rule_names))
+                    and (not cycle_object_sequence or forced_name in set(cycle_object_sequence))
+                    and not bool((forced_entry or {}).get("placed", False))
+                )
+                if forced_available:
+                    target_pool = list(available_rule_names or cycle_object_sequence or [forced_name])
+                    target_candidates = [forced_name]
+                    selected_name = forced_name
+                    print(f"[empty_grasp] retrying relocalized target for cycle {cycle_idx}: {selected_name}")
+                else:
+                    _record_profile(
+                        base_args,
+                        "empty_grasp_forced_retry_target",
+                        success=False,
+                        status="TARGET_UNAVAILABLE",
+                        target_name=forced_name,
+                    )
+                    print(f"[empty_grasp] forced retry target {forced_name} is no longer selectable; choosing normally")
+            reserved_name = None
+            if selected_name is None and prefetch_manager is not None:
+                reserved_name = prefetch_manager.reserved_target_for_cycle(
                     cycle_idx,
                     scene_capture_cache,
                     failed_targets_this_cycle,
                     deferred_failed_targets,
                 )
-                if prefetch_manager is not None
-                else None
-            )
-            if reserved_name is not None:
+            if selected_name is not None:
+                pass
+            elif reserved_name is not None:
                 target_pool = list(available_rule_names or cycle_object_sequence or [reserved_name])
                 target_candidates = [reserved_name]
                 selected_name = reserved_name
@@ -15798,8 +16502,13 @@ def _run_single_scene_main(create_demo_func) -> None:
             if not ok:
                 real_motion_started = bool(getattr(cycle_args, "_episode_real_motion_started", False))
                 failure_phase = str(getattr(cycle_args, "_episode_failure_phase", "") or "")
+                failure_kind = str(getattr(cycle_args, "_episode_failure_kind", "") or "")
+                empty_grasp_failure = failure_kind == "empty_grasp_after_lift" or bool(
+                    getattr(cycle_args, "_episode_empty_grasp_after_lift", False)
+                )
                 object_grasped = bool(getattr(cycle_args, "_episode_object_grasped", False))
                 if bool(getattr(base_args, "reselect_target_on_planning_failure", True)):
+                    relocalized_after_empty_grasp = False
                     if real_exec is None:
                         _single_scene_restore_after_failed_attempt(
                             demo,
@@ -15849,6 +16558,11 @@ def _run_single_scene_main(create_demo_func) -> None:
                                     targeted.base.sync_demo_gripper_state(demo, closed=False, steps=4)
                                 except Exception:
                                     pass
+                                if empty_grasp_failure:
+                                    try:
+                                        real_exec.set_gripper(cycle_args.real_gripper_open)
+                                    except Exception:
+                                        pass
                                 return_ok = True
                                 return_status = "ALREADY_AT_START"
                             else:
@@ -15878,6 +16592,17 @@ def _run_single_scene_main(create_demo_func) -> None:
                                 )
                                 final_ok = False
                                 break
+                            if empty_grasp_failure:
+                                try:
+                                    real_exec.set_gripper(cycle_args.real_gripper_open)
+                                except Exception:
+                                    pass
+                                relocalized_after_empty_grasp = _relocalize_active_target_after_empty_grasp(
+                                    demo,
+                                    bridge_mod,
+                                    cycle_args,
+                                    scene_capture_cache,
+                                )
                         _single_scene_restore_after_failed_attempt(
                             demo,
                             cycle_args,
@@ -15885,15 +16610,56 @@ def _run_single_scene_main(create_demo_func) -> None:
                             selected_name,
                             cycle_start_q,
                         )
-                        print(
-                            "[single_scene] real execution failed before grasp close; returned/restored to "
-                            f"cycle start after failed target={selected_name}"
-                        )
-                    failed_targets_this_cycle.add(selected_name)
-                    deferred_failed_targets.add(selected_name)
+                        if empty_grasp_failure:
+                            print(
+                                "[single_scene] empty grasp detected after lift; returned/restored to "
+                                f"cycle start after target={selected_name}"
+                            )
+                        else:
+                            print(
+                                "[single_scene] real execution failed before grasp close; returned/restored to "
+                                f"cycle start after failed target={selected_name}"
+                            )
+                    retry_same_target_after_empty_grasp = False
+                    if empty_grasp_failure and relocalized_after_empty_grasp:
+                        max_empty_retries = int(max(getattr(base_args, "empty_grasp_max_relocalize_retries", 1), 0))
+                        if int(empty_grasp_retry_counts[selected_name]) < max_empty_retries:
+                            empty_grasp_retry_counts[selected_name] += 1
+                            forced_retry_target_name = selected_name
+                            retry_same_target_after_empty_grasp = True
+                            _record_profile(
+                                cycle_args,
+                                "empty_grasp_retry_same_target",
+                                success=True,
+                                status="SCHEDULED",
+                                target_name=selected_name,
+                                retry_index=int(empty_grasp_retry_counts[selected_name]),
+                                max_retries=max_empty_retries,
+                            )
+                            print(
+                                f"[empty_grasp] relocalized {selected_name}; retrying the same target "
+                                f"({empty_grasp_retry_counts[selected_name]}/{max_empty_retries})"
+                            )
+                        else:
+                            _record_profile(
+                                cycle_args,
+                                "empty_grasp_retry_same_target",
+                                success=False,
+                                status="RETRY_LIMIT_REACHED",
+                                target_name=selected_name,
+                                retry_count=int(empty_grasp_retry_counts[selected_name]),
+                                max_retries=max_empty_retries,
+                            )
+                    if not retry_same_target_after_empty_grasp:
+                        failed_targets_this_cycle.add(selected_name)
+                        deferred_failed_targets.add(selected_name)
                     print(
                         f"[cycle {cycle_idx}] planning/execution failed; "
-                        "keeping the current single scene and trying a different target."
+                        + (
+                            "keeping the current single scene and retrying the relocalized target."
+                            if retry_same_target_after_empty_grasp
+                            else "keeping the current single scene and trying a different target."
+                        )
                     )
                     cycle_idx -= 1
                     continue
@@ -15902,6 +16668,7 @@ def _run_single_scene_main(create_demo_func) -> None:
 
             failed_targets_this_cycle.clear()
             deferred_failed_targets.discard(selected_name)
+            empty_grasp_retry_counts.pop(selected_name, None)
             targeted.base.cache_successfully_placed_object_world_pose(demo, cycle_args.object_name, cycle_args)
             registry = _single_scene_registry(demo)
             if selected_name in registry:

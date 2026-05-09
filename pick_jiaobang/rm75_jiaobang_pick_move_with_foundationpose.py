@@ -315,18 +315,29 @@ def create_grounding_dino_detector(args):
     from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_id = str(args.grounding_dino_model_id)
+    cache_key = (model_id, device)
+    detector_cache = getattr(create_grounding_dino_detector, "_detector_cache", None)
+    if isinstance(detector_cache, dict) and cache_key in detector_cache:
+        return detector_cache[cache_key]
+
     print(f"GroundingDINO device: {device}")
     processor = _load_hf_component_compatible(
         AutoProcessor.from_pretrained,
-        args.grounding_dino_model_id,
+        model_id,
         use_fast=False,
     )
     model = _load_hf_component_compatible(
         AutoModelForZeroShotObjectDetection.from_pretrained,
-        args.grounding_dino_model_id,
+        model_id,
     ).to(device)
     model.eval()
-    return {"processor": processor, "model": model, "device": device}
+    detector = {"processor": processor, "model": model, "device": device}
+    if not isinstance(detector_cache, dict):
+        detector_cache = {}
+        setattr(create_grounding_dino_detector, "_detector_cache", detector_cache)
+    detector_cache[cache_key] = detector
+    return detector
 
 
 
@@ -736,11 +747,29 @@ def review_grounding_dino_batch(reader, detector, args, review_items, *, window_
 
 
 def create_foundationpose_runtime(fp_rt, args):
-    runtime = {
-        "scorer": fp_rt.ScorePredictor(),
-        "refiner": fp_rt.PoseRefinePredictor(),
-        "glctx": fp_rt.dr.RasterizeCudaContext(),
-    }
+    cached_models = getattr(fp_rt, "_jiaobang_foundationpose_runtime_models", None)
+    if isinstance(cached_models, dict) and all(
+        cached_models.get(key) is not None for key in ("scorer", "refiner", "glctx")
+    ):
+        runtime = {
+            "scorer": cached_models["scorer"],
+            "refiner": cached_models["refiner"],
+            "glctx": cached_models["glctx"],
+        }
+    else:
+        runtime = {
+            "scorer": fp_rt.ScorePredictor(),
+            "refiner": fp_rt.PoseRefinePredictor(),
+            "glctx": fp_rt.dr.RasterizeCudaContext(),
+        }
+        try:
+            fp_rt._jiaobang_foundationpose_runtime_models = {
+                "scorer": runtime["scorer"],
+                "refiner": runtime["refiner"],
+                "glctx": runtime["glctx"],
+            }
+        except Exception:
+            pass
 
     reader = fp_rt.RealSenseRGBDReader(
         width=args.camera_width,
