@@ -38,7 +38,7 @@ DEFAULT_FIXED_GOAL_JOINTS_DEG = (178.0, -5.0, 0.0, -70.0, 0.0, -102.0, 60.0)
 OBJECT_SPECS: Dict[str, ObjectSpec] = {
     "shuazi": ObjectSpec(
         name="shuazi",
-        grounding_prompt="white laundry brush.",
+        grounding_prompt="white plastic brush.",
         mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/shuazi.glb",
         sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/shuazi.glb",
         real_longest_axis_m=0.105,
@@ -47,7 +47,7 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
     ),
     "bitong": ObjectSpec(
         name="bitong",
-        grounding_prompt="yellow pen holder.",
+        grounding_prompt="beige cylindrical cup.",
         mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/holder_85x95.glb",
         sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/holder_sim_85x95.glb",
         real_longest_axis_m=0.095,
@@ -180,9 +180,11 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
     # ---------------  roof assembly  ---------------
     "red_bricks_cube": ObjectSpec(
         name="red_bricks_cube",
-        grounding_prompt="red brick cube.",
-        mesh_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_bricks_cube.glb",
-        sim_asset_file="~/Desktop/lerobot/pick_jiaobang/meshs/red_bricks_cube.glb",
+        grounding_prompt="small square plastic building block.",
+        mesh_file="~/Desktop/lerobot/FoundationPose/assets/red_jimu_cube.glb",
+        mesh_scale=0.1,
+        sim_asset_file="~/Desktop/lerobot/FoundationPose/assets/red_jimu_cube.glb",
+        sim_asset_scale=0.1,
         real_longest_axis_m=0.105,
         fixed_goal_joints_deg=DEFAULT_FIXED_GOAL_JOINTS_DEG,
     ),

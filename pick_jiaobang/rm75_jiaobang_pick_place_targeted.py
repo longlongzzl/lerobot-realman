@@ -133,10 +133,34 @@ def build_arg_parser():
         help="For tabletop place_on_slots rules, when any candidate keeps the TCP approach axis at least this aligned with the tabletop normal, reject flatter/horizontal TCP candidates and try the more vertical ones first.",
     )
     parser.add_argument(
+        "--targeted-place-slot-order",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "For place_on_slots rules, prefer these slot numbers or names first, for example "
+            "'3' or 'slot_3 slot_4'. Any unspecified slots remain available after the preferred order."
+        ),
+    )
+    parser.add_argument(
+        "--targeted-place-source-slot-map",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "For place_on_slots rules, bind source objects to exact tabletop slots, for example "
+            "'gluestick:3 tennis:slot_4'. Insert-style rules such as bi->bitong ignore this."
+        ),
+    )
+    parser.add_argument(
         "--target-selection-order",
-        choices=("random", "risk_aware"),
+        choices=("cycle", "random", "risk_aware"),
         default="risk_aware",
-        help="How to choose among rule-enabled targets. risk_aware keeps randomness inside priority groups but tries small/easily-blocked objects before bulky placed obstacles.",
+        help=(
+            "How to choose among rule-enabled targets. cycle follows --cycle-object-names order; "
+            "risk_aware keeps randomness inside priority groups but tries small/easily-blocked objects "
+            "before bulky placed obstacles."
+        ),
     )
     parser.add_argument(
         "--targeted-place-hover-extra-height-m",
@@ -352,6 +376,67 @@ def _ordered_rule_slots(rule: PlaceRule, T_world_target: np.ndarray, bridge_mod,
         )
     )
     return [slot for _, slot, _, _ in annotated]
+
+
+def _slot_name_from_user_token(token: object) -> str | None:
+    text = str(token).strip()
+    if not text:
+        return None
+    if text.lower().startswith("slot_"):
+        return f"slot_{text.split('_')[-1]}"
+    try:
+        return f"slot_{int(text)}"
+    except Exception:
+        return text
+
+
+def _apply_user_slot_order(slots: list, args) -> list:
+    raw_order = list(getattr(args, "targeted_place_slot_order", None) or [])
+    preferred_names = []
+    for token in raw_order:
+        name = _slot_name_from_user_token(token)
+        if name is not None and name not in preferred_names:
+            preferred_names.append(name)
+    if not preferred_names:
+        return slots
+
+    by_name = {str(getattr(slot, "name", "")): slot for slot in slots}
+    ordered = [by_name[name] for name in preferred_names if name in by_name]
+    ordered_names = {str(getattr(slot, "name", "")) for slot in ordered}
+    ordered.extend(slot for slot in slots if str(getattr(slot, "name", "")) not in ordered_names)
+    return ordered
+
+
+def _parse_user_source_slot_map(args) -> dict[str, str]:
+    raw_items = list(getattr(args, "targeted_place_source_slot_map", None) or [])
+    out: dict[str, str] = {}
+    for raw in raw_items:
+        text = str(raw).strip()
+        if not text:
+            continue
+        if ":" in text:
+            source_token, slot_token = text.split(":", 1)
+        elif "=" in text:
+            source_token, slot_token = text.split("=", 1)
+        else:
+            continue
+        source_name = normalize_object_name(source_token.strip())
+        slot_name = _slot_name_from_user_token(slot_token)
+        if source_name is None or slot_name is None:
+            continue
+        out[source_name] = slot_name
+    return out
+
+
+def _apply_rule_slot_order(slots: list, args, rule: PlaceRule) -> list:
+    source_name = normalize_object_name(rule.source_object_name) or str(rule.source_object_name)
+    source_slot_map = _parse_user_source_slot_map(args)
+    mapped_slot_name = source_slot_map.get(source_name)
+    if mapped_slot_name:
+        by_name = {str(getattr(slot, "name", "")): slot for slot in slots}
+        mapped_slot = by_name.get(mapped_slot_name)
+        return [mapped_slot] if mapped_slot is not None else []
+    return _apply_user_slot_order(slots, args)
 
 
 def _mark_place_rule_success(rule: PlaceRule, place_state_cache, slot_name: str | None = None) -> None:
@@ -672,7 +757,7 @@ def build_targeted_place_plan_variants(
     else:
         T_tcp_obj = np.asarray(T_tcp_obj_override, dtype=np.float32).reshape(4, 4)
     if rule.primitive == "place_on_slots":
-        ordered_slots = _ordered_rule_slots(rule, T_world_target, bridge_mod, demo)
+        ordered_slots = _apply_rule_slot_order(_ordered_rule_slots(rule, T_world_target, bridge_mod, demo), args, rule)
         if not ordered_slots:
             raise RuntimeError(f"Rule for {rule.source_object_name} uses place_on_slots but defines no slots")
         target_key = normalize_object_name(rule.target_object_name) or str(rule.target_object_name)
@@ -1522,10 +1607,16 @@ def _random_target_pool_for_cycle(
     available_rule_names,
     cycle_idx: int,
 ) -> list[str]:
+    order = str(getattr(base_args, "target_selection_order", "random"))
     if available_rule_names:
         if cycle_object_sequence:
-            allowed = set(_unique_rule_names(cycle_object_sequence))
-            pool = [name for name in _unique_rule_names(available_rule_names) if name in allowed]
+            available = set(_unique_rule_names(available_rule_names))
+            cycle_pool = [name for name in _unique_rule_names(cycle_object_sequence) if name in available]
+            if order == "cycle":
+                pool = cycle_pool
+            else:
+                allowed = set(cycle_pool)
+                pool = [name for name in _unique_rule_names(available_rule_names) if name in allowed]
         else:
             pool = _unique_rule_names(available_rule_names)
     elif cycle_object_sequence:
@@ -1562,7 +1653,10 @@ def _select_random_cycle_target(
         candidates = [name for name in pool if name not in failed_targets_this_cycle]
     if not candidates:
         return None, pool, []
-    if str(getattr(base_args, "target_selection_order", "random")) == "risk_aware":
+    order = str(getattr(base_args, "target_selection_order", "random"))
+    if order == "cycle":
+        return candidates[0], pool, candidates
+    if order == "risk_aware":
         priority = {
             # Remove the pen first so it no longer blocks nearby small long-axis
             # sources.  Place lvmukuai early: it needs an upright gripper relation

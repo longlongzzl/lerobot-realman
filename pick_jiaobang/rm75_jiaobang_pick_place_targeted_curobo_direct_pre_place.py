@@ -777,6 +777,13 @@ def build_arg_parser():
         help="Use the current risk-aware cycle target priority order.",
     )
     parser.add_argument(
+        "--cycle-order-targets",
+        dest="target_selection_order",
+        action="store_const",
+        const="cycle",
+        help="Follow --cycle-object-names order exactly, skipping only placed or failed targets.",
+    )
+    parser.add_argument(
         "--cycle-target-random-seed",
         type=int,
         default=None,
@@ -1292,6 +1299,34 @@ def build_arg_parser():
             "Maximum seconds to wait at the next cycle for a reserved background plan to finish "
             "before falling back to live planning. The default waits for the already-running "
             "background plan instead of duplicating the same target in the foreground."
+        ),
+    )
+    parser.add_argument(
+        "--next-cycle-prefetch-low-priority",
+        dest="next_cycle_prefetch_low_priority",
+        action="store_true",
+        default=False,
+        help="Run the background next-cycle prefetch worker with lower OS scheduling priority.",
+    )
+    parser.add_argument(
+        "--no-next-cycle-prefetch-low-priority",
+        dest="next_cycle_prefetch_low_priority",
+        action="store_false",
+        help="Do not lower OS scheduling priority for the background next-cycle prefetch worker.",
+    )
+    parser.add_argument(
+        "--next-cycle-prefetch-nice",
+        type=int,
+        default=8,
+        help="Linux nice value applied to the background next-cycle prefetch worker thread when low-priority mode is enabled.",
+    )
+    parser.add_argument(
+        "--next-cycle-prefetch-sched-policy",
+        choices=["none", "batch", "idle"],
+        default="batch",
+        help=(
+            "Linux scheduler policy for the background prefetch worker. 'batch' is a good default; "
+            "'idle' reduces interference more but may finish too late."
         ),
     )
     parser.add_argument(
@@ -11336,12 +11371,14 @@ def _fast_chain_preselect_grasp_place_pair(
         prof["status"] = "Success"
         prof["selected_grasp_label"] = str(selected_grasp.get("label", ""))
         prof["selected_place_label"] = str(selected_place.get("label", ""))
+        prof["selected_place_slot_name"] = str(selected_place.get("slot_name", ""))
         prof["path_score"] = float(best["score"])
         prof["winner_count"] = len(top_pair_records)
         prof["grasp_winner_count"] = len(top_pair_grasps)
         print(
             "[winner_chain] IK preselected grasp-place pair: "
             f"grasp={selected_grasp.get('label')} place={selected_place.get('label')} "
+            f"slot={selected_place.get('slot_name', '')} "
             f"score={float(best['score']):.3f}; top_pairs={len(top_pair_records)}, "
             f"top_grasps={len(top_pair_grasps)}"
         )
@@ -13206,29 +13243,17 @@ def run_targeted_place_episode_curobo_direct(
         and preselected_grasp is None
         and prefetched_plan is None
     ):
+        fallback_winners = min(
+            max(2, expanded_direct_grasp_max_winners, requested_direct_grasp_max_winners),
+            len(all_grasp_candidates_for_fallback),
+        )
         print(
-            "[FAIL] pair-first IK preselect found no complete grasp/place pair; "
-            "legacy candidate-stage MotionGen fallback is disabled"
+            "[winner_chain] pair-first IK preselect found no complete grasp/place pair; "
+            f"falling back to expanded candidate-stage MotionGen winners={fallback_winners}"
         )
-        selected_pose = (
-            grasp_candidates[0].get("pregrasp_pose", grasp_candidates[0]["pose"])
-            if grasp_candidates
-            else demo.build_topdown_grasp_pose()
-        )
-        targeted.base.inspect_failed_pose(
-            demo,
-            bridge_mod,
-            "pair_first_ik_preselect",
-            args,
-            pose=selected_pose,
-            gripper_closed=False,
-            candidate_poses=[
-                item.get("pregrasp_pose", item.get("pose"))
-                for item in list(grasp_candidates or [])
-                if item.get("pregrasp_pose", item.get("pose")) is not None
-            ],
-        )
-        return False
+        initial_grasp_candidates = list(all_grasp_candidates_for_fallback)
+        direct_grasp_max_winners = int(fallback_winners)
+        targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
     if preselected_grasp is not None:
         selected_label = str(preselected_grasp.get("label", ""))
         preselected_pair_grasps = [
@@ -13358,10 +13383,26 @@ def run_targeted_place_episode_curobo_direct(
         pair_first_chain_attempt = any(bool(item.get("pair_first_ik_only", False)) for item in grasp_successes)
         if not joint_chains:
             fallback_grasp_successes = []
-            if pair_first_chain_attempt:
+            if pair_first_chain_attempt and len(all_grasp_candidates_for_fallback) > 1:
+                fallback_winners = min(
+                    max(2, expanded_direct_grasp_max_winners, requested_direct_grasp_max_winners),
+                    len(all_grasp_candidates_for_fallback),
+                )
                 print(
                     "[joint_search] pair-first top pair produced no complete chain; "
-                    "legacy expanded-grasp MotionGen fallback is disabled"
+                    f"trying discarded grasp candidates with expanded winners={fallback_winners}"
+                )
+                targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
+                fallback_grasp_successes = _evaluate_two_step_grasp_candidates(
+                    planner,
+                    demo,
+                    args,
+                    grasp_start_q,
+                    all_grasp_candidates_for_fallback,
+                    label="two_step_grasp_pair_first_fallback",
+                    max_winners=fallback_winners,
+                    include_active_object=True,
+                    disabled_world_collision_links=direct_grasp_disabled_links,
                 )
             elif direct_grasp_max_winners == 1 and len(grasp_candidates) > 1:
                 fallback_winners = min(
@@ -13384,6 +13425,7 @@ def run_targeted_place_episode_curobo_direct(
                     include_active_object=True,
                     disabled_world_collision_links=direct_grasp_disabled_links,
                 )
+            if fallback_grasp_successes:
                 merged_by_label = {str(item.get("label", "")): item for item in grasp_successes}
                 for item in list(fallback_grasp_successes or []):
                     merged_by_label[str(item.get("label", ""))] = item
@@ -15441,6 +15483,42 @@ def _build_prefetch_capture_result(
     }
 
 
+def _apply_next_cycle_prefetch_worker_priority(args) -> None:
+    if not bool(getattr(args, "next_cycle_prefetch_low_priority", True)):
+        return
+    try:
+        tid = int(threading.get_native_id())
+    except Exception:
+        tid = 0
+    applied = []
+    nice_value = int(np.clip(int(getattr(args, "next_cycle_prefetch_nice", 8) or 0), 0, 19))
+    if tid > 0 and nice_value > 0:
+        try:
+            current = int(os.getpriority(os.PRIO_PROCESS, tid))
+            target = int(np.clip(max(current, nice_value), current, 19))
+            if target != current:
+                os.setpriority(os.PRIO_PROCESS, tid, target)
+            applied.append(f"nice={target}")
+        except Exception as exc:
+            applied.append(f"nice_failed={type(exc).__name__}")
+
+    policy_name = str(getattr(args, "next_cycle_prefetch_sched_policy", "batch") or "batch").lower()
+    policy = None
+    if policy_name == "batch":
+        policy = getattr(os, "SCHED_BATCH", None)
+    elif policy_name == "idle":
+        policy = getattr(os, "SCHED_IDLE", None)
+    if tid > 0 and policy is not None:
+        try:
+            os.sched_setscheduler(tid, int(policy), os.sched_param(0))
+            applied.append(f"sched={policy_name}")
+        except Exception as exc:
+            applied.append(f"sched_{policy_name}_failed={type(exc).__name__}")
+
+    if applied:
+        print(f"[prefetch] worker low-priority scheduling: {', '.join(applied)}")
+
+
 class _NextCyclePlanPrefetchManager:
     def __init__(self, create_demo_func, bridge_mod, planner_mod, base_args, cycle_object_sequence):
         self.create_demo_func = create_demo_func
@@ -15652,6 +15730,7 @@ class _NextCyclePlanPrefetchManager:
         error_text = None
         started = time.perf_counter()
         try:
+            _apply_next_cycle_prefetch_worker_priority(self.base_args)
             with _profile_record_context(
                 is_prefetch=True,
                 prefetch_cycle_idx=int(next_cycle_idx),

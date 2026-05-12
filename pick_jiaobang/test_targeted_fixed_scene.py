@@ -15,7 +15,7 @@ from datetime import datetime
 from place_rules import list_place_rule_sources
 
 DEFAULT_SCENE = Path(__file__).resolve().parent / "test_scenes" / "gluestick_desk_regression.json"
-DEFAULT_ENTRYPOINT = Path(__file__).resolve().parent / "rm75_jiaobang_pick_place_targeted_curobo_direct_pre_place.py"
+DEFAULT_ENTRYPOINT = Path(__file__).resolve().parent / "rm75_jiaobang_pick_place_targeted_curobo_direct_pre_place_sam6d.py"
 DEFAULT_CHILD_PYTHON = Path(sys.executable).resolve()
 RESULT_PREFIX = "TEST_RESULT_JSON:"
 SUMMARY_PREFIX = "TEST_SUMMARY_JSON:"

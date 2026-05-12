@@ -5368,6 +5368,59 @@ def capture_failure_render_image(demo, args, *, camera_pose=None):
     return None
 
 
+def _actor_pose_pq(actor):
+    try:
+        pose = actor.pose
+    except Exception:
+        try:
+            pose = actor.get_pose()
+        except Exception:
+            return None
+    try:
+        return flatten_np(pose.p)[:3].copy(), flatten_np(pose.q)[:4].copy()
+    except Exception:
+        return None
+
+
+def _set_actor_pose_pq(actor, p, q) -> bool:
+    try:
+        actor.set_pose(
+            Pose.create_from_pq(
+                p=np.asarray(p, dtype=np.float32).reshape(3),
+                q=np.asarray(q, dtype=np.float32).reshape(4),
+            )
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _hide_virtual_top_wall_for_failure_render(demo) -> list[tuple[object, np.ndarray, np.ndarray]]:
+    env = getattr(demo, "env", None)
+    if env is None:
+        return []
+    hidden = []
+    for actor in list(getattr(env.unwrapped, "_scene_obstacle_actors", []) or []):
+        name = str(getattr(actor, "name", "") or "")
+        if "virtual_top_wall" not in name:
+            continue
+        pose_pq = _actor_pose_pq(actor)
+        if pose_pq is None:
+            continue
+        p, q = pose_pq
+        hidden_p = p.copy()
+        hidden_p[0] += 100.0
+        hidden_p[2] += 100.0
+        if _set_actor_pose_pq(actor, hidden_p, q):
+            hidden.append((actor, p, q))
+    return hidden
+
+
+def _restore_hidden_failure_render_actors(hidden) -> None:
+    for actor, p, q in list(hidden or []):
+        _set_actor_pose_pq(actor, p, q)
+
+
 def _failure_render_output_path(args, label: str, *, suffix: str = "") -> Path:
     output_dir = Path(getattr(args, "failure_render_dir", Path(__file__).resolve().parent / "failure_renders")).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -5483,10 +5536,14 @@ def save_failure_place_candidate_render_image(demo, args, label: str, *, pose=No
         return None
     camera_poses = _failure_place_camera_poses(points)
     labeled_images: list[tuple[str, np.ndarray]] = []
-    for view_name, camera_pose in camera_poses:
-        image = capture_failure_render_image(demo, args, camera_pose=camera_pose)
-        if image is not None:
-            labeled_images.append((f"{label} | {view_name}", image))
+    hidden_actors = _hide_virtual_top_wall_for_failure_render(demo)
+    try:
+        for view_name, camera_pose in camera_poses:
+            image = capture_failure_render_image(demo, args, camera_pose=camera_pose)
+            if image is not None:
+                labeled_images.append((f"{label} | {view_name}", image))
+    finally:
+        _restore_hidden_failure_render_actors(hidden_actors)
     tiled = _tile_failure_render_images(labeled_images)
     if tiled is None:
         print(f"[inspect] failed to capture place-candidate render image for {label}")
