@@ -8,6 +8,7 @@ import importlib.util
 import json
 import socket
 import sys
+import threading
 import time
 import types
 from dataclasses import dataclass
@@ -35,6 +36,68 @@ DEFAULT_EXTRA_MANISKILL_PACKAGE_ROOT = "/home/zhangzhao/anaconda3/envs/realman/l
 DEFAULT_CAMERA_EXTRINSIC = "/home/zhangzhao/Desktop/lerobot-sim2real/results/realman/realman_home/base_camera/camera_extrinsic_opencv.npy"
 DEFAULT_MESH_FILE = "/home/zhangzhao/anaconda3/envs/realman/lib/python3.11/site-packages/mani_skill/envs/tasks/digital_twins/so101_arm_with_two_cameras/jiaobang.glb"
 DEFAULT_MESH_SCALE = 0.1
+
+
+def patch_maniskill_compute_angle_between_device_mismatch() -> None:
+    """Work around mixed ManiSkill package tensors from realman/foundationpose envs.
+
+    The RM75 task is loaded from the realman environment package while common
+    utilities are imported from the active foundationpose310 environment.  During
+    reset/evaluate, RM75Robot.is_grasping can pass CPU link directions
+    together with CUDA contact forces into common.compute_angle_between().
+    """
+    try:
+        import torch
+        from mani_skill.utils import common
+    except Exception:
+        return
+    original = getattr(common, "compute_angle_between", None)
+    if callable(original) and not getattr(original, "_rm75_device_patch", False):
+        def compute_angle_between_same_device(x1, x2):
+            if hasattr(x1, "device") and hasattr(x2, "device") and x1.device != x2.device:
+                target_device = x2.device if getattr(x2, "is_cuda", False) else x1.device
+                x1 = x1.to(device=target_device)
+                x2 = x2.to(device=target_device)
+            if hasattr(x1, "dtype") and hasattr(x2, "dtype") and x1.dtype != x2.dtype:
+                if x1.dtype in (torch.float16, torch.float32, torch.float64):
+                    x2 = x2.to(dtype=x1.dtype)
+            return original(x1, x2)
+
+        compute_angle_between_same_device._rm75_device_patch = True
+        common.compute_angle_between = compute_angle_between_same_device
+
+    def is_grasping_same_device(self, object, min_force=0.5, max_angle=95):
+        l_contact_forces = self.scene.get_pairwise_contact_forces(self.finger1_link, object)
+        r_contact_forces = self.scene.get_pairwise_contact_forces(self.finger2_link, object)
+        target_device = l_contact_forces.device
+        r_contact_forces = r_contact_forces.to(device=target_device)
+        lforce = torch.linalg.norm(l_contact_forces, axis=1)
+        rforce = torch.linalg.norm(r_contact_forces, axis=1)
+
+        ldirection = self.finger1_link.pose.to_transformation_matrix()[..., :3, 1].to(device=target_device)
+        rdirection = (-self.finger2_link.pose.to_transformation_matrix()[..., :3, 1]).to(device=target_device)
+        langle = common.compute_angle_between(ldirection, l_contact_forces)
+        rangle = common.compute_angle_between(rdirection, r_contact_forces)
+
+        lflag = torch.logical_and(lforce >= min_force, torch.rad2deg(langle) <= max_angle)
+        rflag = torch.logical_and(rforce >= min_force, torch.rad2deg(rangle) <= max_angle)
+        # The RM75 task's evaluate() combines this with object placement flags
+        # that are CPU tensors in the mixed realman/foundationpose package setup.
+        return torch.logical_and(lflag, rflag).to(device="cpu")
+
+    is_grasping_same_device._rm75_device_patch = True
+    try:
+        import importlib
+        realman_mod = importlib.import_module("mani_skill.agents.robots.realman.realman_with_gripper")
+    except Exception:
+        return
+    for cls in vars(realman_mod).values():
+        if not isinstance(cls, type):
+            continue
+        original_is_grasping = getattr(cls, "is_grasping", None)
+        if not callable(original_is_grasping) or getattr(original_is_grasping, "_rm75_device_patch", False):
+            continue
+        cls.is_grasping = is_grasping_same_device
 
 
 @dataclass
@@ -1325,6 +1388,25 @@ def build_arg_parser():
         action="store_false",
         help="Disable continuous waypoint-path streaming and fall back to per-waypoint execution.",
     )
+    parser.add_argument(
+        "--real-execution-thread",
+        dest="real_execution_thread",
+        action="store_true",
+        default=True,
+        help="Send real robot arm commands from a dedicated timing thread so optional rendering cannot block the control loop. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-real-execution-thread",
+        dest="real_execution_thread",
+        action="store_false",
+        help="Send real robot arm commands on the main thread.",
+    )
+    parser.add_argument(
+        "--real-shadow-render-hz",
+        type=float,
+        default=0.0,
+        help="Optional low-rate simulation shadow rendering during real execution. Default 0 disables per-motion rendering so real command timing is not affected by rendering.",
+    )
     parser.add_argument("--joint7-max-turns", type=float, default=1.0, help="Reject planned paths whose joint7 travels more than this many full turns in total or excursion from the start configuration. Set <=0 to disable.")
     parser.add_argument(
         "--rrt-attempt-count",
@@ -1347,6 +1429,24 @@ def build_arg_parser():
     )
     parser.add_argument("--real-gripper-open", type=float, default=0.0, help="Real gripper absolute command in [0, 0.91]; 0 means fully open.")
     parser.add_argument("--real-gripper-close", type=float, default=0.91, help="Real gripper absolute command in [0, 0.91]; 0.91 means fully closed.")
+    parser.add_argument(
+        "--real-gripper-command-repeats",
+        type=int,
+        default=2,
+        help="How many identical gripper setpoint commands to send for each open/close action. Lower values reduce gripper-stage dwell.",
+    )
+    parser.add_argument(
+        "--real-gripper-command-hz",
+        type=float,
+        default=10.0,
+        help="Frequency for repeated gripper setpoint commands. Effective blocking time is repeats / hz.",
+    )
+    parser.add_argument(
+        "--sim-gripper-sync-min-steps",
+        type=int,
+        default=8,
+        help="Minimum simulated steps used when syncing the visual gripper state after real open/close. Lower values reduce pauses around gripper actions.",
+    )
     parser.add_argument(
         "--real-gripper-blocked-margin",
         type=float,
@@ -1584,6 +1684,11 @@ class RealmanJointExecutor:
         self._ensure_command_socket()
         self.use_degrees = bool(getattr(self.real_robot.config, "use_degrees", False))
         self.arm_keys, self.has_gripper = self._infer_action_keys()
+        self.use_execution_thread = bool(getattr(args, "real_execution_thread", True))
+        self.shadow_render_hz = float(max(getattr(args, "real_shadow_render_hz", 0.0) or 0.0, 0.0))
+        self.gripper_command_repeats = int(max(getattr(args, "real_gripper_command_repeats", 2), 1))
+        self.gripper_command_hz = float(max(getattr(args, "real_gripper_command_hz", 10.0), 1e-3))
+        self._io_lock = threading.Lock()
         print(f"Connected real robot at {self.real_robot.config.ip}. Arm keys: {self.arm_keys}")
 
     def _ensure_command_socket(self):
@@ -1605,7 +1710,8 @@ class RealmanJointExecutor:
         return arm_keys, ("gripper.pos" in ordered)
 
     def get_arm_qpos(self) -> np.ndarray:
-        obs = self.real_robot.get_observation()
+        with self._io_lock:
+            obs = self.real_robot.get_observation()
         q = np.asarray([float(obs[k]) for k in self.arm_keys], dtype=np.float32)
         if self.use_degrees:
             q = np.deg2rad(q)
@@ -1615,7 +1721,8 @@ class RealmanJointExecutor:
         if not self.has_gripper:
             return None
         try:
-            obs = self.real_robot.get_observation()
+            with self._io_lock:
+                obs = self.real_robot.get_observation()
             return float(obs["gripper.pos"])
         except Exception:
             return None
@@ -1631,7 +1738,8 @@ class RealmanJointExecutor:
             action["gripper.pos"] = float(np.clip(gripper_pos, 0.0, 0.91))
         if not action:
             return {}
-        return self.real_robot.send_action(action)
+        with self._io_lock:
+            return self.real_robot.send_action(action)
 
     def reset_robot(self, gripper_pos: float | None = None):
         arm = getattr(self.real_robot, "arm", None)
@@ -1652,9 +1760,11 @@ class RealmanJointExecutor:
             self.set_gripper(gripper_pos, repeats=2, hz=5.0)
         print("[real reset] moved RM75 to the hardware reset pose")
 
-    def set_gripper(self, gripper_pos: float, repeats: int = 3, hz: float = 5.0):
-        period = 1.0 / max(hz, 1e-3)
-        for _ in range(max(repeats, 1)):
+    def set_gripper(self, gripper_pos: float, repeats: int | None = None, hz: float | None = None):
+        use_repeats = self.gripper_command_repeats if repeats is None else int(repeats)
+        use_hz = self.gripper_command_hz if hz is None else float(hz)
+        period = 1.0 / max(use_hz, 1e-3)
+        for _ in range(max(use_repeats, 1)):
             self.send_action(gripper_pos=gripper_pos)
             time.sleep(period)
 
@@ -1678,28 +1788,30 @@ class RealmanJointExecutor:
         print(f"[real {label}] execute_linear num_steps={num_steps}")
         # Skip alpha=0 so each streamed segment actually advances toward the
         # target instead of repeatedly resending the current joint state.
+        q_cmds = []
         for alpha in np.linspace(0.0, 1.0, num_steps + 1, dtype=np.float32)[1:]:
             q_cmd = (1.0 - alpha) * q_start + alpha * q_target_short
-            self.send_action(arm_q=q_cmd, gripper_pos=gripper_pos)
-            if callable(shadow_callback):
-                try:
-                    shadow_callback(np.asarray(q_cmd, dtype=np.float32))
-                except Exception:
-                    pass
-            time.sleep(period)
-        for _ in range(max(hold_steps, 0)):
-            self.send_action(arm_q=q_target_short, gripper_pos=gripper_pos)
-            if callable(shadow_callback):
-                try:
-                    shadow_callback(np.asarray(q_target_short, dtype=np.float32))
-                except Exception:
-                    pass
-            time.sleep(period)
-        return q_target_short.astype(np.float32)
+            q_cmds.append(np.asarray(q_cmd, dtype=np.float32))
+        return self._execute_command_stream(
+            q_cmds,
+            q_target_short,
+            gripper_pos=gripper_pos,
+            period=period,
+            hold_steps=hold_steps,
+            shadow_callback=shadow_callback,
+        )
 
-    def _build_streamed_waypoint_commands(self, q_start: np.ndarray, q_path, max_delta_per_step: float):
+    def _build_streamed_waypoint_commands(
+        self,
+        q_start: np.ndarray,
+        q_path,
+        max_delta_per_step: float,
+        *,
+        return_waypoint_indices: bool = False,
+    ):
         q_prev = np.asarray(q_start, dtype=np.float32).reshape(-1)[: len(self.arm_keys)]
         streamed_cmds = []
+        waypoint_end_cmd_indices = []
         for q_target in list(q_path or []):
             q_target = np.asarray(q_target, dtype=np.float32).reshape(-1)[: len(self.arm_keys)]
             q_delta = (q_target - q_prev + np.pi) % (2 * np.pi) - np.pi
@@ -1709,8 +1821,117 @@ class RealmanJointExecutor:
             for alpha in np.linspace(0.0, 1.0, num_steps + 1, dtype=np.float32)[1:]:
                 q_cmd = (1.0 - alpha) * q_prev + alpha * q_target_short
                 streamed_cmds.append(np.asarray(q_cmd, dtype=np.float32))
+            waypoint_end_cmd_indices.append(len(streamed_cmds) - 1)
             q_prev = q_target_short.astype(np.float32)
+        if return_waypoint_indices:
+            return streamed_cmds, q_prev.astype(np.float32), waypoint_end_cmd_indices
         return streamed_cmds, q_prev.astype(np.float32)
+
+    def _execute_command_stream(
+        self,
+        q_cmds,
+        q_sent: np.ndarray,
+        *,
+        gripper_pos: float | None,
+        period: float,
+        hold_steps: int,
+        shadow_callback=None,
+        step_callback=None,
+        stream_state: dict | None = None,
+    ):
+        q_cmds = [np.asarray(q, dtype=np.float32).reshape(-1)[: len(self.arm_keys)] for q in list(q_cmds or [])]
+        q_sent = np.asarray(q_sent, dtype=np.float32).reshape(-1)[: len(self.arm_keys)]
+        hold_steps = max(int(hold_steps), 0)
+        shadow_hz = float(max(self.shadow_render_hz, 0.0))
+        stop_event = threading.Event()
+        last_q = {"value": q_sent.astype(np.float32), "sent_count": 0}
+
+        def _after_send(cmd_idx: int, q_cmd: np.ndarray) -> None:
+            last_q["value"] = np.asarray(q_cmd, dtype=np.float32)
+            last_q["sent_count"] = int(cmd_idx) + 1
+            if callable(step_callback):
+                step_callback(int(cmd_idx), np.asarray(q_cmd, dtype=np.float32), stop_event)
+
+        if not self.use_execution_thread:
+            for cmd_idx, q_cmd in enumerate(q_cmds):
+                if stop_event.is_set():
+                    break
+                self.send_action(arm_q=q_cmd, gripper_pos=gripper_pos)
+                _after_send(cmd_idx, q_cmd)
+                if callable(shadow_callback) and shadow_hz > 0.0:
+                    shadow_callback(np.asarray(q_cmd, dtype=np.float32))
+                if stop_event.is_set():
+                    break
+                time.sleep(period)
+            if not stop_event.is_set():
+                for _ in range(hold_steps):
+                    self.send_action(arm_q=q_sent, gripper_pos=gripper_pos)
+                    last_q["value"] = q_sent.astype(np.float32)
+                    if callable(shadow_callback) and shadow_hz > 0.0:
+                        shadow_callback(np.asarray(q_sent, dtype=np.float32))
+                    time.sleep(period)
+            if stream_state is not None:
+                stream_state["interrupted"] = bool(stop_event.is_set())
+                stream_state["sent_count"] = int(last_q["sent_count"])
+                stream_state["last_q"] = np.asarray(last_q["value"], dtype=np.float32).copy()
+            return np.asarray(last_q["value"], dtype=np.float32)
+
+        latest_lock = threading.Lock()
+        latest_q = {"value": None}
+        errors: list[BaseException] = []
+
+        def _worker():
+            try:
+                for cmd_idx, q_cmd in enumerate(q_cmds):
+                    if stop_event.is_set():
+                        break
+                    self.send_action(arm_q=q_cmd, gripper_pos=gripper_pos)
+                    _after_send(cmd_idx, q_cmd)
+                    with latest_lock:
+                        latest_q["value"] = np.asarray(q_cmd, dtype=np.float32)
+                    if stop_event.is_set():
+                        break
+                    time.sleep(period)
+                if stop_event.is_set():
+                    return
+                for _ in range(hold_steps):
+                    if stop_event.is_set():
+                        break
+                    self.send_action(arm_q=q_sent, gripper_pos=gripper_pos)
+                    last_q["value"] = q_sent.astype(np.float32)
+                    with latest_lock:
+                        latest_q["value"] = np.asarray(q_sent, dtype=np.float32)
+                    time.sleep(period)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=_worker, name="realman-command-stream", daemon=False)
+        worker.start()
+        render_period = 1.0 / shadow_hz if shadow_hz > 0.0 else None
+        next_render_t = time.perf_counter()
+        while worker.is_alive():
+            worker.join(timeout=0.01)
+            if not callable(shadow_callback) or render_period is None:
+                continue
+            now = time.perf_counter()
+            if now < next_render_t:
+                continue
+            with latest_lock:
+                q_shadow = latest_q["value"]
+            if q_shadow is not None:
+                try:
+                    shadow_callback(np.asarray(q_shadow, dtype=np.float32))
+                except Exception:
+                    pass
+            next_render_t = now + render_period
+        worker.join()
+        if errors:
+            raise errors[0]
+        if stream_state is not None:
+            stream_state["interrupted"] = bool(stop_event.is_set())
+            stream_state["sent_count"] = int(last_q["sent_count"])
+            stream_state["last_q"] = np.asarray(last_q["value"], dtype=np.float32).copy()
+        return np.asarray(last_q["value"], dtype=np.float32)
 
     def move_waypoint_path(
         self,
@@ -1721,34 +1942,51 @@ class RealmanJointExecutor:
         hold_steps: int,
         label: str,
         shadow_callback=None,
+        waypoint_callbacks: dict[int, object] | None = None,
+        stream_state: dict | None = None,
     ):
         q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[: len(self.arm_keys)] for q in q_path]
         if not q_path:
             return self.get_arm_qpos().astype(np.float32)
         q_start = self.get_arm_qpos().astype(np.float32)
-        q_cmds, q_sent = self._build_streamed_waypoint_commands(q_start, q_path, max_delta_per_step)
+        q_cmds, q_sent, waypoint_end_cmd_indices = self._build_streamed_waypoint_commands(
+            q_start,
+            q_path,
+            max_delta_per_step,
+            return_waypoint_indices=True,
+        )
         period = 1.0 / max(hz, 1e-3)
         print(
             f"[real {label}] execute_stream "
             f"path_waypoints={len(q_path)} num_steps={len(q_cmds)}"
         )
-        for q_cmd in q_cmds:
-            self.send_action(arm_q=q_cmd, gripper_pos=gripper_pos)
-            if callable(shadow_callback):
-                try:
-                    shadow_callback(np.asarray(q_cmd, dtype=np.float32))
-                except Exception:
-                    pass
-            time.sleep(period)
-        for _ in range(max(hold_steps, 0)):
-            self.send_action(arm_q=q_sent, gripper_pos=gripper_pos)
-            if callable(shadow_callback):
-                try:
-                    shadow_callback(np.asarray(q_sent, dtype=np.float32))
-                except Exception:
-                    pass
-            time.sleep(period)
-        return np.asarray(q_sent, dtype=np.float32)
+        command_callbacks: dict[int, object] = {}
+        for waypoint_idx, callback in dict(waypoint_callbacks or {}).items():
+            try:
+                idx = int(waypoint_idx)
+            except Exception:
+                continue
+            if idx < 0:
+                idx += len(waypoint_end_cmd_indices)
+            if idx < 0 or idx >= len(waypoint_end_cmd_indices):
+                continue
+            command_callbacks[int(waypoint_end_cmd_indices[idx])] = callback
+
+        def _step_callback(cmd_idx: int, q_cmd: np.ndarray, stop_event: threading.Event) -> None:
+            callback = command_callbacks.get(int(cmd_idx))
+            if callable(callback):
+                callback(np.asarray(q_cmd, dtype=np.float32), stop_event)
+
+        return self._execute_command_stream(
+            q_cmds,
+            q_sent,
+            gripper_pos=gripper_pos,
+            period=period,
+            hold_steps=hold_steps,
+            shadow_callback=shadow_callback,
+            step_callback=_step_callback if command_callbacks else None,
+            stream_state=stream_state,
+        )
 
     def close(self):
         try:
@@ -2448,7 +2686,8 @@ def real_gripper_blocked_after_close(real_exec: RealmanJointExecutor | None, clo
 
 def sync_demo_gripper_state(demo, closed: bool, steps: int = 3):
     sim_gripper_value = 1.0 if closed else -1.0
-    min_steps = 20
+    demo_args = getattr(demo, "args", None)
+    min_steps = int(max(getattr(demo_args, "sim_gripper_sync_min_steps", 20), 0))
     total_steps = max(int(steps), min_steps)
     try:
         demo.hold_current_and_set_gripper(sim_gripper_value, steps=total_steps)
@@ -2509,10 +2748,10 @@ def confirm_simple_action(label: str, args, bridge_mod=None, env=None, repeats: 
     if bool(getattr(args, "_skip_remaining_step_confirms_in_object", False)):
         print(f"[confirm] auto-approved {label} because single-confirm-per-object is active")
         return True
-    if bridge_mod is not None and env is not None and getattr(args, "render_mode", None) == "human":
-        bridge_mod.render_preview(env, repeats=repeats)
     if args.auto_execute:
         return True
+    if bridge_mod is not None and env is not None and getattr(args, "render_mode", None) == "human":
+        bridge_mod.render_preview(env, repeats=repeats)
     if bridge_mod is not None:
         answer = bridge_mod.prompt_with_live_render(
             f"[confirm] {label}. Press Enter to execute, or type q then Enter to abort: ",
@@ -3830,6 +4069,17 @@ def _validate_real_waypoint_segment(demo, q_start: np.ndarray, q_goal: np.ndarra
     return False
 
 
+def _real_shadow_render_enabled(args) -> bool:
+    return float(max(getattr(args, "real_shadow_render_hz", 0.0) or 0.0, 0.0)) > 0.0
+
+
+def _sync_or_render_real_shadow_step(demo, bridge_mod, args, q_shadow: np.ndarray):
+    if _real_shadow_render_enabled(args):
+        _render_real_shadow_step(demo, bridge_mod, args, q_shadow)
+    else:
+        sync_demo_arm_qpos(demo, q_shadow)
+
+
 def _render_real_shadow_step(demo, bridge_mod, args, q_shadow: np.ndarray):
     sync_demo_arm_qpos(demo, q_shadow)
     scene = None
@@ -3887,9 +4137,11 @@ def execute_real_waypoint_path_with_shadow(
             hz=args.real_control_hz,
             hold_steps=hold_steps,
             label=label,
-            shadow_callback=lambda q_cmd: _render_real_shadow_step(demo, bridge_mod, args, q_cmd),
+            shadow_callback=(lambda q_cmd: _render_real_shadow_step(demo, bridge_mod, args, q_cmd))
+            if _real_shadow_render_enabled(args)
+            else None,
         )
-        _render_real_shadow_step(demo, bridge_mod, args, q_sent)
+        _sync_or_render_real_shadow_step(demo, bridge_mod, args, q_sent)
         return True, q_sent
     for idx, q_target in enumerate(q_path):
         stage_label = f"{label}_wp{idx}"
@@ -3910,9 +4162,11 @@ def execute_real_waypoint_path_with_shadow(
             hz=args.real_control_hz,
             hold_steps=hold_steps,
             label=stage_label,
-            shadow_callback=lambda q_cmd: _render_real_shadow_step(demo, bridge_mod, args, q_cmd),
+            shadow_callback=(lambda q_cmd: _render_real_shadow_step(demo, bridge_mod, args, q_cmd))
+            if _real_shadow_render_enabled(args)
+            else None,
         )
-        _render_real_shadow_step(demo, bridge_mod, args, q_sent)
+        _sync_or_render_real_shadow_step(demo, bridge_mod, args, q_sent)
         q_prev = np.asarray(q_sent, dtype=np.float32).reshape(-1)[:7]
     return True, q_sent
 
@@ -5021,7 +5275,9 @@ def maybe_refine_foundationpose_scene_after_render(demo, bridge_mod, args) -> bo
 
 
 def create_demo(args, bridge_mod, planner_mod, scene_capture_cache=None):
+    patch_maniskill_compute_angle_between_device_mismatch()
     args.env_id = bridge_mod.ensure_pick_jiaobang_env_registered(args.env_id, args.extra_maniskill_package_root)
+    patch_maniskill_compute_angle_between_device_mismatch()
     fp_rt, T_base_cam, target_pose_source, scene_obstacles = capture_or_reuse_foundationpose_scene(
         args,
         bridge_mod,
@@ -5147,9 +5403,11 @@ def execute_stage(demo, bridge_mod, real_exec: RealmanJointExecutor | None, labe
             hz=args.real_control_hz,
             hold_steps=args.real_hold_steps,
             label=label,
-            shadow_callback=lambda q_cmd: _render_real_shadow_step(demo, bridge_mod, args, q_cmd),
+            shadow_callback=(lambda q_cmd: _render_real_shadow_step(demo, bridge_mod, args, q_cmd))
+            if _real_shadow_render_enabled(args)
+            else None,
         )
-        _render_real_shadow_step(demo, bridge_mod, args, q_sent)
+        _sync_or_render_real_shadow_step(demo, bridge_mod, args, q_sent)
     else:
         print(f"[dry-run] skipped real execution for {label}")
         sync_demo_arm_qpos(demo, q_target)

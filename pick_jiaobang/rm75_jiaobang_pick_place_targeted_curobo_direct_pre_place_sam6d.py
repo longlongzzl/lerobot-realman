@@ -83,6 +83,27 @@ def _selected_obstacle_names(args, target_name: str | None) -> list[str]:
     return [name for name in _unique_normalized_names(selected) if name != target_name]
 
 
+def _required_sam6d_scene_names_for_current_task(args, target_name: str | None) -> list[str]:
+    required = []
+    target_name = _normalize_name(target_name)
+    if target_name is not None:
+        required.append(target_name)
+    # The direct cycle runner mirrors tracked obstacles into
+    # selected_obstacle_object_names/required_scene_object_names.  For SAM6D
+    # strict mode those are optional collision obstacles, not hard task
+    # dependencies.  Only the current target and the current place-rule
+    # destination are required here; e.g. lvmukuai requires desk, while bi
+    # requires bitong.
+    try:
+        rule = direct.targeted.get_place_rule(target_name)
+        rule_target = _normalize_name(getattr(rule, "target_object_name", None))
+        if rule_target is not None:
+            required.append(rule_target)
+    except Exception:
+        pass
+    return _unique_normalized_names(required)
+
+
 def _copy_args_for_cache(args):
     copier = getattr(direct.targeted.base, "_copy_scene_cache_namespace", None)
     if callable(copier):
@@ -671,6 +692,8 @@ def capture_or_reuse_sam6d_scene(args, bridge_mod, scene_capture_cache=None):
         object_names.insert(0, target_name)
     object_names = _unique_normalized_names(object_names)
     selected_obstacles = _selected_obstacle_names(args, target_name)
+    required_names = _required_sam6d_scene_names_for_current_task(args, target_name)
+    required_obstacles = [name for name in required_names if name != target_name]
     cache_key = _sam6d_cache_key(args, object_names)
 
     if (
@@ -679,7 +702,7 @@ def capture_or_reuse_sam6d_scene(args, bridge_mod, scene_capture_cache=None):
         and scene_capture_cache.get("key") == cache_key
     ):
         cached_objects = dict(scene_capture_cache.get("objects", {}) or {})
-        if target_name in cached_objects and all(name in cached_objects for name in selected_obstacles):
+        if target_name in cached_objects and all(name in cached_objects for name in required_obstacles):
             print("[sam6d grasp] reusing cached SAM6D scene")
             return (
                 None,
@@ -695,8 +718,7 @@ def capture_or_reuse_sam6d_scene(args, bridge_mod, scene_capture_cache=None):
         cached_objects = {}
         if isinstance(scene_capture_cache, dict):
             cached_objects = dict(scene_capture_cache.get("objects", {}) or {})
-        required = [name for name in [target_name, *selected_obstacles] if name is not None]
-        missing_required = [name for name in required if name not in cached_objects]
+        missing_required = [name for name in required_names if name not in cached_objects]
         raise RuntimeError(
             "SAM6D prefetch scene cache miss; refusing to run SAM3/SAM6D recapture in the background. "
             f"target={target_name}, missing_required={missing_required}, cached={sorted(cached_objects.keys())}"
@@ -708,10 +730,11 @@ def capture_or_reuse_sam6d_scene(args, bridge_mod, scene_capture_cache=None):
             summary, result_path = _run_sam6d_provider(args, object_names)
     results = _results_by_name(summary)
     missing = [name for name in object_names if not results.get(name)]
+    missing_required = [name for name in required_names if not results.get(name)]
     if target_name not in results:
-        raise RuntimeError(f"SAM6D did not produce a target pose for {target_name}; missing={missing}")
-    if missing and bool(getattr(args, "sam6d_strict_scene", True)):
-        raise RuntimeError(f"SAM6D strict scene is enabled and these objects are missing: {missing}")
+        raise RuntimeError(f"SAM6D did not produce a target pose for {target_name}; missing_required={missing_required}, missing={missing}")
+    if missing_required and bool(getattr(args, "sam6d_strict_scene", True)):
+        raise RuntimeError(f"SAM6D strict scene is enabled and required objects are missing: {missing_required}; optional_missing={missing}")
     if missing:
         print(f"[sam6d grasp] warning: missing non-target SAM6D object(s): {missing}")
 
@@ -1019,7 +1042,19 @@ def build_arg_parser():
         default="/home/zhangzhao/Desktop/lerobot/pick_jiaobang/sam6d_pem_feature_cache",
     )
     parser.add_argument("--sam6d-no-pem-warmup-during-sam3", action="store_true", default=False)
-    parser.add_argument("--sam6d-no-post-pem-mask-refine", action="store_true", default=False)
+    parser.add_argument(
+        "--sam6d-post-pem-mask-refine",
+        dest="sam6d_no_post_pem_mask_refine",
+        action="store_false",
+        default=True,
+        help="Enable post-PEM mask/depth translation refinement. Disabled by default.",
+    )
+    parser.add_argument(
+        "--sam6d-no-post-pem-mask-refine",
+        dest="sam6d_no_post_pem_mask_refine",
+        action="store_true",
+        help="Disable post-PEM mask/depth translation refinement.",
+    )
     parser.add_argument("--sam6d-no-full-scene-pem-visualization", action="store_true", default=False)
     parser.add_argument("--sam6d-no-pem-save-visualization", action="store_true", default=False)
     parser.add_argument("--sam6d-post-pem-mask-refine-objects", type=str, default="lvmukuai,carriot,tennis")

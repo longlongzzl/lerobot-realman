@@ -163,7 +163,7 @@ def build_grasp_command(config: dict[str, Any] | None = None) -> list[str]:
         "--real-max-delta-per-step",
         str(float(config.get("real_max_delta_per_step") or 0.1)),
     ]
-    if bool(config.get("disable_empty_grasp_relocalize", True)):
+    if bool(config.get("disable_empty_grasp_relocalize", False)):
         cmd.extend(["--no-empty-grasp-relocalize-target", "--empty-grasp-max-relocalize-retries", "0"])
     if bool(config.get("random_targets", False)):
         cmd.extend(["--random-cycle-targets", "--target-selection-order", "random"])
@@ -235,6 +235,7 @@ def build_perception_command(config: dict[str, Any] | None = None) -> list[str]:
         "1",
         "--pem-feature-cache-root",
         str(PICK_DIR / "sam6d_pem_feature_cache"),
+        "--no-post-pem-mask-refine",
         "--post-pem-mask-refine-objects",
         "lvmukuai,carriot,tennis",
         "--post-pem-mask-refine-trigger-px",
@@ -299,6 +300,11 @@ def chinese_summary(line: str) -> str | None:
     text = line.strip()
     if not text:
         return None
+    if text.startswith("[fast_chain_ui]"):
+        summary = text.split("]", 1)[-1].strip()
+        if "；" in summary:
+            summary = summary.replace("；", "；\n  ")
+        return summary
     if "Traceback" in text or "RuntimeError" in text or "failed:" in text:
         return "检测到错误：" + text[-260:]
     if "[sam3] full-scene text masks:" in text:
@@ -326,6 +332,33 @@ def chinese_summary(line: str) -> str | None:
     return None
 
 
+def _safe_log_component(name: str) -> str:
+    out = []
+    for ch in str(name or "process"):
+        out.append(ch if (ch.isalnum() or ch in "-_") else "_")
+    return "".join(out).strip("_") or "process"
+
+
+def _make_process_log_path(process_name: str) -> Path:
+    log_dir = PICK_DIR / "web_process_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    safe = _safe_log_component(process_name)
+    return log_dir / f"{stamp}_{safe}_{uuid.uuid4().hex[:8]}.log"
+
+
+def process_line_for_ui(process_name: str, stream_name: str, line: str) -> str | None:
+    text = line.strip()
+    if not text:
+        return None
+    # Raw process logs are kept on disk.  The web console only shows explicit
+    # concise UI messages; normal stdout/stderr is summarized by chinese_summary().
+    for prefix in ("[web_ui]", "[web-ui]"):
+        if text.startswith(prefix):
+            return text.split("]", 1)[-1].strip()
+    return None
+
+
 class ManagedProcess:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -339,6 +372,8 @@ class ManagedProcess:
         self.last_json: dict[str, Any] | None = None
         self.last_update_at: float | None = None
         self.pending: dict[str, queue.Queue] = {}
+        self.raw_log_path: Path | None = None
+        self._raw_log_fp = None
         self.lock = threading.Lock()
 
     def is_running(self) -> bool:
@@ -359,6 +394,15 @@ class ManagedProcess:
             self.last_error = None
             self.last_json = None
             self.last_update_at = time.time()
+            self.raw_log_path = _make_process_log_path(self.name)
+            try:
+                self._raw_log_fp = self.raw_log_path.open("a", encoding="utf-8", buffering=1)
+                self._raw_log_fp.write(f"# process: {self.name}\n")
+                self._raw_log_fp.write(f"# started_at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self._raw_log_fp.write(f"# cwd: {cwd}\n")
+                self._raw_log_fp.write(f"# command: {shell_join(cmd)}\n\n")
+            except Exception:
+                self._raw_log_fp = None
             self.proc = subprocess.Popen(
                 cmd,
                 cwd=str(cwd),
@@ -371,18 +415,42 @@ class ManagedProcess:
                 start_new_session=True,
             )
             self.started_at = time.time()
-            emit("status", f"{self.name} 已启动 pid={self.proc.pid}")
+            log_hint = f"；完整日志：{self.raw_log_path}" if self.raw_log_path else ""
+            emit("status", f"{self.name} 已启动 pid={self.proc.pid}{log_hint}")
             threading.Thread(target=self._read_pipe, args=("stdout", self.proc.stdout), daemon=True).start()
             threading.Thread(target=self._read_pipe, args=("stderr", self.proc.stderr), daemon=True).start()
             threading.Thread(target=self._watch, daemon=True).start()
+
+    def _write_raw_log(self, stream_name: str, line: str) -> None:
+        fp = self._raw_log_fp
+        if fp is None:
+            return
+        try:
+            fp.write(f"[{time.strftime('%H:%M:%S')}] {stream_name}: {line}\n")
+        except Exception:
+            pass
+
+    def _close_raw_log(self) -> None:
+        fp = self._raw_log_fp
+        self._raw_log_fp = None
+        if fp is None:
+            return
+        try:
+            fp.flush()
+            fp.close()
+        except Exception:
+            pass
 
     def _read_pipe(self, stream_name: str, pipe) -> None:
         if pipe is None:
             return
         for line in pipe:
             line = line.rstrip("\n")
+            self._write_raw_log(stream_name, line)
             self._handle_structured_output(stream_name, line)
-            emit("process", line, process=self.name, stream=stream_name)
+            ui_line = process_line_for_ui(self.name, stream_name, line)
+            if ui_line:
+                emit("process", ui_line, process=self.name, stream=stream_name)
             summary = chinese_summary(line)
             if summary:
                 emit("summary", summary, process=self.name)
@@ -475,6 +543,7 @@ class ManagedProcess:
                 self.phase = "error"
                 self.ready = False
                 self.last_error = f"process exited with code {code}"
+            self._close_raw_log()
         emit("status", f"{self.name} 已退出 code={code}", process=self.name, returncode=code)
 
     def send_stdin(self, text: str) -> None:
@@ -513,6 +582,7 @@ class ManagedProcess:
             "last_error": self.last_error,
             "last_json": self.last_json,
             "last_update_at": self.last_update_at,
+            "raw_log_path": None if self.raw_log_path is None else str(self.raw_log_path),
         }
 
 
@@ -1356,7 +1426,7 @@ def _resident_provider_payload(config: dict[str, Any]) -> dict[str, Any]:
         "full_scene_pem_visualization": True,
         "pem_save_visualization": True,
         "pem_run_mode": "inprocess",
-        "post_pem_mask_refine": True,
+        "post_pem_mask_refine": False,
         "post_pem_mask_refine_objects": "lvmukuai,carriot,tennis",
         "post_pem_mask_refine_trigger_px": 6.0,
     }

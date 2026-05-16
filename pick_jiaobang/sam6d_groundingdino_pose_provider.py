@@ -1819,9 +1819,10 @@ def save_pem_refine_compare_visual(frame: dict, mask: np.ndarray, before: dict, 
 
 
 def refine_pem_translation_against_mask_depth(args, frame: dict, object_name: str, mesh: trimesh.Trimesh, T_cam_obj: np.ndarray, mask: np.ndarray, run_dir: Path, score: float) -> dict:
-    enabled = bool(getattr(args, "post_pem_mask_refine", True))
+    enabled = bool(getattr(args, "post_pem_mask_refine", False))
     whitelist = _parse_name_set(getattr(args, "post_pem_mask_refine_objects", "lvmukuai,tennis"))
     normalized_name = normalize_object_name(object_name) or str(object_name)
+    tennis_sphere_enabled = normalized_name == "tennis" and bool(getattr(args, "post_pem_mask_refine_tennis_sphere", True))
     sample_count = int(getattr(args, "post_pem_mask_refine_sample_points", 350) or 350)
     pts_obj = _mesh_refine_points(mesh, sample_count)
     K = np.asarray(frame["K"], dtype=np.float64).reshape(3, 3)
@@ -1835,7 +1836,9 @@ def refine_pem_translation_against_mask_depth(args, frame: dict, object_name: st
     initial_t = initial_T[:3, 3].copy()
     before = _alignment_metrics_for_pose(K, initial_T, pts_obj, mask, depth_ref)
     result = {
-        "enabled": enabled,
+        "enabled": enabled or tennis_sphere_enabled,
+        "generic_enabled": enabled,
+        "tennis_sphere_enabled": tennis_sphere_enabled,
         "object_name": normalized_name,
         "applied": False,
         "reason": None,
@@ -1847,10 +1850,10 @@ def refine_pem_translation_against_mask_depth(args, frame: dict, object_name: st
         "translation_delta_m": [0.0, 0.0, 0.0],
         "depth_reference": depth_ref,
     }
-    if not enabled:
+    if not enabled and not tennis_sphere_enabled:
         result["reason"] = "disabled"
         return result
-    if normalized_name not in whitelist:
+    if enabled and normalized_name not in whitelist and not tennis_sphere_enabled:
         result["reason"] = "not_in_whitelist"
         return result
     skip_border_px = float(getattr(args, "post_pem_mask_refine_skip_border_mask_px", 2.0) or 0.0)
@@ -1868,7 +1871,7 @@ def refine_pem_translation_against_mask_depth(args, frame: dict, object_name: st
     max_raw_center_px = float(getattr(args, "post_pem_mask_refine_max_raw_center_px", 250.0) or 250.0)
     t0 = time.perf_counter()
 
-    if normalized_name == "tennis" and bool(getattr(args, "post_pem_mask_refine_tennis_sphere", True)):
+    if tennis_sphere_enabled:
         t_sphere, sphere_debug = _sphere_translation_from_mask_depth(K, mask, depth_ref, float(np.max(np.asarray(mesh.extents, dtype=np.float64))))
         result["sphere_refine"] = sphere_debug
         if t_sphere is not None:
@@ -1899,6 +1902,12 @@ def refine_pem_translation_against_mask_depth(args, frame: dict, object_name: st
                     result["visualization_error"] = repr(exc)
                 return result
 
+    if not enabled:
+        result["reason"] = "disabled_after_tennis_sphere"
+        return result
+    if normalized_name not in whitelist:
+        result["reason"] = "not_in_whitelist"
+        return result
     if not raw_pose_valid:
         result["reason"] = "invalid_initial_translation"
         return result
@@ -2016,6 +2025,28 @@ def refine_pem_translation_against_mask_depth(args, frame: dict, object_name: st
     except Exception as exc:
         result["visualization_error"] = repr(exc)
     return result
+
+
+def validate_pem_pose_result(args, object_name: str, score: float, T_cam_obj: np.ndarray, refine_info: dict | None = None) -> None:
+    normalized_name = normalize_object_name(object_name) or str(object_name)
+    T = np.asarray(T_cam_obj, dtype=np.float64).reshape(4, 4)
+    t = T[:3, 3]
+    min_z = float(getattr(args, "pem_min_valid_pose_z_m", 0.2) or 0.2)
+    max_z = float(getattr(args, "pem_max_valid_pose_z_m", 1.6) or 1.6)
+    min_score = float(getattr(args, "pem_min_valid_score", 1e-6) or 0.0)
+    refined_by_tennis_sphere = bool((refine_info or {}).get("applied")) and str((refine_info or {}).get("reason")) == "tennis_sphere"
+    if not np.isfinite(T).all():
+        raise RuntimeError(f"SAM6D produced non-finite pose for {normalized_name}")
+    if not (min_z <= float(t[2]) <= max_z):
+        raise RuntimeError(
+            f"SAM6D produced invalid pose depth for {normalized_name}: "
+            f"translation={np.round(t, 6).tolist()}, expected z in [{min_z:.3f}, {max_z:.3f}]"
+        )
+    if float(score) <= min_score and not refined_by_tennis_sphere:
+        raise RuntimeError(
+            f"SAM6D PEM score is too low for {normalized_name}: "
+            f"score={float(score):.6f}, translation={np.round(t, 6).tolist()}"
+        )
 
 
 def _draw_projected_line(canvas: np.ndarray, uv: np.ndarray, valid: np.ndarray, i: int, j: int, color, thickness: int = 2):
@@ -2496,7 +2527,7 @@ def parse_args():
     parser.add_argument("--full-scene-pem-visualization", dest="full_scene_pem_visualization", action="store_true", default=True)
     parser.add_argument("--no-full-scene-pem-visualization", dest="full_scene_pem_visualization", action="store_false")
     parser.add_argument("--sam3-full-scene-result-json", type=str, default="")
-    parser.add_argument("--post-pem-mask-refine", dest="post_pem_mask_refine", action="store_true", default=True)
+    parser.add_argument("--post-pem-mask-refine", dest="post_pem_mask_refine", action="store_true", default=False)
     parser.add_argument("--no-post-pem-mask-refine", dest="post_pem_mask_refine", action="store_false")
     parser.add_argument("--post-pem-mask-refine-objects", type=str, default="lvmukuai,carriot,tennis")
     parser.add_argument("--post-pem-mask-refine-trigger-px", type=float, default=6.0)
@@ -2516,6 +2547,9 @@ def parse_args():
     parser.add_argument("--post-pem-mask-refine-skip-border-mask-px", type=float, default=2.0)
     parser.add_argument("--post-pem-mask-refine-tennis-sphere", dest="post_pem_mask_refine_tennis_sphere", action="store_true", default=True)
     parser.add_argument("--no-post-pem-mask-refine-tennis-sphere", dest="post_pem_mask_refine_tennis_sphere", action="store_false")
+    parser.add_argument("--pem-min-valid-score", type=float, default=1e-6)
+    parser.add_argument("--pem-min-valid-pose-z-m", type=float, default=0.2)
+    parser.add_argument("--pem-max-valid-pose-z-m", type=float, default=1.6)
     parser.add_argument("--repair-mask-depth", dest="repair_mask_depth", action="store_true", default=True)
     parser.add_argument("--no-repair-mask-depth", dest="repair_mask_depth", action="store_false")
     parser.add_argument("--repair-mask-depth-min-valid-pixels", type=int, default=128)
@@ -2711,12 +2745,14 @@ def _run_single_object_pose(args, frame: dict, sam6d_root: Path, run_dir: Path, 
     if bool(refine_info.get("applied", False)):
         T_cam_obj = np.asarray(T_cam_obj, dtype=np.float32).copy()
         T_cam_obj[:3, 3] = np.asarray(refine_info["refined_translation_m"], dtype=np.float32).reshape(3)
+    score = float(best.get("score", 0.0))
+    validate_pem_pose_result(args, object_name, score, T_cam_obj, refine_info)
     result = {
         "object_name": object_name,
         "prompt": prompt,
         "run_dir": str(run_dir),
         "sam3_instance_index": result_instance_index,
-        "score": float(best.get("score", 0.0)),
+        "score": score,
         "mask_source": mask_source,
         "mask_elapsed_ms": float(mask_elapsed_ms),
         "mask_pixels": int(np.count_nonzero(mask)),
@@ -2735,7 +2771,7 @@ def _run_single_object_pose(args, frame: dict, sam6d_root: Path, run_dir: Path, 
     with open(result_path, "w") as f:
         json.dump(result, f, indent=2)
     print("[sam6d-gdino] pem_ms:", f"{pem_elapsed_ms:.2f}", "mode:", str(args.pem_run_mode))
-    print("[sam6d-gdino] best PEM score:", f"{float(best.get('score', 0.0)):.4f}")
+    print("[sam6d-gdino] best PEM score:", f"{score:.4f}")
     if refine_info.get("enabled"):
         raw_err = float(refine_info.get("raw_metrics", {}).get("center_error_px", -1.0))
         ref_err = float(refine_info.get("refined_metrics", {}).get("center_error_px", raw_err))
@@ -2981,29 +3017,48 @@ def _run_same_object_multi_instance_pose(
         if bool(refine_info.get("applied", False)):
             T_cam_obj = np.asarray(T_cam_obj, dtype=np.float32).copy()
             T_cam_obj[:3, 3] = np.asarray(refine_info["refined_translation_m"], dtype=np.float32).reshape(3)
+        score = float(pem_det.get("score", 0.0))
         item = {key: value for key, value in meta.items() if key != "_mask"}
-        item.update(
-            {
-                "ok": True,
-                "sam3_instance_index": int(instance_index),
-                "score": float(pem_det.get("score", 0.0)),
-                "mask_elapsed_ms": float(mask_elapsed_ms),
-                "pem_elapsed_ms": float(pem_elapsed_ms),
-                "pem_batch_instance_count": int(len(entries)),
-                "T_cam_obj_raw_pem": raw_T_cam_obj.tolist(),
-                "translation_m_raw_pem": raw_T_cam_obj[:3, 3].tolist(),
-                "T_cam_obj": T_cam_obj.tolist(),
-                "translation_m": T_cam_obj[:3, 3].tolist(),
-                "pem_refine": refine_info,
-                "pem_detection": pem_det,
-            }
-        )
+        try:
+            validate_pem_pose_result(args, object_name, score, T_cam_obj, refine_info)
+            item.update(
+                {
+                    "ok": True,
+                    "sam3_instance_index": int(instance_index),
+                    "score": score,
+                    "mask_elapsed_ms": float(mask_elapsed_ms),
+                    "pem_elapsed_ms": float(pem_elapsed_ms),
+                    "pem_batch_instance_count": int(len(entries)),
+                    "T_cam_obj_raw_pem": raw_T_cam_obj.tolist(),
+                    "translation_m_raw_pem": raw_T_cam_obj[:3, 3].tolist(),
+                    "T_cam_obj": T_cam_obj.tolist(),
+                    "translation_m": T_cam_obj[:3, 3].tolist(),
+                    "pem_refine": refine_info,
+                    "pem_detection": pem_det,
+                }
+            )
+        except Exception as exc:
+            item.update(
+                {
+                    "ok": False,
+                    "sam3_instance_index": int(instance_index),
+                    "score": score,
+                    "mask_elapsed_ms": float(mask_elapsed_ms),
+                    "pem_elapsed_ms": float(pem_elapsed_ms),
+                    "pem_batch_instance_count": int(len(entries)),
+                    "T_cam_obj_raw_pem": raw_T_cam_obj.tolist(),
+                    "translation_m_raw_pem": raw_T_cam_obj[:3, 3].tolist(),
+                    "pem_refine": refine_info,
+                    "pem_detection": pem_det,
+                    "error": repr(exc),
+                }
+            )
         result_path = Path(meta["run_dir"]) / "sam6d_pose_result.json"
         with open(result_path, "w") as f:
             json.dump(item, f, indent=2)
         results.append(item)
         print(
-            f"[sam6d-gdino] instance={instance_index} PEM score={float(pem_det.get('score', 0.0)):.4f} "
+            f"[sam6d-gdino] instance={instance_index} PEM score={score:.4f} "
             f"T_cam_obj translation(m): {T_cam_obj[:3, 3].tolist()}"
         )
 
