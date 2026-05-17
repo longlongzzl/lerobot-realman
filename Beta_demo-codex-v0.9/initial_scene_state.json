@@ -1,0 +1,154 @@
+{
+  "schema": "jimu_assembly_state_v1",
+  "source": "sam6d_to_assembly_state",
+  "roles": [
+    "floor",
+    "right_wall",
+    "back_wall",
+    "left_wall",
+    "front_wall"
+  ],
+  "completed_roles": [],
+  "robot_qpos": null,
+  "role_states": {
+    "floor": {
+      "pose": {
+        "position": [
+          -0.35396623611450195,
+          0.028811544179916382,
+          0.0035000001080334187
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "linear_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "angular_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "target_pose_error": null
+    },
+    "right_wall": {
+      "pose": {
+        "position": [
+          -0.5246343016624451,
+          -0.29163917899131775,
+          0.03700000047683716
+        ],
+        "quaternion": [
+          0.4512212574481964,
+          0.4512212574481964,
+          -0.5444257259368896,
+          -0.5444257259368896
+        ]
+      },
+      "linear_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "angular_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "target_pose_error": null
+    },
+    "back_wall": {
+      "pose": {
+        "position": [
+          -0.4608679413795471,
+          -0.17090024054050446,
+          0.03700000047683716
+        ],
+        "quaternion": [
+          0.5645527243614197,
+          0.5645527243614197,
+          0.42577019333839417,
+          0.42577019333839417
+        ]
+      },
+      "linear_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "angular_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "target_pose_error": null
+    },
+    "left_wall": {
+      "pose": {
+        "position": [
+          -0.6761025786399841,
+          -0.2907634675502777,
+          0.03700000047683716
+        ],
+        "quaternion": [
+          0.491089791059494,
+          0.491089791059494,
+          -0.5087541937828064,
+          -0.5087541937828064
+        ]
+      },
+      "linear_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "angular_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "target_pose_error": null
+    },
+    "front_wall": {
+      "pose": {
+        "position": [
+          -0.6080570816993713,
+          -0.1687099188566208,
+          0.03700000047683716
+        ],
+        "quaternion": [
+          0.49857789278030396,
+          0.49857789278030396,
+          0.5014180541038513,
+          0.5014180541038513
+        ]
+      },
+      "linear_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "angular_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "target_pose_error": null
+    }
+  },
+  "magnetic_snap_report": {
+    "connections": [],
+    "active_connection_count": 0,
+    "connection_error": {
+      "connections": [],
+      "max_point_error": 0.0,
+      "mean_point_error": 0.0
+    }
+  }
+}

@@ -28,11 +28,13 @@ DEFAULT_SAM3_PYTHON = "/home/zhangzhao/anaconda3/envs/sam3/bin/python"
 DEFAULT_FOUNDATIONPOSE_PYTHON = "/home/zhangzhao/anaconda3/envs/foundationpose310/bin/python"
 DEFAULT_SAM3_CHECKPOINT = "/home/zhangzhao/Downloads/sam3.pt"
 DEFAULT_CAMERA_EXTRINSIC_OPENCV = "/home/zhangzhao/Desktop/lerobot-sim2real/results/realman/realman_home/base_camera/camera_extrinsic_opencv.npy"
+DEFAULT_LLM_SCENE_FILE = PICK_DIR / "test_scenes" / "current_table.json"
 DEFAULT_GRASP_OBJECTS = ["lvmukuai", "carriot", "shuazi", "hongshupian", "gluestick", "bi", "tennis"]
 DEFAULT_TRACKED_OBJECTS = ["desk", "bitong"]
 DEFAULT_OBJECTS = DEFAULT_GRASP_OBJECTS + DEFAULT_TRACKED_OBJECTS
 SERVER_STARTED_AT = time.time()
 latest_perception_result: dict[str, Any] = {}
+latest_llm_result: dict[str, Any] = {}
 
 
 def shell_join(cmd: list[str]) -> str:
@@ -325,6 +327,16 @@ def chinese_summary(line: str) -> str | None:
         return "本轮最终结果：" + text
     if "[planning_profile] jsonl:" in text:
         return "本次 profile 文件：" + text.split(":", 1)[-1].strip()
+    if text.startswith("[llm_orchestrator] OK case"):
+        return "LLM 计划生成成功：" + text
+    if text.startswith("[llm_orchestrator] FAIL case"):
+        return "LLM 计划失败：" + text[-260:]
+    if text.startswith("[llm_orchestrator] RUN"):
+        return "LLM 执行启动：" + text
+    if text.startswith("[llm_orchestrator] DONE"):
+        return "LLM 执行结束：" + text
+    if text.startswith("[llm_orchestrator] summary:"):
+        return "LLM 运行摘要：" + text.split(":", 1)[-1].strip()
     if "[sam6d prefetch] fail-fast" in text:
         return "SAM6D 后台预计算已启用 fail-fast。"
     if "scene_capture" in text and "elapsed_ms" in text:
@@ -621,6 +633,7 @@ class ResidentProcess(ManagedProcess):
 
 
 grasp_process = ManagedProcess("抓取流程")
+llm_process = ManagedProcess("LLM执行")
 perception_process = ManagedProcess("分割定位")
 sam3_worker = ResidentProcess("SAM3 常驻")
 sam6d_worker = ResidentProcess("SAM6D 常驻")
@@ -727,6 +740,181 @@ def _release_sam6d_for_fixed_scene_grasp(cmd: list[str]) -> bool:
         except Exception:
             pass
     return True
+
+
+def _safe_scene_file(raw_path: str | Path | None) -> Path:
+    if raw_path is None or not str(raw_path).strip():
+        raw_path = DEFAULT_LLM_SCENE_FILE
+    path = Path(str(raw_path)).expanduser().resolve()
+    allowed_roots = [PICK_DIR.resolve(), Path("/tmp").resolve()]
+    if not any(str(path).startswith(str(root)) for root in allowed_roots):
+        raise ValueError(f"scene file outside allowed roots: {path}")
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    if path.suffix.lower() != ".json":
+        raise ValueError(f"scene file must be json: {path}")
+    return path
+
+
+def _safe_json_file(raw_path: str | Path | None) -> Path:
+    if raw_path is None or not str(raw_path).strip():
+        raise ValueError("json path is empty")
+    path = Path(str(raw_path)).expanduser().resolve()
+    allowed_roots = [PICK_DIR.resolve(), Path("/tmp").resolve()]
+    if not any(str(path).startswith(str(root)) for root in allowed_roots):
+        raise ValueError(f"json file outside allowed roots: {path}")
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    if path.suffix.lower() != ".json":
+        raise ValueError(f"json file must be json: {path}")
+    return path
+
+
+def _list_llm_scene_files(limit: int = 160) -> list[dict[str, Any]]:
+    roots = [
+        PICK_DIR / "test_scenes",
+        PICK_DIR / "llm_pick_place_runs",
+    ]
+    files: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        files.extend(root.rglob("*.json"))
+    out = []
+    seen: set[str] = set()
+    preferred = [DEFAULT_LLM_SCENE_FILE]
+    for path in preferred + sorted(files, key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True):
+        try:
+            resolved = path.expanduser().resolve()
+            if str(resolved) in seen or not resolved.exists():
+                continue
+            data = json.loads(resolved.read_text(encoding="utf-8"))
+            objects = data.get("objects")
+            if not isinstance(objects, dict) or not objects:
+                continue
+            seen.add(str(resolved))
+            try:
+                rel = str(resolved.relative_to(ROOT))
+            except Exception:
+                rel = str(resolved)
+            out.append(
+                {
+                    "path": str(resolved),
+                    "rel": rel,
+                    "name": resolved.name,
+                    "mtime": resolved.stat().st_mtime,
+                    "object_count": len(objects),
+                }
+            )
+            if len(out) >= limit:
+                break
+        except Exception:
+            continue
+    return out
+
+
+def _llm_result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    preview = result.get("target_pose_preview") if isinstance(result.get("target_pose_preview"), dict) else {}
+    steps = []
+    for step in list(result.get("steps") or []):
+        steps.append(
+            {
+                "index": int(step.get("index", len(steps) + 1)),
+                "description": step.get("description"),
+                "source_spec": step.get("source_spec"),
+                "operator": step.get("operator"),
+                "target_object_id": step.get("target_object_id"),
+                "place_mode": step.get("place_mode"),
+                "target_pose_xyz_m": step.get("target_pose_xyz_m"),
+                "warnings": step.get("warnings") or [],
+                "command": step.get("command"),
+                "command_file": step.get("command_file"),
+            }
+        )
+    return {
+        "command": result.get("command"),
+        "output_dir": result.get("output_dir"),
+        "manifest_file": str(Path(str(result.get("output_dir"))) / "manifest.json") if result.get("output_dir") else None,
+        "llm_plan_source": result.get("llm_plan_source"),
+        "llm_plan": result.get("llm_plan"),
+        "raw_external_llm_plan": result.get("raw_external_llm_plan"),
+        "llm_call": result.get("llm_call"),
+        "step_count": int(result.get("step_count", len(steps)) or 0),
+        "steps": steps,
+        "combined_command": result.get("combined_command"),
+        "target_pose_preview": preview,
+    }
+
+
+def _materialize_llm_from_web(config: dict[str, Any], command: str) -> dict[str, Any]:
+    import rm75_llm_pick_place_orchestrator as llm
+
+    scene_file = _safe_scene_file(config.get("scene_file"))
+    provider = str(config.get("llm_provider") or "deepseek").strip().lower()
+    render_mode = str(config.get("render_mode") or "human")
+    argv = [
+        "--fixed-scene-pose-file",
+        str(scene_file),
+        "--command",
+        str(command),
+        "--python",
+        str(config.get("python") or DEFAULT_FOUNDATIONPOSE_PYTHON),
+        "--direct-script",
+        str(PICK_DIR / "rm75_jiaobang_pick_place_targeted_curobo_direct_pre_place.py"),
+        "--curobo-rm75-robot-cfg",
+        str(PICK_DIR / "curobo_rm75_config" / "rm75.yml"),
+        "--render-mode",
+        render_mode,
+        "--trajectory-preview-sleep",
+        str(float(config.get("trajectory_preview_sleep") or 0.08)),
+        "--dry-run-motion-window-scale",
+        str(float(config.get("dry_run_motion_window_scale") or 1.0)),
+        "--real-control-hz",
+        str(int(config.get("real_control_hz") or 30)),
+        "--real-max-delta-per-step",
+        str(float(config.get("real_max_delta_per_step") or 0.1)),
+        "--llm-provider",
+        provider,
+    ]
+    model = str(config.get("llm_model") or "").strip()
+    if model:
+        argv.extend(["--llm-model", model])
+    api_base = str(config.get("llm_api_base") or "").strip()
+    if api_base:
+        argv.extend(["--llm-api-base", api_base])
+    key_env = str(config.get("llm_api_key_env") or "").strip()
+    if key_env:
+        argv.extend(["--llm-api-key-env", key_env])
+    if bool(config.get("execute_real", False)):
+        argv.append("--execute-real")
+    args = llm.build_arg_parser().parse_args(argv)
+    scene = llm.SceneState.load(scene_file)
+    run_root = llm._make_run_dir(Path(args.output_root).expanduser().resolve(), "web_llm_pick_place")
+    out_dir = run_root / "case_01"
+    result = llm.materialize_plan(args, str(command), scene.copy(), out_dir)
+    return result
+
+
+def _llm_manifest_execution_command(manifest_file: str | Path) -> tuple[list[str], dict[str, Any]]:
+    manifest_path = _safe_json_file(manifest_file)
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    combined = data.get("combined_command") if isinstance(data.get("combined_command"), dict) else {}
+    command_file = None
+    if combined.get("available") and combined.get("command_file"):
+        command_file = combined.get("command_file")
+    else:
+        steps = list(data.get("steps") or [])
+        if steps and steps[0].get("command_file"):
+            command_file = steps[0].get("command_file")
+    if not command_file:
+        raise ValueError("LLM manifest has no executable command_file")
+    command_path = Path(str(command_file)).expanduser().resolve()
+    allowed_roots = [PICK_DIR.resolve(), Path("/tmp").resolve()]
+    if not any(str(command_path).startswith(str(root)) for root in allowed_roots):
+        raise ValueError(f"command file outside allowed roots: {command_path}")
+    if not command_path.exists():
+        raise FileNotFoundError(str(command_path))
+    return ["bash", str(command_path)], data
 
 
 def update_perception_task(**fields) -> dict[str, Any]:
@@ -1283,7 +1471,9 @@ def api_status():
             "sam6d": sam6d_worker.status(),
             "perception": current_perception_status(),
             "grasp": grasp_process.status(),
+            "llm": llm_process.status(),
             "latest_perception_result": dict(latest_perception_result),
+            "latest_llm_result": dict(latest_llm_result),
             "profile": latest_profile_waterfall(),
             "failure": latest_failure_summary(),
             "run_id": time.strftime("%Y%m%d_%H%M%S", time.localtime(SERVER_STARTED_AT)),
@@ -1303,6 +1493,71 @@ def api_preflight():
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, "report": report})
+
+
+@app.get("/api/llm/scenes")
+def api_llm_scenes():
+    return jsonify({"ok": True, "scenes": _list_llm_scene_files()})
+
+
+@app.get("/api/llm/interface")
+def api_llm_interface():
+    try:
+        import rm75_llm_pick_place_orchestrator as llm
+
+        return jsonify({"ok": True, "interface": llm._llm_pick_place_interface_text()})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.post("/api/llm/plan")
+def api_llm_plan():
+    global latest_llm_result
+    payload = request.get_json(force=True, silent=True) or {}
+    command = str(payload.get("command") or "").strip()
+    if not command:
+        return jsonify({"ok": False, "error": "请输入自然语言命令"}), 400
+    config = dict(payload.get("config") or {})
+    try:
+        emit("summary", f"LLM：开始解析命令：{command}")
+        result = _materialize_llm_from_web(config, command)
+        summary = _llm_result_summary(result)
+        latest_llm_result = {**summary, "updated_at": time.time()}
+        emit(
+            "summary",
+            f"LLM：目标位姿已生成，step={summary.get('step_count')}，manifest={summary.get('manifest_file')}",
+        )
+    except Exception as exc:
+        emit("summary", f"LLM：生成失败：{exc!r}")
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "result": summary})
+
+
+@app.post("/api/llm/start")
+def api_llm_start():
+    payload = request.get_json(force=True, silent=True) or {}
+    manifest_file = payload.get("manifest_file") or latest_llm_result.get("manifest_file")
+    try:
+        cmd, manifest = _llm_manifest_execution_command(manifest_file)
+        command_text = ""
+        combined = manifest.get("combined_command") if isinstance(manifest.get("combined_command"), dict) else {}
+        if combined.get("command"):
+            command_text = str(combined.get("command"))
+        elif manifest.get("steps"):
+            command_text = str((manifest.get("steps") or [{}])[0].get("command") or "")
+        if bool(payload.get("execute_real", False)) and "--execute-real" not in command_text:
+            raise ValueError("这个 manifest 不是按真机执行生成的；请先用真机模式重新生成 LLM 计划")
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    llm_process.start(cmd, cwd=ROOT)
+    emit("summary", f"LLM：按 manifest 执行计划，steps={len(manifest.get('steps') or [])}")
+    return jsonify({"ok": True, "status": llm_process.status(), "command": shell_join(cmd)})
+
+
+@app.post("/api/llm/stop")
+def api_llm_stop():
+    llm_process.stop()
+    return jsonify({"ok": True})
 
 
 @app.post("/api/hotstart/sam3")
@@ -1829,12 +2084,29 @@ INDEX_HTML = r"""<!doctype html>
     }
     h1 { margin: 0; font-size: 18px; font-weight: 700; }
     header .note { color: #cbd5e1; }
+    .tabbar {
+      display: flex;
+      gap: 8px;
+      padding: 10px 14px 0;
+    }
+    .tab-btn {
+      min-width: 128px;
+      background: #f8fafc;
+      color: var(--ink);
+    }
+    .tab-btn.active {
+      background: var(--ink);
+      color: #fff;
+      border-color: var(--ink);
+    }
     main {
       display: grid;
       grid-template-columns: minmax(390px, 0.92fr) minmax(560px, 1.38fr);
       gap: 14px;
       padding: 14px;
     }
+    main.tab-panel { display: none; }
+    main.tab-panel.active { display: grid; }
     section {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -2067,6 +2339,45 @@ INDEX_HTML = r"""<!doctype html>
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 8px;
     }
+    .llm-command-box textarea {
+      min-height: 112px;
+      font-family: inherit;
+      font-size: 14px;
+    }
+    .llm-step-list {
+      display: grid;
+      gap: 9px;
+    }
+    .llm-step {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fbfcfe;
+      min-width: 0;
+    }
+    .llm-step b {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 14px;
+    }
+    .llm-step small {
+      display: block;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+      line-height: 1.4;
+    }
+    .json-panel {
+      max-height: 280px;
+      overflow: auto;
+      background: #0f172a;
+      color: #d1fae5;
+      border-radius: 6px;
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
     #waterfallChart {
       width: 100%;
       height: 230px;
@@ -2156,7 +2467,11 @@ INDEX_HTML = r"""<!doctype html>
       <button id="refreshBtn">刷新</button>
     </div>
   </header>
-  <main>
+  <div class="tabbar">
+    <button class="tab-btn active" data-tab="pickTab">PickPlace</button>
+    <button class="tab-btn" data-tab="llmTab">LLM 控制</button>
+  </div>
+  <main id="pickTab" class="tab-panel active">
     <div class="stack">
       <section>
         <h2>运行总览</h2>
@@ -2320,6 +2635,86 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
   </main>
+  <main id="llmTab" class="tab-panel">
+    <div class="stack">
+      <section>
+        <h2>自然语言任务</h2>
+        <div class="llm-command-box">
+          <textarea id="llmCommand" placeholder="例如：把网球扔进笔筒，然后把笔靠在笔筒右侧">把网球扔进笔筒，然后把笔靠在笔筒右侧</textarea>
+        </div>
+        <div class="field-grid" style="margin-top: 10px;">
+          <div class="field">
+            <label for="llmSceneFile">场景 JSON</label>
+            <select id="llmSceneFile"></select>
+          </div>
+          <div class="field">
+            <label for="llmProvider">LLM 后端</label>
+            <select id="llmProvider">
+              <option value="deepseek" selected>deepseek</option>
+              <option value="mock">mock 本地规则</option>
+              <option value="openai-compatible">OpenAI compatible</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="llmModel">模型</label>
+            <input id="llmModel" type="text" value="deepseek-v4-flash" />
+          </div>
+          <div class="field">
+            <label for="llmApiBase">API Base</label>
+            <input id="llmApiBase" type="text" value="https://api.deepseek.com" />
+          </div>
+          <div class="field">
+            <label for="llmApiKeyEnv">Key 环境变量</label>
+            <input id="llmApiKeyEnv" type="text" value="DEEPSEEK_API_KEY" />
+          </div>
+          <div class="field">
+            <label for="llmRenderMode">渲染模式</label>
+            <select id="llmRenderMode">
+              <option value="human" selected>human</option>
+              <option value="rgb_array">rgb_array</option>
+              <option value="none">none</option>
+            </select>
+          </div>
+        </div>
+        <div class="row" style="margin-top: 10px;">
+          <label class="check"><input type="checkbox" id="llmExecuteReal" /> 真机执行</label>
+          <button id="llmReloadScenesBtn">刷新场景</button>
+          <button class="primary" id="llmPlanBtn">生成目标位姿预览</button>
+          <button class="primary" id="llmRunBtn">按当前计划执行</button>
+          <button class="danger" id="llmStopBtn">停止 LLM 执行</button>
+        </div>
+        <p class="note" id="llmStatusText">先选择固定场景 JSON，再生成目标位姿预览。真实相机 SAM6D 定位仍在 PickPlace 页运行；LLM 页目前使用固定 JSON 场景做语义规划。</p>
+      </section>
+
+      <section>
+        <h2>计划步骤</h2>
+        <div class="llm-step-list" id="llmStepList">
+          <div class="llm-step"><b>暂无计划</b><small>输入命令后点击生成。</small></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>低层命令</h2>
+        <textarea id="llmCommandPreview" readonly></textarea>
+        <p class="note" id="llmManifestText">manifest：暂无</p>
+      </section>
+    </div>
+
+    <div class="stack">
+      <section>
+        <h2>目标位姿预览</h2>
+        <div class="images">
+          <div class="image-slot"><div class="caption" id="llmPreview3dCaption">3D 预览</div><div class="empty-image" id="llmPreview3dEmpty">暂无</div><img id="llmPreview3dImg" /></div>
+          <div class="image-slot"><div class="caption" id="llmPreviewCaption">俯视预览</div><div class="empty-image" id="llmPreviewEmpty">暂无</div><img id="llmPreviewImg" /></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>LLM JSON</h2>
+        <div class="json-panel" id="llmJsonPanel">暂无</div>
+      </section>
+    </div>
+  </main>
 <script>
 const defaultCommand = __DEFAULT_COMMAND_JSON__;
 const graspObjects = __GRASP_OBJECTS_JSON__;
@@ -2334,6 +2729,12 @@ let dragState = null;
 const fixedBitongTargets = new Set(['bi']);
 let placementPreviewTimer = null;
 let placementPreviewSignature = '';
+let latestLlmResult = null;
+
+function switchTab(tabId) {
+  document.querySelectorAll('.tab-panel').forEach((el) => el.classList.toggle('active', el.id === tabId));
+  document.querySelectorAll('.tab-btn').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === tabId));
+}
 
 function buildChecks(containerId, names, checkedNames, prefix) {
   const checked = new Set(checkedNames || []);
@@ -2883,6 +3284,12 @@ async function refreshStatus() {
   document.getElementById('sam6dState').innerHTML = stateText(data.sam6d);
   document.getElementById('perceptionState').innerHTML = stateText(data.perception);
   document.getElementById('graspState').innerHTML = stateText(data.grasp);
+  const llmStatus = document.getElementById('llmStatusText');
+  if (llmStatus && data.llm?.running) llmStatus.textContent = `LLM 执行运行中 pid=${data.llm.pid}`;
+  else if (llmStatus && data.llm?.returncode !== undefined && data.llm?.returncode !== null) llmStatus.textContent = `LLM 执行已退出 code=${data.llm.returncode}`;
+  if (!latestLlmResult && data.latest_llm_result && data.latest_llm_result.manifest_file) {
+    renderLlmResult(data.latest_llm_result);
+  }
   updatePerceptionAssetMarks(data);
   renderTargetStatus(data);
   renderTimeline(data);
@@ -2925,6 +3332,113 @@ function setImg(id, list) {
   img.src = `/image?path=${encodeURIComponent(item.path)}&t=${Date.now()}`;
   img.style.display = 'block';
   if (empty) empty.style.display = 'none';
+}
+
+function setPathImage(id, path, captionText) {
+  const img = document.getElementById(id + 'Img');
+  const cap = document.getElementById(id + 'Caption');
+  const empty = document.getElementById(id + 'Empty');
+  if (!img || !cap) return;
+  if (!path) {
+    cap.textContent = `${captionText || cap.textContent.split(' | ')[0]} | 暂无`;
+    img.removeAttribute('src');
+    img.style.display = 'none';
+    if (empty) empty.style.display = 'flex';
+    return;
+  }
+  cap.textContent = `${captionText || cap.textContent.split(' | ')[0]} | ${String(path).split('/').slice(-2).join('/')}`;
+  img.src = `/image?path=${encodeURIComponent(path)}&t=${Date.now()}`;
+  img.style.display = 'block';
+  if (empty) empty.style.display = 'none';
+}
+
+async function loadLlmScenes() {
+  const data = await (await fetch('/api/llm/scenes')).json();
+  const select = document.getElementById('llmSceneFile');
+  if (!select || !data.ok) return;
+  const current = select.value;
+  select.innerHTML = '';
+  (data.scenes || []).forEach((item) => {
+    const opt = document.createElement('option');
+    opt.value = item.path;
+    opt.textContent = `${item.rel} (${item.object_count} objects)`;
+    select.appendChild(opt);
+  });
+  if (current && Array.from(select.options).some((opt) => opt.value === current)) select.value = current;
+}
+
+function llmConfig() {
+  return {
+    scene_file: document.getElementById('llmSceneFile').value,
+    llm_provider: document.getElementById('llmProvider').value,
+    llm_model: document.getElementById('llmModel').value.trim(),
+    llm_api_base: document.getElementById('llmApiBase').value.trim(),
+    llm_api_key_env: document.getElementById('llmApiKeyEnv').value.trim(),
+    render_mode: document.getElementById('llmRenderMode').value,
+    execute_real: document.getElementById('llmExecuteReal').checked,
+    real_control_hz: Number(document.getElementById('realHz').value || 30),
+    real_max_delta_per_step: Number(document.getElementById('realDelta').value || 0.1),
+  };
+}
+
+function renderLlmResult(result) {
+  latestLlmResult = result || null;
+  const stepRoot = document.getElementById('llmStepList');
+  const jsonPanel = document.getElementById('llmJsonPanel');
+  const commandPreview = document.getElementById('llmCommandPreview');
+  const manifestText = document.getElementById('llmManifestText');
+  if (!result) {
+    stepRoot.innerHTML = '<div class="llm-step"><b>暂无计划</b><small>输入命令后点击生成。</small></div>';
+    jsonPanel.textContent = '暂无';
+    commandPreview.value = '';
+    manifestText.textContent = 'manifest：暂无';
+    setPathImage('llmPreview', null, '俯视预览');
+    setPathImage('llmPreview3d', null, '3D 预览');
+    return;
+  }
+  stepRoot.innerHTML = '';
+  (result.steps || []).forEach((step) => {
+    const div = document.createElement('div');
+    div.className = 'llm-step';
+    const xyz = step.target_pose_xyz_m ? `目标 ${step.target_pose_xyz_m.map(x => Number(x).toFixed(3)).join(', ')}` : '';
+    const warn = (step.warnings || []).length ? `；警告 ${step.warnings.join('；')}` : '';
+    div.innerHTML = `<b>${step.index}. ${step.source_spec || step.source_id || '?'} · ${step.operator || ''}</b><small>${step.description || ''}${xyz ? '<br>' + xyz : ''}${warn}</small>`;
+    stepRoot.appendChild(div);
+  });
+  if (!(result.steps || []).length) {
+    stepRoot.innerHTML = '<div class="llm-step"><b>无步骤</b><small>LLM 没有生成可执行 pick-place step。</small></div>';
+  }
+  const combined = result.combined_command || {};
+  const firstStep = (result.steps || [])[0] || {};
+  commandPreview.value = combined.command || firstStep.command || '';
+  manifestText.textContent = `manifest：${result.manifest_file || '暂无'}`;
+  jsonPanel.textContent = JSON.stringify(result.raw_external_llm_plan || result.llm_plan || {}, null, 2);
+  const preview = result.target_pose_preview || {};
+  setPathImage('llmPreview', preview.target_pose_preview_image, '俯视预览');
+  setPathImage('llmPreview3d', preview.target_pose_preview_3d_image, '3D 预览');
+}
+
+async function runLlmPlan() {
+  const command = document.getElementById('llmCommand').value.trim();
+  if (!command) {
+    appendLog('LLM 命令为空');
+    return;
+  }
+  document.getElementById('llmStatusText').textContent = 'LLM 正在生成结构化计划和目标位姿...';
+  const data = await postJSON('/api/llm/plan', {command, config: llmConfig()});
+  renderLlmResult(data.result);
+  document.getElementById('llmStatusText').textContent = `计划已生成：${data.result.step_count || 0} 步`;
+  appendLog(`LLM 计划已生成：${data.result.manifest_file || ''}`);
+}
+
+async function startLlmPlan() {
+  const manifest = latestLlmResult?.manifest_file;
+  if (!manifest) {
+    appendLog('还没有 LLM manifest，先生成目标位姿预览');
+    return;
+  }
+  if (document.getElementById('llmExecuteReal').checked && !window.confirm('确认按 LLM 计划开始真机执行？')) return;
+  await postJSON('/api/llm/start', {manifest_file: manifest, execute_real: document.getElementById('llmExecuteReal').checked});
 }
 
 function drawGpu() {
@@ -3047,6 +3561,22 @@ document.getElementById('enterBtn').onclick = async () => { await postJSON('/api
 document.getElementById('retryBtn').onclick = async () => { await postJSON('/api/grasp/stdin', {text: 'r\n'}); };
 document.getElementById('quitBtn').onclick = async () => { await postJSON('/api/grasp/stdin', {text: 'q\n'}); };
 document.getElementById('refreshBtn').onclick = () => { refreshStatus(); refreshImages(); };
+document.querySelectorAll('.tab-btn').forEach((btn) => {
+  btn.onclick = () => switchTab(btn.dataset.tab);
+});
+document.getElementById('llmReloadScenesBtn').onclick = async () => { await loadLlmScenes(); appendLog('LLM 场景列表已刷新'); };
+document.getElementById('llmPlanBtn').onclick = async () => {
+  try { await runLlmPlan(); }
+  catch (err) {
+    document.getElementById('llmStatusText').textContent = `LLM 生成失败：${err.message || err}`;
+    appendLog(`LLM 生成失败：${err.message || err}`);
+  }
+};
+document.getElementById('llmRunBtn').onclick = async () => {
+  try { await startLlmPlan(); }
+  catch (err) { appendLog(`LLM 执行启动失败：${err.message || err}`); }
+};
+document.getElementById('llmStopBtn').onclick = async () => { await postJSON('/api/llm/stop'); };
 
 const es = new EventSource('/events');
 es.onmessage = (ev) => {
@@ -3063,6 +3593,8 @@ es.onmessage = (ev) => {
 setInterval(refreshStatus, 2000);
 setInterval(refreshImages, 2500);
 initControls();
+loadLlmScenes().catch((err) => appendLog(`LLM 场景列表加载失败：${err.message || err}`));
+renderLlmResult(null);
 renderPreflight({ok:false, checks:[], mapping:buildLocalMappingPreview()});
 refreshStatus();
 refreshImages();
