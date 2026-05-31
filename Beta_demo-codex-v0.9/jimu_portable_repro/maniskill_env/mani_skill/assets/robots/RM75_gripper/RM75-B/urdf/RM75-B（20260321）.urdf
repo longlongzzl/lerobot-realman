@@ -1,0 +1,313 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="RM75B_with_Gripper">
+
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0.00049987 5.2709E-05 0.060019" rpy="0 0 0" />
+      <mass value="1.862" />
+      <inertia ixx="0.0017232" ixy="-3.1058E-06" ixz="-3.7924E-05" iyy="0.0017051" iyz="1.3691E-06" izz="0.00090158" />
+    </inertial>
+    <visual>
+      <geometry><mesh filename="../meshes/base_link.dae" /></geometry>
+      <material name=""><color rgba="1 1 1 1" /></material>
+    </visual>
+    <collision>
+      <geometry><mesh filename="../meshes/base_link.dae" /></geometry>
+    </collision>
+  </link>
+
+  <link name="link_1">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.002 0.02692 -0.01332"/>
+      <mass value="2.16"/>
+      <inertia ixx="0.00539427" ixy="1.095E-05" ixz="1.635E-06" iyy="0.0048979" iyz="0.000793" izz="0.00311573"/>
+    </inertial>
+    <visual><geometry><mesh filename="../meshes/link_1.dae" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../meshes/link_1.dae" /></geometry>
+    </collision>
+  </link>
+  <joint name="joint_1" type="revolute">
+    <origin xyz="0 0 0.2405" rpy="0 0 0" />
+    <parent link="base_link" /><child link="link_1" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.106" upper="3.106" effort="60" velocity="3.14" />
+  </joint>
+
+  <link name="link_2">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.03531 -0.21398 0.03386"/>
+      <mass value="1.71"/>
+      <inertia ixx="0.0248674" ixy="-0.00430651" ixz="-0.00067797" iyy="0.00485548" iyz="0.00457245" izz="0.02387827"/>
+    </inertial>
+    <visual><geometry><mesh filename="../meshes/link_2.dae" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../meshes/link_2.dae" /></geometry>
+    </collision>
+  </link>
+  <joint name="joint_2" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5708 0 0" />
+    <parent link="link_1" /><child link="link_2" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.2689" upper="2.2689" effort="60" velocity="3.14" />
+  </joint>
+
+  <link name="link_3">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.06781 0.10749 0.01457"/>
+      <mass value="1.384"/>
+      <inertia ixx="0.0053694" ixy="0.0014185" ixz="-0.00092094" iyy="0.0032423" iyz="-0.00169178" izz="0.00501731"/>
+    </inertial>
+    <visual><geometry><mesh filename="../meshes/link_3.dae" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../meshes/link_3.dae" /></geometry>
+    </collision>
+  </link>
+  <joint name="joint_3" type="revolute">
+    <origin xyz="0 -0.1525 0" rpy="1.5708 0 0" />
+    <parent link="link_2" /><child link="link_3" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.106" upper="3.106" effort="30" velocity="3.14" />
+  </joint>
+
+  <link name="link_4">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.00021 0.02578 -0.02538"/>
+      <mass value="1.115"/>
+      <inertia ixx="0.00439263" ixy="5.028E-05" ixz="1.374E-05" iyy="0.0040077" iyz="0.00045338" izz="0.00110321"/>
+    </inertial>
+    <visual><geometry><mesh filename="../meshes/link_4.dae" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../meshes/link_4.dae" /></geometry>
+    </collision>
+  </link>
+  <joint name="joint_4" type="revolute">
+    <origin xyz="0 0 0.1035" rpy="-1.5708 0 0" />
+    <parent link="link_3" /><child link="link_4" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.356" upper="2.356" effort="30" velocity="3.14" />
+  </joint>
+
+  <link name="link_5">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.05428 0.01781 0.00543"/>
+      <mass value="1.275"/>
+      <inertia ixx="0.001202758" ixy="0.000492428" ixz="-0.00039147" iyy="0.0022876" iyz="-1.235E-04" izz="0.0026866"/>
+    </inertial>
+    <visual><geometry><mesh filename="../meshes/link_5.dae" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../meshes/link_5.dae" /></geometry>
+    </collision>
+  </link>
+  <joint name="joint_5" type="revolute">
+    <origin xyz="0 -0.21 0" rpy="1.5708 0 0" />
+    <parent link="link_4" /><child link="link_5" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.106" upper="3.106" effort="10" velocity="3.14" />
+  </joint>
+
+  <link name="link_6">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0.00064 -0.00952"/>
+      <mass value="0.1096"/>
+      <inertia ixx="4.5293E-05" ixy="0" ixz="0" iyy="4.8111E-05" iyz="0" izz="7.9715E-05"/>
+    </inertial>
+    <visual><geometry><mesh filename="../meshes/link_6.dae" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../meshes/link_6.dae" /></geometry>
+    </collision>
+  </link>
+  <joint name="joint_6" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5708 0 0" />
+    <parent link="link_5" /><child link="link_6" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.234" upper="2.234" effort="10" velocity="3.14" />
+  </joint>
+
+  <link name="link_7">
+    <inertial>
+      <origin xyz="0.001094 -0.000077 -0.010119" rpy="0 0 0" />
+      <mass value="0.107" />
+      <inertia ixx="0.000044123" ixy="-0.000000064" ixz="0.0000003" iyy="0.000035078" iyz="-0.000000029" izz="0.000065445" />
+    </inertial>
+    <visual>
+      <geometry><mesh filename="../meshes/link_7.dae" /></geometry>
+    <material name="arm_gray"><color rgba="0.5137254901960784 0.5137254901960784 0.5137254901960784 1" /></material></visual>
+    <collision>
+      <geometry><mesh filename="../meshes/link_7.dae" /></geometry>
+    </collision>
+  </link>
+  <joint name="joint_7" type="revolute">
+    <origin xyz="0 -0.144 0" rpy="1.5708 0 0" />
+    <parent link="link_6" /><child link="link_7" />
+    <axis xyz="0 0 1" />
+    <limit lower="-6.28" upper="6.28" effort="10" velocity="3.14" />
+  </joint>
+
+  <link name="gripper_base">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="1E-06" ixy="0" ixz="0" iyy="1E-06" iyz="0" izz="1E-06"/>
+    </inertial>
+  </link>
+
+  <link name="gripper_base_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="8.625E-08 -4.6583E-06 0.03145"/>
+      <mass value="0.49834"/>
+      <inertia ixx="0.00044011" ixy="-9.3372E-10" ixz="-6.3952E-10" iyy="0.00039230" iyz="-7.5684E-08" izz="0.00029652"/>
+    </inertial>
+    <visual>
+      <origin xyz="4.4025e-05 0.000129318 0.0141078" rpy="-0.00140938 0.00181551 -1.57195" />
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes_obj/gripper_base.obj" scale="1.00158 1.00158 1.00158" /></geometry>
+    </visual>
+    <collision>
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes/base_link.STL" /></geometry>
+    </collision>
+  </link>
+
+  <joint name="gripper_base_link_Joint" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="gripper_base" />
+    <child link="gripper_base_link" />
+  </joint>
+
+  <link name="gripper_Left_1_Link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0002 0.01994 0.02922"/>
+      <mass value="0.2877"/>
+      <inertia ixx="6.3646E-06" ixy="0" ixz="0" iyy="4.1074E-06" iyz="-2.6818E-06" izz="2.6818E-06"/>
+    </inertial>
+    <visual><origin xyz="0.00111294 0.00337362 -7.94229e-05" rpy="2.08623 1.56736 1.10298" /><geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes_obj/link_1.obj" scale="0.864627 0.864627 0.864627" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes/Left_1_Link.STL" /></geometry>
+    </collision>
+  </link>
+  <joint name="gripper_Left_1_Joint" type="revolute">
+    <origin xyz="0.030141 0 0.10415" rpy="1.5708 0 0" />
+    <parent link="gripper_base_link" /><child link="gripper_Left_1_Link" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="0.91" effort="10" velocity="10" />
+  </joint>
+
+  <link name="gripper_Left_Support_Link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0003 0.03739 -0.0208"/>
+      <mass value="0.6974"/>
+      <inertia ixx="3.355E-05" ixy="0" ixz="0" iyy="1.3589E-05" iyz="1.4929E-05" izz="2.563E-05"/>
+    </inertial>
+    <visual>
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes/Left_Support_Link.STL" /></geometry>
+      <material name="gripper_black"><color rgba="0.05 0.05 0.05 1" /></material>
+    </visual>
+    <collision>
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes/Left_Support_Link.STL" /></geometry>
+    </collision>
+  </link>
+  <joint name="gripper_Left_Support_Joint" type="revolute">
+    <origin xyz="0.040359 0.037365 0" rpy="0 0 0" />
+    <parent link="gripper_Left_1_Link" /><child link="gripper_Left_Support_Link" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="0.91" effort="10" velocity="10" />
+  </joint>
+
+  <link name="gripper_Left_2_Link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000123 0.05079 0.00104"/>
+      <mass value="0.25966"/>
+      <inertia ixx="5.7618E-05" ixy="-5.3592E-07" ixz="-1.4032E-08" iyy="6.2194E-06" iyz="-1.1818E-06" izz="6.2414E-05"/>
+    </inertial>
+    <visual><origin xyz="0.00128881 0.00371676 4.90749e-05" rpy="-0.283666 1.56309 -1.27674" /><geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes_obj/link_2.obj" scale="0.856241 0.856241 0.856241" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes/Left_2_Link.STL" /></geometry>
+    </collision>
+  </link>
+  <joint name="gripper_Left_2_Joint" type="revolute">
+    <origin xyz="0.016 0 0.121" rpy="1.5708 0 0" />
+    <parent link="gripper_base_link" /><child link="gripper_Left_2_Link" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="0.91" effort="10" velocity="10" />
+  </joint>
+
+  <link name="gripper_Right_1_Link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0002 0.01994 0.02922"/>
+      <mass value="0.2877"/>
+      <inertia ixx="6.3646E-06" ixy="0" ixz="0" iyy="4.1074E-06" iyz="-2.6818E-06" izz="2.6818E-06"/>
+    </inertial>
+    <visual><origin xyz="0.00108309 0.00335368 2.62743e-05" rpy="-3.00901 1.56853 2.29281" /><geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes_obj/link_1.obj" scale="0.868642 0.868642 0.868642" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes/Right_1_Link.STL" /></geometry>
+    </collision>
+  </link>
+  <joint name="gripper_Right_1_Joint" type="revolute">
+    <origin xyz="-0.030141 0 0.10415" rpy="1.5708 0 3.1416" />
+    <parent link="gripper_base_link" /><child link="gripper_Right_1_Link" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="0.91" effort="10" velocity="10" />
+  </joint>
+
+  <link name="gripper_Right_Support_Link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0003 0.03739 -0.0208"/>
+      <mass value="0.6974"/>
+      <inertia ixx="3.355E-05" ixy="0" ixz="0" iyy="1.3589E-05" iyz="1.4929E-05" izz="2.563E-05"/>
+    </inertial>
+    <visual>
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes/Right_Support_Link.STL" /></geometry>
+      <material name="gripper_black"><color rgba="0.05 0.05 0.05 1" /></material>
+    </visual>
+    <collision>
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes/Right_Support_Link.STL" /></geometry>
+    </collision>
+  </link>
+  <joint name="gripper_Right_Support_Joint" type="revolute">
+    <origin xyz="0.040359 0.037365 0" rpy="0 0 0" />
+    <parent link="gripper_Right_1_Link" /><child link="gripper_Right_Support_Link" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="0.91" effort="10" velocity="10" />
+  </joint>
+
+  <link name="gripper_Right_2_Link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000123 0.05079 0.00104"/>
+      <mass value="0.25966"/>
+      <inertia ixx="5.7618E-05" ixy="-5.3592E-07" ixz="-1.4032E-08" iyy="6.2194E-06" iyz="-1.1818E-06" izz="6.2414E-05"/>
+    </inertial>
+    <visual><origin xyz="0.00105785 0.00336014 9.51929e-05" rpy="-2.62763 1.56332 2.66538" /><geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes_obj/link_2.obj" scale="0.864297 0.864297 0.864297" /></geometry></visual>
+    <collision>
+      <geometry><mesh filename="../../crt_ctag2f90d_gripper_visualization/meshes/Right_2_Link.STL" /></geometry>
+    </collision>
+  </link>
+  <joint name="gripper_Right_2_Joint" type="revolute">
+    <origin xyz="-0.016 0 0.121" rpy="1.5708 0 3.1416" />
+    <parent link="gripper_base_link" /><child link="gripper_Right_2_Link" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="0.91" effort="10" velocity="10" />
+  </joint>
+
+  <link name="left_pad">
+    <inertial>
+      <mass value="0" />
+      <inertia ixx="0.00" ixy="0.00" ixz="0.00" iyy="0.00" iyz="0.00" izz="0.00" />
+    </inertial>
+  </link>
+  <joint name="left_pad_joint" type="fixed">
+    <parent link="gripper_Left_Support_Link" />
+    <child link="left_pad" />
+    <origin rpy="0 0 0" xyz="-0.02 0.055 0" />
+  </joint>
+  <link name="right_pad">
+    <inertial>
+      <mass value="0" />
+      <inertia ixx="0.00" ixy="0.00" ixz="0.00" iyy="0.00" iyz="0.00" izz="0.00" />
+    </inertial>
+  </link>
+  <joint name="right_pad_joint" type="fixed">
+    <parent link="gripper_Right_Support_Link" />
+    <child link="right_pad" />
+    <origin rpy="0 0 0" xyz="-0.02 0.055 0" />
+  </joint>
+
+<link name="flange_spacer_8mm"><inertial><origin xyz="0 0 0.004000" rpy="0 0 0" /><mass value="0.050000" /><inertia ixx="1.55791666667e-05" ixy="0" ixz="0" iyy="1.55791666667e-05" iyz="0" izz="3.0625e-05" /></inertial><visual><origin xyz="0 0 0.004000" rpy="0 0 0" /><geometry><cylinder radius="0.037500" length="0.008000" /></geometry><material name="arm_gray"><color rgba="0.5137254901960784 0.5137254901960784 0.5137254901960784 1" /></material></visual><collision><origin xyz="0 0 0.004000" rpy="0 0 0" /><geometry><cylinder radius="0.037500" length="0.008000" /></geometry></collision></link><joint name="link7_to_flange_spacer_8mm" type="fixed"><origin xyz="0 0 0" rpy="0 0 0.5236" /><parent link="link_7" /><child link="flange_spacer_8mm" /></joint><joint name="flange_spacer_8mm_to_gripper_base" type="fixed"><origin xyz="0 0 0.008000" rpy="0 0 0" /><parent link="flange_spacer_8mm" /><child link="gripper_base" /></joint></robot>
