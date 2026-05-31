@@ -80,7 +80,7 @@ robot_cfg:
         "link_3": ["link_4", "link_5"],
         "link_4": ["link_5", "link_6"],
         "link_5": ["link_6", "link_7", "gripper_base_link"],
-        "link_6": ["link_7"],
+        "link_6": ["link_7", "gripper_base_link"],
         "link_7":
           [
             "gripper_base_link",

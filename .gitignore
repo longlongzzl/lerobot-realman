@@ -27,7 +27,24 @@ runs/
 output/
 outputs/
 results/
+planning_profile.jsonl
+planning_profile_logs/
+failure_renders/
+**/failure_renders/
+**/planning_profile_logs/
 pick_jiaobang/.curobo_torch_extensions/
+pick_jiaobang/sam6d_groundingdino_runs/
+pick_jiaobang/sam6d_grasp_scene_runs/
+pick_jiaobang/sam6d_template_cache/
+pick_jiaobang/sam6d_pem_feature_cache/
+pick_jiaobang/llm_pick_place_runs/
+Beta_demo-codex-v0.9/localization_debug/
+Beta_demo-codex-v0.9/sam6d_jimu_direct_runs/
+Beta_demo-codex-v0.9/sam6d_pose_init_runs/
+Beta_demo-codex-v0.9/v6_standard_four_wall_retry_build*/
+Beta_demo-codex-v0.9/multi_wall_path_v1/
+Demo_Triangle/runs/
+Demo_Triangle/reports/
 
 # Archives / data
 *.zip

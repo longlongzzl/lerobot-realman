@@ -2527,6 +2527,12 @@ def parse_args():
     parser.add_argument("--full-scene-pem-visualization", dest="full_scene_pem_visualization", action="store_true", default=True)
     parser.add_argument("--no-full-scene-pem-visualization", dest="full_scene_pem_visualization", action="store_false")
     parser.add_argument("--sam3-full-scene-result-json", type=str, default="")
+    parser.add_argument(
+        "--same-object-instance-start-index",
+        type=int,
+        default=0,
+        help="Start index into precomputed SAM3 instances for same-object multi-instance PEM batches.",
+    )
     parser.add_argument("--post-pem-mask-refine", dest="post_pem_mask_refine", action="store_true", default=False)
     parser.add_argument("--no-post-pem-mask-refine", dest="post_pem_mask_refine", action="store_false")
     parser.add_argument("--post-pem-mask-refine-objects", type=str, default="lvmukuai,carriot,tennis")
@@ -2799,6 +2805,7 @@ def _run_same_object_multi_instance_pose(
     object_name, prompt, mesh_file, mesh_scale = resolve_object_inputs(args)
     run_dir.mkdir(parents=True, exist_ok=True)
     requested_count = max(1, int(instance_count))
+    instance_start = max(0, int(getattr(args, "same_object_instance_start_index", 0) or 0))
 
     with open(run_dir / "run_args.json", "w") as f:
         json.dump(
@@ -2809,6 +2816,7 @@ def _run_same_object_multi_instance_pose(
                 "mesh_file": mesh_file,
                 "mesh_scale": mesh_scale,
                 "requested_instances": requested_count,
+                "same_object_instance_start_index": instance_start,
                 "batch_same_object_instances": True,
             },
             f,
@@ -2836,7 +2844,8 @@ def _run_same_object_multi_instance_pose(
     metadata_by_index: dict[int, dict] = {}
     failed_results: list[dict] = []
     mask_t0 = time.perf_counter()
-    for instance_index in range(requested_count):
+    for local_instance_index in range(requested_count):
+        instance_index = instance_start + local_instance_index
         item_dir = run_dir / f"instance_{instance_index:02d}"
         item_dir.mkdir(parents=True, exist_ok=True)
         if instance_index >= len(precomputed_list):
@@ -2846,7 +2855,10 @@ def _run_same_object_multi_instance_pose(
                     "ok": False,
                     "sam3_instance_index": int(instance_index),
                     "run_dir": str(item_dir),
-                    "error": f"SAM3 produced only {len(precomputed_list)} instance(s), requested {requested_count}",
+                    "error": (
+                        f"SAM3 produced only {len(precomputed_list)} instance(s), "
+                        f"requested range [{instance_start}, {instance_start + requested_count})"
+                    ),
                 }
             )
             continue
@@ -2946,7 +2958,7 @@ def _run_same_object_multi_instance_pose(
 
     print(
         f"[sam6d-gdino] batch same-object instances: {len(entries)}/{requested_count} "
-        f"object={object_name} mask_ms={mask_elapsed_ms:.2f} run_dir={run_dir}"
+        f"object={object_name} start={instance_start} mask_ms={mask_elapsed_ms:.2f} run_dir={run_dir}"
     )
 
     if not entries:

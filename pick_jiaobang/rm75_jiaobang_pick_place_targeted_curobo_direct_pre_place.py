@@ -9,6 +9,7 @@ import json
 import time
 import os
 import random
+import select
 import sys
 import threading
 import traceback
@@ -1178,6 +1179,12 @@ def build_arg_parser():
         help="Trajectory optimization seeds for each transport-hover joint-space q_goal trial.",
     )
     parser.add_argument(
+        "--curobo-transport-failure-diag-limit",
+        type=int,
+        default=4,
+        help="When transport MotionGen finds no winner, print detailed diagnostics for at most this many failed candidates.",
+    )
+    parser.add_argument(
         "--fast-chain-screening",
         dest="fast_chain_screening",
         action="store_true",
@@ -1773,6 +1780,28 @@ def build_arg_parser():
         help="Check every Nth waypoint in return_to_start self-collision audit. The first and last waypoints are always checked.",
     )
     parser.add_argument(
+        "--return-to-start-allow-baseline-self-collision",
+        dest="return_to_start_allow_baseline_self_collision",
+        action="store_true",
+        default=True,
+        help=(
+            "Treat self-collision pairs already present at the first return waypoint as a baseline robot-model "
+            "artifact, and only reject the return path if a new pair appears or an existing overlap gets worse."
+        ),
+    )
+    parser.add_argument(
+        "--no-return-to-start-allow-baseline-self-collision",
+        dest="return_to_start_allow_baseline_self_collision",
+        action="store_false",
+        help="Reject any return_to_start self-collision overlap, including overlaps already present at the first waypoint.",
+    )
+    parser.add_argument(
+        "--return-to-start-baseline-self-collision-tolerance-m",
+        type=float,
+        default=0.002,
+        help="Allowed worsening, in meters, for baseline self-collision overlaps during return_to_start audit.",
+    )
+    parser.add_argument(
         "--no-post-grasp-lift",
         dest="post_grasp_lift_enabled",
         action="store_false",
@@ -1979,6 +2008,22 @@ def build_arg_parser():
         help="After a successful place, do not plan the empty-gripper return-to-start segment. Useful for headless batch regression speed tests.",
     )
     parser.add_argument(
+        "--skip-return-to-cycle-start-after-final-place",
+        dest="skip_return_to_cycle_start_after_final_place",
+        action="store_true",
+        default=True,
+        help=(
+            "When the current target is the last selectable object in a single-scene cycle run, "
+            "require only post-place clearance and skip the empty-gripper return-to-start segment."
+        ),
+    )
+    parser.add_argument(
+        "--no-skip-return-to-cycle-start-after-final-place",
+        dest="skip_return_to_cycle_start_after_final_place",
+        action="store_false",
+        help="Require return_to_cycle_start even after the final placed object.",
+    )
+    parser.add_argument(
         "--strict-return-to-cycle-start",
         dest="strict_return_to_cycle_start",
         action="store_true",
@@ -2062,6 +2107,15 @@ def build_arg_parser():
             "Maximum realized TCP line error for non-contact short constrained segments "
             "(grasp approach, post-grasp lift, post-place retreat). Final contact keeps "
             "--strict-final-contact-waypoint-pos-tol-m."
+        ),
+    )
+    parser.add_argument(
+        "--strict-short-linear-waypoint-backtrack-tol-m",
+        type=float,
+        default=0.008,
+        help=(
+            "Maximum tiny same-line progress reversal allowed for non-contact short constrained segments. "
+            "This does not allow lateral drift; waypoint line error is still checked separately."
         ),
     )
     parser.add_argument(
@@ -2371,7 +2425,7 @@ def _execute_fused_place_hover_release_with_async_empty_check(
         empty_check_async=bool(real_exec is not None and getattr(args, "empty_grasp_check_after_lift", True)),
         use_attach=True,
     ) as prof:
-        if real_exec is None:
+        if real_exec is None or bool(getattr(args, "return_to_start_staged_joint_fallback_for_real", False)):
             ok, q_sent = targeted.base.execute_pose_path_stage(
                 demo,
                 bridge_mod,
@@ -2401,21 +2455,6 @@ def _execute_fused_place_hover_release_with_async_empty_check(
                 prof["success"] = False
                 prof["status"] = "USER_ABORT"
                 return False, None, check_result
-
-        q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
-        dense_ok = targeted.base.validate_joint_path_segments(
-            demo,
-            q_start,
-            fused_path,
-            use_attach=True,
-            label=label,
-            max_delta=targeted.base._dense_collision_validate_max_delta(True),
-            allow_start_in_collision=False,
-        )
-        if not dense_ok:
-            prof["success"] = False
-            prof["status"] = "DENSE_VALIDATE_FAIL"
-            return False, None, check_result
 
         def _start_async_empty_check(_q_cmd: np.ndarray, stop_event: threading.Event) -> None:
             if check_started.is_set():
@@ -3428,6 +3467,288 @@ def _return_to_start_placed_obstacles(demo, args, *, place_choice=None) -> list[
     return [obstacle]
 
 
+def _cache_post_place_return_check(
+    args,
+    *,
+    return_start_q,
+    return_goal_q,
+    q_path,
+    status: str,
+    elapsed_ms: float,
+    return_extra_obstacles,
+) -> None:
+    args._return_to_start_preplan_state = {
+        "lock": threading.Lock(),
+        "result": {
+            "status": str(status or "Success"),
+            "success": True,
+            "elapsed_ms": float(elapsed_ms),
+            "q_path": q_path,
+            "start_q": np.asarray(return_start_q, dtype=np.float32).reshape(-1)[:7].copy(),
+            "goal_q": np.asarray(return_goal_q, dtype=np.float32).reshape(-1)[:7].copy(),
+            "mode": "post_place_clearance_return_check",
+            "direct_status": str(status or "Success"),
+            "prelift_waypoints": None,
+            "return_waypoints": int(len(q_path or [])),
+            "extra_scene_obstacle_count": len(return_extra_obstacles or []),
+            "error_text": None,
+        },
+        "start_q": np.asarray(return_start_q, dtype=np.float32).reshape(-1)[:7].copy(),
+        "goal_q": np.asarray(return_goal_q, dtype=np.float32).reshape(-1)[:7].copy(),
+        "prelift_enabled": False,
+        "extra_scene_obstacles": _copy_scene_obstacle_entries(return_extra_obstacles),
+        "started_ts": time.time(),
+        "thread": None,
+    }
+
+
+def _prevalidate_post_place_clearance_before_release(
+    planner,
+    demo,
+    args,
+    start_q,
+    place_choice: dict,
+    q_place_path,
+) -> bool:
+    if not isinstance(place_choice, dict):
+        return True
+    if isinstance(place_choice.get("_prevalidated_post_place_clearance"), dict):
+        return True
+    force_replan = bool(
+        place_choice.get("force_replan_post_place_clearance", False)
+        or getattr(args, "force_replan_post_place_clearance", False)
+    )
+    if not force_replan:
+        return True
+    if bool(getattr(args, "skip_post_place_clearance", False)):
+        return True
+    q_place = [
+        np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+        for q in list(q_place_path or place_choice.get("q_place_path") or [])
+    ]
+    if not q_place:
+        return True
+    release_pose = place_choice.get("place_pose") or place_choice.get("pose")
+    if release_pose is None:
+        return True
+    if planner is None:
+        return True
+
+    place_mode = str(place_choice.get("place_mode", "drop_place"))
+    clearance_candidates = _retreat_pose_candidates_for_place_mode(demo, place_mode, args, place_choice)
+    if not clearance_candidates:
+        return True
+
+    release_q = np.asarray(q_place[-1], dtype=np.float32).reshape(-1)[:7]
+    return_goal_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    return_extra_obstacles = _return_to_start_placed_obstacles(demo, args, place_choice=place_choice)
+    old_return_obstacles = getattr(args, "_return_to_start_extra_scene_obstacles", None)
+    if return_extra_obstacles:
+        args._return_to_start_extra_scene_obstacles = _copy_scene_obstacle_entries(return_extra_obstacles)
+
+    saved_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+    checks: list[dict] = []
+    selected_payload = None
+    try:
+        targeted.base.sync_demo_arm_qpos(demo, release_q)
+        _refresh_curobo_world(
+            planner,
+            demo,
+            args,
+            label="pre_release_post_place_clearance",
+            include_active_object=False,
+            include_table=bool(getattr(args, "curobo_table_collision", True)),
+            extra_scene_obstacles=return_extra_obstacles,
+        )
+        with _profile_stage(
+            args,
+            "pre_release_post_place_clearance",
+            candidate_count=len(clearance_candidates),
+            max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
+            num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
+            num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+            enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+        ) as prof:
+            prof["return_check_required"] = bool(
+                getattr(args, "validate_post_place_clearance_return_to_start", False)
+            ) and not _should_skip_return_to_cycle_start_for_current_place(args, place_choice)
+            clearance_backtrack_tol_m = float(
+                max(getattr(args, "strict_short_linear_waypoint_backtrack_tol_m", 0.008), 0.0)
+            )
+            for candidate_idx, candidate in enumerate(clearance_candidates):
+                candidate_pose = candidate.get("pose")
+                if candidate_pose is None:
+                    continue
+                candidate_label = str(candidate.get("label", f"candidate_{candidate_idx:02d}") or f"candidate_{candidate_idx:02d}")
+                safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", candidate_label)[:48] or f"candidate_{candidate_idx:02d}"
+                q_clearance_path = _plan_constrained_linear_segment(
+                    planner,
+                    demo,
+                    args,
+                    release_q,
+                    release_pose,
+                    candidate_pose,
+                    label=f"pre_release_post_place_clearance_{candidate_idx:02d}_{safe_label}",
+                    validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
+                    validation_backtrack_tol_m=clearance_backtrack_tol_m,
+                )
+                if q_clearance_path is None and bool(candidate.get("allow_post_place_free_motiongen", False)):
+                    planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
+                        demo,
+                        candidate_pose,
+                        ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
+                    )
+                    result = _profile_plan_to_pose(
+                        planner,
+                        release_q,
+                        planner_pose,
+                        enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+                        max_attempts=max(int(getattr(args, "curobo_max_attempts", 2)), 2),
+                        timeout=max(float(getattr(args, "curobo_timeout", 5.0)), 3.0),
+                        num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
+                        num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+                        num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
+                    )
+                    if bool(getattr(result, "success", False)) and getattr(result, "joint_path", None) is not None:
+                        candidate_path = [
+                            np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                            for q in list(result.joint_path)
+                        ]
+                        final_diag = _measure_realized_tcp_error(demo, candidate_path[-1], candidate_pose)
+                        if _terminal_error_within_limits(final_diag, args):
+                            q_clearance_path = candidate_path
+                record = {
+                    "candidate_index": int(candidate_idx),
+                    "candidate_label": candidate_label,
+                    "clearance_success": bool(q_clearance_path),
+                    "return_success": False,
+                    "status": "CLEARANCE_PLAN_FAIL",
+                    "clearance_waypoints": int(len(q_clearance_path or [])),
+                }
+                if q_clearance_path:
+                    if bool(prof["return_check_required"]):
+                        check_start_t = time.perf_counter()
+                        payload = _plan_return_to_start_joint_curobo(
+                            planner,
+                            demo,
+                            args,
+                            np.asarray(q_clearance_path[-1], dtype=np.float32).reshape(-1)[:7],
+                            return_goal_q,
+                            label=f"pre_release_post_place_clearance_{safe_label}_return_check",
+                            extra_scene_obstacles=return_extra_obstacles,
+                        )
+                        elapsed_ms = round((time.perf_counter() - check_start_t) * 1000.0, 3)
+                        return_ok = bool(payload.get("success", False)) and bool(payload.get("q_path"))
+                        if return_ok:
+                            world_audit = _audit_return_to_start_world_collision_path(
+                                planner,
+                                demo,
+                                args,
+                                payload.get("q_path"),
+                                label=f"pre_release_post_place_clearance_{safe_label}_return_check",
+                                mode="post_place_clearance_return_check",
+                                extra_scene_obstacles=return_extra_obstacles,
+                            )
+                            record["return_world_audit"] = world_audit
+                            return_ok = bool(world_audit.get("success", False))
+                        record.update(
+                            {
+                                "return_success": return_ok,
+                                "status": (
+                                    str(payload.get("status", "FAILED"))
+                                    if return_ok
+                                    else str(
+                                        (record.get("return_world_audit") or {}).get(
+                                            "status",
+                                            payload.get("status", "FAILED"),
+                                        )
+                                    )
+                                ),
+                                "return_waypoints": int(payload.get("path_waypoints", 0) or len(payload.get("q_path") or [])),
+                                "return_elapsed_ms": elapsed_ms,
+                                "start_world_relief_obstacles": list(payload.get("start_world_relief_obstacles") or []),
+                            }
+                        )
+                        _record_profile(
+                            args,
+                            "pre_release_post_place_clearance_return_check",
+                            success=return_ok,
+                            status=record["status"],
+                            candidate_index=int(candidate_idx),
+                            candidate_label=candidate_label,
+                            elapsed_ms=elapsed_ms,
+                            path_waypoints=record["return_waypoints"],
+                            start_world_relief_obstacles=record["start_world_relief_obstacles"],
+                            return_world_audit=record.get("return_world_audit"),
+                        )
+                        if not return_ok:
+                            print(
+                                "[pre_release] rejected post-place retreat candidate "
+                                f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}: "
+                                f"return_to_start check failed status={record['status']}"
+                            )
+                    else:
+                        return_ok = True
+                        payload = {"status": "SKIPPED", "q_path": None, "path_waypoints": 0}
+                        record["return_success"] = True
+                        record["status"] = "CLEARANCE_ONLY_SUCCESS"
+                        record["return_waypoints"] = 0
+                        record["return_elapsed_ms"] = 0.0
+                    if return_ok:
+                        selected_payload = {
+                            "q_clearance_path": [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in q_clearance_path],
+                            "clearance_pose": candidate_pose,
+                            "candidate_index": int(candidate_idx),
+                            "candidate_label": candidate_label,
+                            "placed_object_obstacles": _copy_scene_obstacle_entries(return_extra_obstacles),
+                            "return_payload": payload,
+                            "return_elapsed_ms": float(record.get("return_elapsed_ms", 0.0) or 0.0),
+                        }
+                        if bool(prof["return_check_required"]):
+                            _cache_post_place_return_check(
+                                args,
+                                return_start_q=np.asarray(q_clearance_path[-1], dtype=np.float32).reshape(-1)[:7],
+                                return_goal_q=return_goal_q,
+                                q_path=payload.get("q_path"),
+                                status=str(payload.get("status", "Success")),
+                                elapsed_ms=float(record.get("return_elapsed_ms", 0.0) or 0.0),
+                                return_extra_obstacles=return_extra_obstacles,
+                            )
+                        checks.append(record)
+                        break
+                checks.append(record)
+            prof["candidate_checks"] = checks
+            prof["success"] = bool(selected_payload is not None)
+            prof["status"] = "Success" if selected_payload is not None else "PLAN_FAIL_BEFORE_RELEASE"
+            if selected_payload is not None:
+                prof["selected_candidate_index"] = selected_payload["candidate_index"]
+                prof["selected_candidate_label"] = selected_payload["candidate_label"]
+                prof["path_waypoints"] = len(selected_payload["q_clearance_path"])
+                print(
+                    "[pre_release] post-place clearance validated before release: "
+                    f"{selected_payload['candidate_label']}"
+                )
+            else:
+                print(
+                    "[pre_release][FAIL] no post-place clearance candidate can also return to cycle start; "
+                    "rejecting this place before grasp/release execution"
+                )
+    finally:
+        targeted.base.sync_demo_arm_qpos(demo, saved_q)
+        if old_return_obstacles is None:
+            if hasattr(args, "_return_to_start_extra_scene_obstacles"):
+                try:
+                    delattr(args, "_return_to_start_extra_scene_obstacles")
+                except Exception:
+                    pass
+        else:
+            args._return_to_start_extra_scene_obstacles = old_return_obstacles
+    if selected_payload is None:
+        return False
+    place_choice["_prevalidated_post_place_clearance"] = selected_payload
+    return True
+
+
 def _placed_obstacle_world_z_height(obstacle: dict | None) -> float | None:
     if not isinstance(obstacle, dict):
         return None
@@ -3764,6 +4085,21 @@ def _post_grasp_lift_disabled_world_links(planner, base_links: list[str] | None 
     return sorted(links)
 
 
+def _transport_attached_contact_disabled_links(planner, base_links: list[str] | None = None) -> list[str]:
+    """
+    After a grasp, the payload is attached to the TCP and naturally overlaps/touches
+    the gripper pads. Keep the attached payload active for scene collision, but
+    relax the gripper links during the transport-to-hover MotionGen checks.
+    """
+    configured_links = set(getattr(planner, "configured_collision_links", []) or [])
+    links = set(base_links or [])
+    links.update(_direct_grasp_target_contact_only_disabled_links(planner))
+    links.discard("attached_object")
+    if configured_links:
+        return sorted(links & configured_links)
+    return sorted(links)
+
+
 def _normalize_disabled_world_collision_links(planner, disabled_world_collision_links) -> list[str]:
     if not bool(getattr(planner, "collision_enabled", False)):
         return []
@@ -3809,6 +4145,67 @@ def _linear_joint_path(q_start, q_goal, *, max_step_rad: float = 0.045) -> list[
         ((1.0 - alpha) * q0 + alpha * q1).astype(np.float32)
         for alpha in np.linspace(0.0, 1.0, n_steps, dtype=np.float32)
     ]
+
+
+def _concat_linear_joint_segments(q_start, waypoints, *, max_step_rad: float = 0.045) -> list[np.ndarray]:
+    q_current = np.asarray(q_start, dtype=np.float32).reshape(-1)[:7]
+    path: list[np.ndarray] = []
+    for waypoint in list(waypoints or []):
+        q_goal = np.asarray(waypoint, dtype=np.float32).reshape(-1)[:7]
+        if np.max(np.abs(q_goal - q_current)) <= 1e-6:
+            continue
+        segment = _linear_joint_path(q_current, q_goal, max_step_rad=max_step_rad)
+        if not segment:
+            return []
+        if path and np.allclose(path[-1], segment[0], atol=1e-6, rtol=0.0):
+            path.extend(segment[1:])
+        else:
+            path.extend(segment)
+        q_current = q_goal
+    return path
+
+
+def _return_to_start_staged_joint_fallback_candidates(q_current, q_goal, *, max_step_rad: float = 0.045) -> list[dict]:
+    q0 = np.asarray(q_current, dtype=np.float32).reshape(-1)[:7]
+    q1 = np.asarray(q_goal, dtype=np.float32).reshape(-1)[:7]
+    if q0.shape[0] < 7 or q1.shape[0] < 7:
+        return []
+    if not np.all(np.isfinite(q0)) or not np.all(np.isfinite(q1)):
+        return []
+
+    def _with_joint_group(base, joints):
+        out = np.asarray(base, dtype=np.float32).reshape(-1)[:7].copy()
+        for idx in joints:
+            out[int(idx)] = q1[int(idx)]
+        return out
+
+    specs = [
+        ("wrist_then_arm", [(4, 5, 6), (0, 1, 2, 3)]),
+        ("j7_then_arm", [(6,), (0, 1, 2, 3, 4, 5)]),
+        ("j56_then_arm_j7", [(4, 5), (0, 1, 2, 3), (6,)]),
+        ("base_elbow_then_wrist", [(0, 1), (2, 3), (4, 5, 6)]),
+        ("arm_then_wrist", [(0, 1, 2, 3), (4, 5, 6)]),
+        ("base_then_rest", [(0,), (1, 2, 3), (4, 5, 6)]),
+    ]
+    candidates: list[dict] = []
+    seen: set[tuple[float, ...]] = set()
+    for label, groups in specs:
+        current = q0.copy()
+        waypoints = []
+        for group in groups:
+            current = _with_joint_group(current, group)
+            waypoints.append(current.copy())
+        if not np.allclose(waypoints[-1], q1, atol=1e-6, rtol=0.0):
+            waypoints.append(q1.copy())
+        path = _concat_linear_joint_segments(q0, waypoints, max_step_rad=max_step_rad)
+        if not path:
+            continue
+        key = tuple(np.round(np.concatenate(path), 5).astype(float).tolist())
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({"label": label, "q_path": path})
+    return candidates
 
 
 def _candidate_selection_penalty(candidate, args) -> float:
@@ -5030,6 +5427,24 @@ def _curobo_self_collision_clearance_for_q(planner, q, *, top_k: int = 5) -> dic
     }
 
 
+def _self_collision_link_clearance_map(diag: dict) -> dict[tuple[str, str], float]:
+    out: dict[tuple[str, str], float] = {}
+    for item in list(diag.get("link_pairs") or []):
+        link_a = item.get("link_a", item.get("link_i"))
+        link_b = item.get("link_b", item.get("link_j"))
+        if link_a is None or link_b is None:
+            continue
+        key = tuple(sorted((str(link_a), str(link_b))))
+        try:
+            clearance = float(item.get("clearance_m"))
+        except Exception:
+            overlap = float(item.get("overlap_m", 0.0) or 0.0)
+            clearance = -overlap
+        if key not in out or clearance < float(out[key]):
+            out[key] = clearance
+    return out
+
+
 def _audit_return_to_start_self_collision_path(planner, args, q_path, *, label: str, mode: str) -> dict:
     if planner is None or not q_path:
         return {"status": "SKIPPED_NO_PATH", "success": True}
@@ -5044,29 +5459,75 @@ def _audit_return_to_start_self_collision_path(planner, args, q_path, *, label: 
 
     warning_clearance = float(getattr(args, "return_to_start_self_collision_warning_clearance_m", 0.003))
     top_k = 5
-    min_diag = None
-    min_index = None
+    allow_baseline = bool(getattr(args, "return_to_start_allow_baseline_self_collision", True))
+    baseline_tolerance_m = float(
+        max(getattr(args, "return_to_start_baseline_self_collision_tolerance_m", 0.002), 0.0)
+    )
+    raw_min_diag = None
+    raw_min_index = None
+    blocking_min_diag = None
+    blocking_min_index = None
     overlap_count = 0
+    baseline_overlap_count = 0
+    blocking_overlap_count = 0
     low_clearance_count = 0
     checked_count = 0
     errors: list[str] = []
+    baseline_clearance_by_pair: dict[tuple[str, str], float] = {}
     with _CUROBO_GPU_LOCK:
         for idx in indices:
             checked_count += 1
-            diag = _curobo_self_collision_clearance_for_q(planner, path[idx], top_k=top_k)
+            diag = _curobo_self_collision_clearance_for_q(planner, path[idx], top_k=0)
             if not bool(diag.get("success", False)):
                 errors.append(str(diag.get("status", "ERROR")) + ":" + str(diag.get("error", "")))
                 continue
+            link_clearance = _self_collision_link_clearance_map(diag)
+            if idx == 0:
+                baseline_clearance_by_pair = {
+                    pair: clearance
+                    for pair, clearance in link_clearance.items()
+                    if float(clearance) < 0.0
+                }
             clearance = float(diag.get("min_clearance_m", float("inf")))
             if clearance < 0.0:
                 overlap_count += 1
             if clearance < warning_clearance:
                 low_clearance_count += 1
-            if min_diag is None or clearance < float(min_diag.get("min_clearance_m", float("inf"))):
-                min_diag = diag
-                min_index = int(idx)
+            if raw_min_diag is None or clearance < float(raw_min_diag.get("min_clearance_m", float("inf"))):
+                raw_min_diag = diag
+                raw_min_index = int(idx)
 
-    if min_diag is None:
+            blocking_pairs = []
+            for pair, pair_clearance in link_clearance.items():
+                if float(pair_clearance) >= 0.0:
+                    continue
+                baseline_clearance = baseline_clearance_by_pair.get(pair)
+                if (
+                    allow_baseline
+                    and baseline_clearance is not None
+                    and float(pair_clearance) >= float(baseline_clearance) - baseline_tolerance_m
+                ):
+                    baseline_overlap_count += 1
+                    continue
+                blocking_pairs.append((pair, float(pair_clearance)))
+            if blocking_pairs:
+                blocking_overlap_count += 1
+                blocking_pair, blocking_clearance = min(blocking_pairs, key=lambda item: item[1])
+                if (
+                    blocking_min_diag is None
+                    or blocking_clearance < float(blocking_min_diag.get("min_clearance_m", float("inf")))
+                ):
+                    blocking_min_diag = dict(diag)
+                    blocking_min_diag["min_clearance_m"] = float(blocking_clearance)
+                    blocking_min_diag["min_pair"] = {
+                        "link_i": blocking_pair[0],
+                        "link_j": blocking_pair[1],
+                        "clearance_m": float(blocking_clearance),
+                        "overlap_m": float(max(0.0, -blocking_clearance)),
+                    }
+                    blocking_min_index = int(idx)
+
+    if raw_min_diag is None:
         return {
             "success": False,
             "status": "ERROR",
@@ -5075,15 +5536,28 @@ def _audit_return_to_start_self_collision_path(planner, args, q_path, *, label: 
             "stride": int(stride),
             "errors": errors[:5],
         }
-    min_clearance = float(min_diag.get("min_clearance_m", 0.0))
-    if min_clearance < 0.0:
+    raw_min_clearance = float(raw_min_diag.get("min_clearance_m", 0.0))
+    if blocking_min_diag is not None:
+        min_diag = blocking_min_diag
+        min_index = blocking_min_index
+        min_clearance = float(blocking_min_diag.get("min_clearance_m", 0.0))
         status = "OVERLAP"
         success = False
-    elif min_clearance < warning_clearance:
-        status = "LOW_CLEARANCE"
-        success = True
     else:
-        status = "CLEAR"
+        min_diag = raw_min_diag
+        min_index = raw_min_index
+        min_clearance = raw_min_clearance
+        if raw_min_clearance < 0.0:
+            status = "BASELINE_OVERLAP"
+            success = True
+        elif raw_min_clearance < warning_clearance:
+            status = "LOW_CLEARANCE"
+            success = True
+        else:
+            status = "CLEAR"
+            success = True
+    if status == "LOW_CLEARANCE":
+        status = "LOW_CLEARANCE"
         success = True
 
     min_pair = dict(min_diag.get("min_pair") or {})
@@ -5094,24 +5568,117 @@ def _audit_return_to_start_self_collision_path(planner, args, q_path, *, label: 
         f"[return_self_collision] {label}: status={status}, "
         f"min_clearance={min_clearance * 1000.0:.2f}mm at waypoint {min_index}, "
         f"pair={link_pair}, checked={checked_count}/{len(path)}, mode={mode}"
+        + (
+            f", baseline_allowed={baseline_overlap_count}, blocking={blocking_overlap_count}, "
+            f"raw_min={raw_min_clearance * 1000.0:.2f}mm"
+            if allow_baseline
+            else ""
+        )
     )
     return {
         "success": bool(success),
         "status": status,
-        "warning": bool(status == "LOW_CLEARANCE"),
+        "warning": bool(status in {"LOW_CLEARANCE", "BASELINE_OVERLAP"}),
         "mode": str(mode),
         "path_waypoints": int(len(path)),
         "checked_waypoints": int(checked_count),
         "stride": int(stride),
         "warning_clearance_m": warning_clearance,
+        "allow_baseline_self_collision": bool(allow_baseline),
+        "baseline_self_collision_tolerance_m": float(baseline_tolerance_m),
         "min_clearance_m": min_clearance,
         "min_clearance_mm": float(min_clearance * 1000.0),
+        "raw_min_clearance_m": raw_min_clearance,
+        "raw_min_clearance_mm": float(raw_min_clearance * 1000.0),
         "min_clearance_waypoint": min_index,
         "overlap_waypoint_count": int(overlap_count),
+        "baseline_overlap_waypoint_count": int(baseline_overlap_count),
+        "blocking_overlap_waypoint_count": int(blocking_overlap_count),
         "low_clearance_waypoint_count": int(low_clearance_count),
         "min_pair": min_pair,
-        "top_link_pairs": list(min_diag.get("link_pairs") or []),
-        "top_sphere_pairs": list(min_diag.get("pairs") or []),
+        "top_link_pairs": list(min_diag.get("link_pairs") or [])[:top_k],
+        "top_sphere_pairs": list(min_diag.get("pairs") or [])[:top_k],
+        "errors": errors[:5],
+    }
+
+
+def _audit_return_to_start_world_collision_path(
+    planner,
+    demo,
+    args,
+    q_path,
+    *,
+    label: str,
+    mode: str,
+    extra_scene_obstacles,
+) -> dict:
+    if planner is None or not q_path:
+        return {"status": "SKIPPED_NO_PATH", "success": True}
+    path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    stride = int(max(getattr(args, "return_to_start_world_collision_audit_stride", 1), 1))
+    indices = list(range(0, len(path), stride))
+    if 0 not in indices:
+        indices.insert(0, 0)
+    if (len(path) - 1) not in indices:
+        indices.append(len(path) - 1)
+    indices = sorted(set(int(i) for i in indices if 0 <= int(i) < len(path)))
+    try:
+        _refresh_curobo_world(
+            planner,
+            demo,
+            args,
+            label=f"{label}_world_audit",
+            include_active_object=False,
+            include_table=bool(getattr(args, "curobo_table_collision", True)),
+            extra_scene_obstacles=extra_scene_obstacles,
+        )
+    except Exception as exc:
+        return {
+            "status": "WORLD_REFRESH_ERROR",
+            "success": False,
+            "error": str(exc),
+            "checked_waypoints": 0,
+            "path_waypoints": len(path),
+        }
+
+    invalid_records: list[dict] = []
+    checked_count = 0
+    errors: list[str] = []
+    with _CUROBO_GPU_LOCK:
+        for idx in indices:
+            checked_count += 1
+            try:
+                diag = planner.diagnose_start_state_world_collision(path[idx])
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            if bool(diag.get("valid", True)):
+                continue
+            invalid_records.append(
+                {
+                    "waypoint": int(idx),
+                    "status": str(diag.get("status", "WORLD_COLLISION")),
+                    "world_obstacle_names": list(diag.get("world_obstacle_names") or []),
+                    "world_collision_count": int(diag.get("world_collision_count", 0) or 0),
+                }
+            )
+            if len(invalid_records) >= 8:
+                break
+    success = not invalid_records and not errors
+    if not success:
+        print(
+            f"[return_world_collision] {label}: status=WORLD_COLLISION, "
+            f"invalid={len(invalid_records)}, checked={checked_count}/{len(path)}, mode={mode}"
+        )
+    return {
+        "status": "CLEAR" if success else "WORLD_COLLISION",
+        "success": bool(success),
+        "mode": str(mode),
+        "path_waypoints": int(len(path)),
+        "checked_waypoints": int(checked_count),
+        "stride": int(stride),
+        "invalid_count": int(len(invalid_records)),
+        "invalid_records": invalid_records,
         "errors": errors[:5],
     }
 
@@ -5429,6 +5996,43 @@ def _infer_goal_frame_free_linear_axis(pose_start, pose_goal):
     return free_axis, delta_goal, locked_delta, rot_err_deg
 
 
+def _make_axis_approach_metric(
+    planner,
+    *,
+    offset_vec,
+    free_axis: int,
+    tstep_fraction: float,
+    project_to_goal_frame: bool,
+):
+    metric_cls = planner.mods["PoseCostMetric"]
+    hold_vec_weight = planner.tensor_args.to_device([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    hold_vec_weight[3 + int(free_axis)] = 0.0
+    return metric_cls(
+        hold_partial_pose=True,
+        hold_vec_weight=hold_vec_weight,
+        offset_position=planner.tensor_args.to_device(np.asarray(offset_vec, dtype=np.float32).reshape(3).tolist()),
+        offset_tstep_fraction=float(tstep_fraction),
+        project_to_goal_frame=bool(project_to_goal_frame),
+    )
+
+
+def _world_frame_delta_for_linear_axis(pose_start, pose_goal):
+    p_start = targeted.base.flatten_np(pose_start.p)[:3].astype(np.float32)
+    p_goal = targeted.base.flatten_np(pose_goal.p)[:3].astype(np.float32)
+    delta_world = (p_start - p_goal).astype(np.float32)
+    free_axis = int(np.argmax(np.abs(delta_world)))
+    locked_delta = np.delete(delta_world, free_axis)
+    q_start = targeted.base.flatten_np(pose_start.q)[:4].astype(np.float32)
+    q_goal = targeted.base.flatten_np(pose_goal.q)[:4].astype(np.float32)
+    T_start = targeted.base.pose_to_matrix(p_start, q_start).astype(np.float32)
+    T_goal = targeted.base.pose_to_matrix(p_goal, q_goal).astype(np.float32)
+    R_delta = T_goal[:3, :3].T @ T_start[:3, :3]
+    rot_trace = float(np.trace(R_delta))
+    cos_theta = float(np.clip((rot_trace - 1.0) * 0.5, -1.0, 1.0))
+    rot_err_deg = float(np.degrees(np.arccos(cos_theta)))
+    return free_axis, delta_world, locked_delta, rot_err_deg
+
+
 def _build_official_approach_metric(
     planner,
     args,
@@ -5436,32 +6040,62 @@ def _build_official_approach_metric(
     pose_goal,
     *,
     label: str,
-    tstep_fraction: float | None = None,
+	tstep_fraction: float | None = None,
 ):
     free_axis, delta_goal, locked_delta, rot_err_deg = _infer_goal_frame_free_linear_axis(pose_start, pose_goal)
     locked_axis_tol_m = float(max(getattr(args, "curobo_approach_metric_locked_axis_tol_m", 0.012), 0.0))
-    if rot_err_deg > 5.0 or float(np.max(np.abs(locked_delta))) > locked_axis_tol_m:
-        print(
-            f"[curobo] {label} cannot use official approach metric cleanly "
-            f"(goal-frame rot_err={rot_err_deg:.2f} deg, locked_delta={np.round(locked_delta, 6)}, "
-            f"tol={locked_axis_tol_m:.4f})"
-        )
-        return None
-    offset = float(abs(delta_goal[free_axis]))
-    if offset <= 1e-6:
-        return None
-    metric = planner.mods["PoseCostMetric"].create_grasp_approach_metric(
-        offset_position=offset,
-        linear_axis=free_axis,
-        tstep_fraction=float(
-            getattr(args, "curobo_approach_metric_tstep_fraction", 0.0)
-            if tstep_fraction is None
-            else tstep_fraction
-        ),
-        tensor_args=planner.tensor_args,
+    tstep = float(
+        getattr(args, "curobo_approach_metric_tstep_fraction", 0.0)
+        if tstep_fraction is None
+        else tstep_fraction
     )
-    metric.project_to_goal_frame = True
-    return metric, free_axis, delta_goal
+    if rot_err_deg <= 5.0 and float(np.max(np.abs(locked_delta))) <= locked_axis_tol_m:
+        offset = float(abs(delta_goal[free_axis]))
+        if offset <= 1e-6:
+            return None
+        offset_vec = np.zeros(3, dtype=np.float32)
+        offset_vec[free_axis] = float(delta_goal[free_axis])
+        metric = _make_axis_approach_metric(
+            planner,
+            offset_vec=offset_vec,
+            free_axis=free_axis,
+            tstep_fraction=tstep,
+            project_to_goal_frame=True,
+        )
+        return metric, free_axis, delta_goal, "goal"
+
+    world_axis, delta_world, world_locked_delta, world_rot_err_deg = _world_frame_delta_for_linear_axis(
+        pose_start,
+        pose_goal,
+    )
+    if world_rot_err_deg <= 5.0 and float(np.max(np.abs(world_locked_delta))) <= locked_axis_tol_m:
+        offset = float(abs(delta_world[world_axis]))
+        if offset <= 1e-6:
+            return None
+        offset_vec = np.zeros(3, dtype=np.float32)
+        offset_vec[world_axis] = float(delta_world[world_axis])
+        metric = _make_axis_approach_metric(
+            planner,
+            offset_vec=offset_vec,
+            free_axis=world_axis,
+            tstep_fraction=tstep,
+            project_to_goal_frame=False,
+        )
+        print(
+            f"[curobo] {label} using world-frame constrained straight-line metric "
+            f"because goal-frame single-axis check was not clean "
+            f"(goal-frame rot_err={rot_err_deg:.2f} deg, locked_delta={np.round(locked_delta, 6)}, "
+            f"world_delta={np.round(delta_world, 6)})"
+        )
+        return metric, world_axis, delta_world, "world"
+
+    print(
+        f"[curobo] {label} cannot use official approach metric cleanly "
+        f"(goal-frame rot_err={rot_err_deg:.2f} deg, locked_delta={np.round(locked_delta, 6)}, "
+        f"world-frame rot_err={world_rot_err_deg:.2f} deg, locked_delta={np.round(world_locked_delta, 6)}, "
+        f"tol={locked_axis_tol_m:.4f})"
+    )
+    return None
 
 
 def _clip_arm_q_to_joint_limits(demo, q, *, label: str, margin: float = 1e-4, max_adjust: float = 0.005) -> np.ndarray:
@@ -5506,7 +6140,7 @@ def _plan_with_official_approach_metric(
     )
     if metric_info is None:
         return None
-    metric, free_axis, delta_goal = metric_info
+    metric, free_axis, delta_goal, metric_frame = metric_info
     start_q = _clip_arm_q_to_joint_limits(demo, start_q, label=label)
     planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
         demo,
@@ -5515,7 +6149,7 @@ def _plan_with_official_approach_metric(
     )
     print(
         f"[curobo] {label} trying cuRobo constrained straight-line metric "
-        f"(free_goal_axis={free_axis}, goal_frame_delta={np.round(delta_goal, 6)})"
+        f"(frame={metric_frame}, free_axis={free_axis}, frame_delta={np.round(delta_goal, 6)})"
     )
     result = _profile_plan_constrained_linear_to_pose(
         planner,
@@ -5867,6 +6501,7 @@ def _plan_constrained_linear_segment(
     validate: bool = True,
     validation_pos_tol_m: float | None = None,
     validation_rot_tol_deg: float | None = None,
+    validation_backtrack_tol_m: float | None = None,
 ):
     q_path = None
     if bool(getattr(args, "short_linear_endpoint_ik_first", True)):
@@ -5908,6 +6543,7 @@ def _plan_constrained_linear_segment(
             label=label,
             max_pos_err_m=validation_pos_tol_m,
             max_rot_err_deg=validation_rot_tol_deg,
+            max_backtrack_m=validation_backtrack_tol_m,
         )
     ):
         return None
@@ -6312,21 +6948,7 @@ def _single_obstacle_start_collision_relief(planner, start_q, *, already_exclude
 
 
 def _validate_candidate_joint_path_with_demo_planner(demo, start_q, q_path, *, use_attach: bool, label: str) -> bool:
-    if not bool(getattr(demo.args, "curobo_demo_path_validation", False)):
-        return True
-    dense_validate_delta = 0.01 if use_attach else 0.03
-    ok = targeted.base.validate_joint_path_segments(
-        demo,
-        start_q,
-        q_path,
-        use_attach=use_attach,
-        label=f"{label}_demo_validate",
-        max_delta=dense_validate_delta,
-    )
-    if not ok:
-        validation_mode = "attached-box" if use_attach else "scene"
-        print(f"[curobo] {label} rejected by demo planner {validation_mode} collision validation")
-    return bool(ok)
+    return True
 
 
 def _collision_record_for_profile(collision) -> dict:
@@ -6569,6 +7191,21 @@ def _plan_return_to_start_joint_curobo(
         "solve_time": float(getattr(result, "solve_time", 0.0) or 0.0),
         "trajopt_time": float(getattr(result, "trajopt_time", 0.0) or 0.0),
     }
+    if payload["status"] == "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION":
+        try:
+            start_diag = planner.diagnose_start_state_world_collision(start_q)
+        except Exception as exc:
+            start_diag = {"error": str(exc), "status": type(exc).__name__}
+        ablation = list(start_diag.get("ablation", []) or [])
+        payload["start_world_valid"] = bool(start_diag.get("valid", False))
+        payload["start_world_status"] = str(start_diag.get("status", ""))
+        payload["start_world_obstacle_names"] = list(start_diag.get("world_obstacle_names") or [])
+        payload["start_world_ablation"] = ablation
+        payload["start_world_relief_obstacles"] = [
+            str(item.get("removed", ""))
+            for item in ablation
+            if bool(item.get("valid", False))
+        ]
     if result.success and result.joint_path is not None:
         q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in result.joint_path]
         q_final = q_path[-1]
@@ -6749,14 +7386,6 @@ def _start_return_to_start_preplan(
         return
     if bool(getattr(args, "_planning_prefetch_capture_only", False)):
         return
-    if isinstance(getattr(args, "_return_to_start_preplan_state", None), dict):
-        _record_profile(
-            args,
-            "return_to_start_preplan_start",
-            success=True,
-            status="ALREADY_STARTED",
-        )
-        return
     preplan_start_q = _q7_or_none(start_q)
     goal_q = _q7_or_none(goal_q)
     if preplan_start_q is None or goal_q is None or planner is None:
@@ -6767,6 +7396,70 @@ def _start_return_to_start_preplan(
             status="INVALID_INPUT",
         )
         return
+    existing_state = getattr(args, "_return_to_start_preplan_state", None)
+    if isinstance(existing_state, dict):
+        thread = existing_state.get("thread")
+        thread_alive = bool(thread is not None and thread.is_alive())
+        payload = {}
+        try:
+            with existing_state["lock"]:
+                payload = dict(existing_state.get("result") or {})
+        except Exception:
+            payload = {}
+        if thread_alive:
+            _record_profile(
+                args,
+                "return_to_start_preplan_start",
+                success=True,
+                status="ALREADY_STARTED",
+                thread_alive=True,
+            )
+            return
+        raw_planned_start = existing_state.get("start_q")
+        if raw_planned_start is None:
+            raw_planned_start = payload.get("start_q")
+        raw_planned_goal = existing_state.get("goal_q")
+        if raw_planned_goal is None:
+            raw_planned_goal = payload.get("goal_q")
+        planned_start_q = _q7_or_none(raw_planned_start)
+        planned_goal_q = _q7_or_none(raw_planned_goal)
+        q_tol = float(max(getattr(args, "return_to_start_preplan_start_q_tolerance", 0.05), 0.0))
+        start_delta = (
+            float(np.max(np.abs(preplan_start_q - planned_start_q)))
+            if planned_start_q is not None
+            else float("inf")
+        )
+        goal_delta = (
+            float(np.max(np.abs(goal_q - planned_goal_q)))
+            if planned_goal_q is not None
+            else float("inf")
+        )
+        existing_success = bool(payload.get("success", False)) and bool(payload.get("q_path"))
+        if existing_success and start_delta <= q_tol and goal_delta <= q_tol:
+            _record_profile(
+                args,
+                "return_to_start_preplan_start",
+                success=True,
+                status="ALREADY_STARTED_READY",
+                thread_alive=False,
+                start_delta=start_delta,
+                goal_delta=goal_delta,
+                q_tol=q_tol,
+            )
+            return
+        args._return_to_start_preplan_state = None
+        _record_profile(
+            args,
+            "return_to_start_preplan_start",
+            success=True,
+            status="RESTART_AFTER_FAILED_OR_STALE",
+            previous_status=str(payload.get("status", "NO_RESULT")),
+            previous_success=existing_success,
+            thread_alive=False,
+            start_delta=start_delta,
+            goal_delta=goal_delta,
+            q_tol=q_tol,
+        )
     state = {
         "lock": threading.Lock(),
         "result": None,
@@ -6963,6 +7656,7 @@ def _consume_return_to_start_preplan(demo, args, current_q, goal_q, *, use_attac
     goal_delta = float(np.max(np.abs(goal_q - planned_goal_q)))
     q_tol = float(max(getattr(args, "return_to_start_preplan_start_q_tolerance", 0.05), 0.0))
     if start_delta > q_tol or goal_delta > q_tol:
+        args._return_to_start_preplan_state = None
         _record_profile(
             args,
             "return_to_start_preplan_consume",
@@ -7088,37 +7782,35 @@ def _plan_and_execute_return_to_cycle_start(
             mode=return_mode,
             path_waypoints=len(q_path or []),
         ) as prof:
-            dense_validate_delta = 0.01 if use_attach else 0.03
-            cached_diag = _diagnose_dense_joint_path_collision(
+            world_audit = _audit_return_to_start_world_collision_path(
+                planner,
                 demo,
-                q_current,
+                args,
                 q_path,
-                use_attach=use_attach,
-                max_delta=dense_validate_delta,
+                label=label,
+                mode=return_mode,
+                extra_scene_obstacles=return_extra_obstacles,
             )
-            cached_path_ok = bool(cached_diag.get("success", False))
-            prof["success"] = bool(cached_path_ok)
-            prof["status"] = "Success" if cached_path_ok else "DENSE_COLLISION_VALIDATE_FAIL"
-            prof["max_delta"] = float(dense_validate_delta)
-            if not cached_path_ok:
-                _print_dense_collision_diagnosis("return_to_start_cached_pre_execute", cached_diag)
-                prof["collision_status"] = cached_diag.get("status")
-                prof["collision_kind"] = cached_diag.get("collision_kind")
-                prof["path_segment_idx"] = cached_diag.get("path_segment_idx")
-                prof["path_waypoint_idx"] = cached_diag.get("path_waypoint_idx")
-                prof["segment_step"] = cached_diag.get("segment_step")
-                prof["segment_steps"] = cached_diag.get("segment_steps")
-                prof["alpha"] = cached_diag.get("alpha")
-                prof["self_collision_count"] = cached_diag.get("self_collision_count")
-                prof["env_collision_count"] = cached_diag.get("env_collision_count")
-                prof["collision_pair_texts"] = cached_diag.get("collision_pair_texts")
-                prof["self_collisions"] = cached_diag.get("self_collisions")
-                prof["env_collisions"] = cached_diag.get("env_collisions")
-        if not cached_path_ok:
-            print("[return_preplan] cached return_to_start path failed dense validation; replanning live")
-            q_path = None
-            return_mode = "live_after_cached_validate_fail"
-
+            prof.update(world_audit)
+            if bool(world_audit.get("success", False)):
+                prof["status"] = "WORLD_AUDIT_PASS"
+            else:
+                prof["status"] = str(world_audit.get("status", "WORLD_AUDIT_FAIL"))
+                print(
+                    "[return_preplan][FAIL] cached return_to_start path collides in current world; "
+                    "rejecting cached path before execution"
+                )
+                q_path = None
+        if cached_path and q_path is None and real_exec is not None:
+            _record_profile(
+                args,
+                "return_to_start",
+                success=False,
+                status="CACHED_PATH_WORLD_AUDIT_FAIL",
+                elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
+                mode=return_mode,
+            )
+            return False
     clearance_lift_m, clearance_lift_debug = _return_start_clearance_lift_m(args, return_extra_obstacles)
     if q_path is None and clearance_lift_m > 1e-5:
         with _profile_stage(
@@ -7128,6 +7820,33 @@ def _plan_and_execute_return_to_cycle_start(
             lift_source=clearance_lift_debug.get("source"),
             object_world_z_height_m=clearance_lift_debug.get("object_world_z_height_m"),
         ) as prof:
+            lift_exclude_names: set[str] = set()
+            relief_name = None
+            if planner is not None:
+                try:
+                    _refresh_curobo_world(
+                        planner,
+                        demo,
+                        args,
+                        label=f"{label}_return_start_relief_world",
+                        include_active_object=False,
+                        include_table=bool(getattr(args, "curobo_table_collision", True)),
+                        extra_scene_obstacles=return_extra_obstacles,
+                    )
+                    relief_name = _single_obstacle_start_collision_relief(
+                        planner,
+                        q_current,
+                        already_excluded=lift_exclude_names,
+                    )
+                except Exception as exc:
+                    prof["start_collision_relief_error"] = str(exc)
+            if relief_name:
+                lift_exclude_names.add(relief_name)
+                prof["start_collision_relief_obstacle"] = relief_name
+                print(
+                    f"[return_preplan] {label}: temporarily excluding start-collision "
+                    f"obstacle {relief_name!r} for {clearance_lift_m:.3f}m return prelift"
+                )
             lift_path = _plan_short_world_z_lift_ik(
                 planner,
                 demo,
@@ -7136,11 +7855,38 @@ def _plan_and_execute_return_to_cycle_start(
                 lift_m=clearance_lift_m,
                 label=f"{label}_prelift",
                 include_table=bool(getattr(args, "curobo_table_collision", True)),
-                exclude_object_names=None,
+                exclude_object_names=lift_exclude_names or None,
                 extra_scene_obstacles=return_extra_obstacles,
                 disabled_world_collision_links=_direct_place_contact_tolerant_disabled_links(planner),
             ) if planner is not None else None
             prof["path_waypoints"] = len(lift_path or [])
+            if (
+                lift_path is not None
+                and len(lift_path) >= 2
+                and bool(getattr(args, "return_to_start_self_collision_audit", True))
+                and planner is not None
+            ):
+                prelift_audit = _audit_return_to_start_self_collision_path(
+                    planner,
+                    args,
+                    lift_path,
+                    label=f"{label}_prelift",
+                    mode="return_to_start_prelift",
+                )
+                prof["self_collision_status"] = prelift_audit.get("status")
+                prof["self_collision_min_clearance_mm"] = prelift_audit.get("min_clearance_mm")
+                prof["self_collision_min_waypoint"] = prelift_audit.get("min_clearance_waypoint")
+                prof["self_collision_min_pair"] = prelift_audit.get("min_pair")
+                if not bool(prelift_audit.get("success", False)):
+                    print(
+                        f"[return_preplan] {label}: rejected prelift path before execution because "
+                        f"self-collision status={prelift_audit.get('status')} "
+                        f"min_clearance={float(prelift_audit.get('min_clearance_mm', 0.0) or 0.0):.2f}mm"
+                    )
+                    lift_path = None
+                    prof["path_waypoints"] = 0
+                    prof["success"] = False
+                    prof["status"] = "SELF_COLLISION_REJECT_CONTINUE"
             if lift_path is not None and len(lift_path) >= 2:
                 lift_pose = _lift_pose_world_z(demo.tcp.pose, clearance_lift_m)
                 ok, _ = targeted.base.execute_pose_path_stage(
@@ -7166,8 +7912,9 @@ def _plan_and_execute_return_to_cycle_start(
                 else:
                     print(f"[warn] {label}: prelift execution failed; trying direct return anyway")
             else:
-                prof["success"] = False
-                prof["status"] = "PLAN_FAIL_CONTINUE"
+                if "status" not in prof:
+                    prof["success"] = False
+                    prof["status"] = "PLAN_FAIL_CONTINUE"
                 print(f"[warn] {label}: prelift planning failed; trying direct return anyway")
     if q_path is None and planner is not None:
         with _profile_stage(
@@ -7192,6 +7939,15 @@ def _plan_and_execute_return_to_cycle_start(
             prof["max_joint_error"] = joint_payload.get("max_joint_error")
             prof["solve_time"] = joint_payload.get("solve_time")
             prof["trajopt_time"] = joint_payload.get("trajopt_time")
+            for key in (
+                "start_world_valid",
+                "start_world_status",
+                "start_world_obstacle_names",
+                "start_world_ablation",
+                "start_world_relief_obstacles",
+            ):
+                if key in joint_payload:
+                    prof[key] = joint_payload.get(key)
         if q_path is not None:
             print(
                 f"[curobo] {label} joint-space plan succeeded ({len(q_path)} waypoints), "
@@ -7273,6 +8029,31 @@ def _plan_and_execute_return_to_cycle_start(
             prof["success"] = bool(q_path)
             prof["status"] = "Success" if q_path else "PLAN_FAIL"
             prof["path_waypoints"] = len(q_path or [])
+    source_name = _current_source_object_name(args)
+    roof_dry_run_linear_fallback = (
+        q_path is None
+        and real_exec is None
+        and "roof_triangle" in str(source_name or "")
+        and bool(getattr(args, "jimu_dry_run_return_linear_fallback", True))
+    )
+    if roof_dry_run_linear_fallback:
+        with _profile_stage(
+            args,
+            "return_to_start_dry_run_linear_fallback",
+            source_name=str(source_name or ""),
+        ) as prof:
+            step = float(max(getattr(args, "jimu_return_to_start_linear_fallback_step_rad", 0.035), 1e-3))
+            q_path = _linear_joint_path(q_current, start_q, max_step_rad=step)
+            return_mode = "dry_run_linear_fallback"
+            prof["success"] = bool(q_path)
+            prof["status"] = "Success" if q_path else "NO_PATH"
+            prof["path_waypoints"] = len(q_path or [])
+            prof["step_rad"] = step
+            if q_path:
+                print(
+                    "[return_preplan] roof dry-run fallback: rendering linear joint return_to_cycle_start "
+                    f"({len(q_path)} waypoint(s)); cuRobo/MPLib return planners had no path"
+                )
     if q_path is None:
         print(f"[FAIL] {label} planning failed")
         targeted.base.print_failure_diagnostics(
@@ -7290,6 +8071,7 @@ def _plan_and_execute_return_to_cycle_start(
             elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
         )
         return False
+    return_audit = None
     if bool(getattr(args, "return_to_start_self_collision_audit", True)) and planner is not None:
         with _profile_stage(
             args,
@@ -7305,6 +8087,77 @@ def _plan_and_execute_return_to_cycle_start(
                 mode=return_mode,
             )
             prof.update(audit)
+            return_audit = dict(audit)
+    if return_audit is not None and not bool(return_audit.get("success", False)):
+        replacement_path = None
+        replacement_mode = None
+        if real_exec is None:
+            step = float(max(getattr(args, "jimu_return_to_start_linear_fallback_step_rad", 0.035), 1e-3))
+            staged_candidates = _return_to_start_staged_joint_fallback_candidates(
+                q_current,
+                start_q,
+                max_step_rad=step,
+            )
+            with _profile_stage(
+                args,
+                "return_to_start_staged_joint_fallback",
+                rejected_mode=return_mode,
+                rejected_status=str(return_audit.get("status", "")),
+                candidate_count=len(staged_candidates),
+            ) as prof:
+                prof["success"] = False
+                prof["status"] = "NO_SAFE_CANDIDATE"
+                for idx, candidate in enumerate(staged_candidates):
+                    candidate_label = str(candidate.get("label", f"candidate_{idx}"))
+                    candidate_path = list(candidate.get("q_path") or [])
+                    audit = _audit_return_to_start_self_collision_path(
+                        planner,
+                        args,
+                        candidate_path,
+                        label=f"{label}_{candidate_label}",
+                        mode=f"{return_mode}_{candidate_label}",
+                    )
+                    if bool(audit.get("success", False)):
+                        replacement_path = candidate_path
+                        replacement_mode = f"{return_mode}_{candidate_label}"
+                        prof["success"] = True
+                        prof["status"] = "Success"
+                        prof["selected_label"] = candidate_label
+                        prof["selected_path_waypoints"] = len(candidate_path)
+                        prof["selected_self_collision_status"] = audit.get("status")
+                        prof["selected_min_clearance_mm"] = audit.get("min_clearance_mm")
+                        print(
+                            f"[return_preplan] {label}: replaced self-colliding return path "
+                            f"with staged fallback {candidate_label} ({len(candidate_path)} waypoint(s))"
+                        )
+                        break
+                    print(
+                        f"[return_preplan] {label}: staged fallback {candidate_label} rejected "
+                        f"by self-collision audit status={audit.get('status')} "
+                        f"min_clearance={float(audit.get('min_clearance_mm', 0.0) or 0.0):.2f}mm"
+                    )
+        if replacement_path is not None:
+            q_path = replacement_path
+            return_mode = str(replacement_mode or f"{return_mode}_staged")
+        else:
+            status = str(return_audit.get("status", "SELF_COLLISION_AUDIT_FAIL"))
+            min_clearance = float(return_audit.get("min_clearance_mm", 0.0) or 0.0)
+            print(
+                f"[FAIL] {label} rejected before execution: self-collision audit "
+                f"status={status}, min_clearance={min_clearance:.2f}mm"
+            )
+            _record_profile(
+                args,
+                "return_to_start",
+                success=False,
+                status=f"SELF_COLLISION_{status}",
+                elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
+                path_waypoints=len(q_path or []),
+                mode=return_mode,
+                self_collision_status=status,
+                self_collision_min_clearance_mm=min_clearance,
+            )
+            return False
     execute_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     with _profile_stage(args, "return_to_start_execute", mode=return_mode, path_waypoints=len(q_path or [])) as prof:
         try:
@@ -7330,36 +8183,6 @@ def _plan_and_execute_return_to_cycle_start(
             print(f"[FAIL] {label} execution raised {type(exc).__name__}: {exc}")
     if not ok:
         print(f"[FAIL] {label} execution failed")
-        dense_validate_delta = 0.01 if use_attach else 0.03
-        exec_diag = _diagnose_dense_joint_path_collision(
-            demo,
-            execute_start_q,
-            q_path,
-            use_attach=use_attach,
-            max_delta=dense_validate_delta,
-        )
-        if not bool(exec_diag.get("success", False)):
-            _print_dense_collision_diagnosis(f"{label}_execute", exec_diag)
-        _record_profile(
-            args,
-            "return_to_start_execute_collision_diagnosis",
-            success=bool(exec_diag.get("success", False)),
-            status=str(exec_diag.get("status", "UNKNOWN")),
-            mode=return_mode,
-            path_waypoints=len(q_path or []),
-            max_delta=float(dense_validate_delta),
-            collision_kind=exec_diag.get("collision_kind"),
-            path_segment_idx=exec_diag.get("path_segment_idx"),
-            path_waypoint_idx=exec_diag.get("path_waypoint_idx"),
-            segment_step=exec_diag.get("segment_step"),
-            segment_steps=exec_diag.get("segment_steps"),
-            alpha=exec_diag.get("alpha"),
-            self_collision_count=exec_diag.get("self_collision_count"),
-            env_collision_count=exec_diag.get("env_collision_count"),
-            collision_pair_texts=exec_diag.get("collision_pair_texts"),
-            self_collisions=exec_diag.get("self_collisions"),
-            env_collisions=exec_diag.get("env_collisions"),
-        )
         _record_profile(
             args,
             "return_to_start",
@@ -7832,6 +8655,174 @@ def _store_candidate_prefilter_record(
         candidate[f"q_{role}"] = q
 
 
+def _joint_state_collision_summary_for_diag(planner, demo, q, *, use_attach: bool) -> dict:
+    q_np = _q7_or_none(q)
+    if q_np is None:
+        return {"valid_q": False}
+    summary: dict = {"valid_q": True}
+    try:
+        self_collisions = list(demo.planner.check_for_self_collision(qpos=q_np) or [])
+        env_collisions = list(
+            demo.planner.check_for_env_collision(qpos=q_np, with_point_cloud=False, use_attach=use_attach) or []
+        )
+        summary.update(
+            {
+                "demo_self_count": len(self_collisions),
+                "demo_env_count": len(env_collisions),
+                "demo_pairs": [
+                    item["text"]
+                    for item in _collision_records_for_profile(
+                        list(self_collisions) + list(env_collisions),
+                        limit=5,
+                    )
+                ],
+            }
+        )
+    except Exception as exc:
+        summary["demo_collision_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        world_diag = planner.diagnose_start_state_world_collision(q_np)
+        summary.update(
+            {
+                "curobo_world_valid": bool(world_diag.get("valid", False)),
+                "curobo_world_status": str(world_diag.get("status", "")),
+                "curobo_world_collision_count": int(world_diag.get("world_collision_count", 0) or 0),
+                "curobo_world_obstacles": list(world_diag.get("world_obstacle_names") or [])[:8],
+                "curobo_world_relief": [
+                    str(item.get("removed", ""))
+                    for item in list(world_diag.get("ablation", []) or [])
+                    if bool(item.get("valid", False))
+                ][:8],
+            }
+        )
+    except Exception as exc:
+        summary["curobo_world_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        self_diag = planner.diagnose_start_state_self_collision(q_np, top_k=5)
+        link_pairs = list(self_diag.get("link_pairs", []) or [])
+        sphere_pairs = list(self_diag.get("pairs", []) or [])
+        summary.update(
+            {
+                "curobo_self_error": str(self_diag.get("error", "") or ""),
+                "curobo_self_link_pairs": [
+                    f"{item.get('link_a')}<->{item.get('link_b')} overlap={float(item.get('overlap', 0.0)) * 1000.0:.2f}mm"
+                    for item in link_pairs[:5]
+                ],
+                "curobo_self_sphere_pairs": [
+                    (
+                        f"{item.get('sphere_i')}({item.get('link_i')})<->"
+                        f"{item.get('sphere_j')}({item.get('link_j')}) "
+                        f"overlap={float(item.get('overlap', 0.0)) * 1000.0:.2f}mm"
+                    )
+                    for item in sphere_pairs[:5]
+                ],
+            }
+        )
+    except Exception as exc:
+        summary["curobo_self_error"] = f"{type(exc).__name__}: {exc}"
+    return summary
+
+
+def _print_transport_motiongen_failure_diagnostics(
+    planner,
+    demo,
+    args,
+    label: str,
+    failures: list[dict],
+    *,
+    use_attach: bool,
+    limit: int = 4,
+) -> None:
+    if not failures:
+        return
+    status_counts = Counter(str(item.get("status", "")) for item in failures)
+    print(
+        f"[curobo][diag] {label}: no transport MotionGen winner; "
+        f"failure_statuses={dict(status_counts)}; showing first {min(len(failures), int(limit))}/{len(failures)}"
+    )
+    shown = 0
+    seen: set[tuple[str, str]] = set()
+    for item in failures:
+        candidate = item.get("candidate") if isinstance(item.get("candidate"), dict) else {}
+        candidate_label = str(item.get("label") or candidate.get("label") or "?")
+        status = str(item.get("status", ""))
+        key = (candidate_label, status)
+        if key in seen:
+            continue
+        seen.add(key)
+        shown += 1
+        raw_start_q = item.get("start_q")
+        if raw_start_q is None:
+            raw_start_q = candidate.get("start_q")
+        start_q = _q7_or_none(raw_start_q)
+        q_goal = _q7_or_none(item.get("q_goal"))
+        if q_goal is None and start_q is not None:
+            q_goal = _candidate_reusable_prefilter_q(candidate, start_q=start_q)
+        print(
+            f"[curobo][diag]   #{shown} candidate={candidate_label} "
+            f"status={status} mode={item.get('mode', '')}"
+        )
+        if start_q is not None:
+            start_summary = _joint_state_collision_summary_for_diag(
+                planner,
+                demo,
+                start_q,
+                use_attach=use_attach,
+            )
+            print(
+                "[curobo][diag]      start: "
+                f"demo_self={start_summary.get('demo_self_count')} "
+                f"demo_env={start_summary.get('demo_env_count')} "
+                f"world_valid={start_summary.get('curobo_world_valid')} "
+                f"world_status={start_summary.get('curobo_world_status')}"
+            )
+            for text in list(start_summary.get("demo_pairs") or [])[:3]:
+                print(f"[curobo][diag]        start_pair: {text}")
+            for text in list(start_summary.get("curobo_self_link_pairs") or [])[:3]:
+                print(f"[curobo][diag]        start_self: {text}")
+            relief = list(start_summary.get("curobo_world_relief") or [])
+            if relief:
+                print(f"[curobo][diag]        start_world_relief={relief}")
+        if q_goal is not None:
+            goal_summary = _joint_state_collision_summary_for_diag(
+                planner,
+                demo,
+                q_goal,
+                use_attach=use_attach,
+            )
+            max_delta = _max_joint_angle_delta_wrapped(start_q, q_goal) if start_q is not None else None
+            print(
+                "[curobo][diag]      goal: "
+                f"demo_self={goal_summary.get('demo_self_count')} "
+                f"demo_env={goal_summary.get('demo_env_count')} "
+                f"world_valid={goal_summary.get('curobo_world_valid')} "
+                f"world_status={goal_summary.get('curobo_world_status')} "
+                + (f"max_joint_delta={float(max_delta):.3f}rad" if max_delta is not None else "")
+            )
+            for text in list(goal_summary.get("demo_pairs") or [])[:3]:
+                print(f"[curobo][diag]        goal_pair: {text}")
+            for text in list(goal_summary.get("curobo_self_link_pairs") or [])[:3]:
+                print(f"[curobo][diag]        goal_self: {text}")
+            relief = list(goal_summary.get("curobo_world_relief") or [])
+            if relief:
+                print(f"[curobo][diag]        goal_world_relief={relief}")
+        else:
+            print("[curobo][diag]      goal: no reusable q_goal from IK prefilter")
+        try:
+            pose = candidate.get("pose")
+            if pose is not None:
+                p = targeted.base.flatten_np(pose.p)[:3]
+                q = targeted.base.flatten_np(pose.q)[:4]
+                print(
+                    f"[curobo][diag]      target_pose p={np.round(p, 5).tolist()} "
+                    f"q={np.round(q, 5).tolist()}"
+                )
+        except Exception:
+            pass
+        if shown >= int(limit):
+            break
+
+
 def _transport_candidate_needs_release_precheck(args, candidate: dict) -> bool:
     if not bool(getattr(args, "joint_search_release_endpoint_precheck", True)):
         return False
@@ -8029,6 +9020,7 @@ def _evaluate_curobo_pose_candidates_goalset(
         )
 
     winners = []
+    motiongen_failures: list[dict] = []
     use_max_winners = int(len(remaining) if max_winners is None else max_winners)
     if use_max_winners <= 0:
         use_max_winners = len(remaining)
@@ -8688,6 +9680,7 @@ def _evaluate_curobo_pose_candidates_multi_start(
             )
 
     winners = []
+    motiongen_failures: list[dict] = []
     use_max_winners = int(len(remaining) if max_winners is None else max_winners)
     if use_max_winners <= 0:
         use_max_winners = len(remaining)
@@ -8981,6 +9974,16 @@ def _evaluate_curobo_pose_candidates_multi_start(
                 )
                 if not js_result.success or js_result.joint_path is None:
                     q_goal_failures.append((candidate_label, str(js_result.status)))
+                    motiongen_failures.append(
+                        {
+                            "mode": "prefilter-q-goal",
+                            "label": candidate_label,
+                            "status": str(js_result.status),
+                            "candidate": candidate,
+                            "start_q": start_q,
+                            "q_goal": q_goal,
+                        }
+                    )
                     if str(js_result.status) == "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION":
                         saw_invalid_start = True
                     elif str(js_result.status) == "MotionGenStatus.INVALID_START_STATE_SELF_COLLISION":
@@ -9121,6 +10124,16 @@ def _evaluate_curobo_pose_candidates_multi_start(
                                 return winners
                 else:
                     print(f"[curobo] {label} goalset fast-path failed with status={goalset_result.status}; falling back to pair batch")
+                    motiongen_failures.append(
+                        {
+                            "mode": "goalset",
+                            "label": f"{len(remaining)}_same_start_targets",
+                            "status": str(goalset_result.status),
+                            "candidate": remaining[0],
+                            "start_q": start_q0,
+                            "q_goal": _candidate_reusable_prefilter_q(remaining[0], start_q=start_q0),
+                        }
+                    )
                     _bump_profile_counter("fallback_count")
                     if str(goalset_result.status) == "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION":
                         saw_invalid_start = True
@@ -9162,6 +10175,17 @@ def _evaluate_curobo_pose_candidates_multi_start(
                 candidate_label = str(candidate["label"])
                 if not result.success or result.joint_path is None:
                     batch_failures.append((candidate_label, str(result.status)))
+                    start_q = np.asarray(candidate["start_q"], dtype=np.float32).reshape(-1)[:7]
+                    motiongen_failures.append(
+                        {
+                            "mode": f"batch_chunk_{chunk_idx}",
+                            "label": candidate_label,
+                            "status": str(result.status),
+                            "candidate": candidate,
+                            "start_q": start_q,
+                            "q_goal": _candidate_reusable_prefilter_q(candidate, start_q=start_q),
+                        }
+                    )
                     if str(result.status) == "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION":
                         saw_invalid_start = True
                     elif str(result.status) == "MotionGenStatus.INVALID_START_STATE_SELF_COLLISION":
@@ -9242,6 +10266,16 @@ def _evaluate_curobo_pose_candidates_multi_start(
                 )
             if len(winners) >= use_max_winners:
                 break
+        if not winners and motiongen_failures:
+            _print_transport_motiongen_failure_diagnostics(
+                planner,
+                demo,
+                args,
+                label,
+                motiongen_failures,
+                use_attach=use_attach,
+                limit=int(getattr(args, "curobo_transport_failure_diag_limit", 4) or 4),
+            )
     finally:
         _set_world_collision_for_links(
             planner,
@@ -10011,6 +11045,40 @@ def _print_joint_chain_failed_candidate_summary(demo, *, limit: int = 24) -> Non
 
 def _current_source_object_name(args) -> str | None:
     return curobo_wrapper.normalize_object_name(getattr(args, "object_name", None))
+
+
+def _should_skip_return_to_cycle_start_for_current_place(args, place_choice=None) -> bool:
+    if bool(getattr(args, "skip_return_to_cycle_start", False)):
+        return True
+    if (
+        bool(getattr(args, "skip_return_to_cycle_start_after_final_place", True))
+        and bool(getattr(args, "_single_scene_no_remaining_after_current", False))
+    ):
+        return True
+    source_name = _current_source_object_name(args)
+    if (
+        "roof_triangle" in str(source_name or "")
+        and bool(getattr(args, "jimu_skip_return_to_cycle_start_after_roof_place", False))
+    ):
+        return True
+    return False
+
+
+def _return_to_cycle_start_skip_reason(args, place_choice=None) -> str:
+    if bool(getattr(args, "skip_return_to_cycle_start", False)):
+        return "request"
+    if (
+        bool(getattr(args, "skip_return_to_cycle_start_after_final_place", True))
+        and bool(getattr(args, "_single_scene_no_remaining_after_current", False))
+    ):
+        return "final_target"
+    source_name = _current_source_object_name(args)
+    if (
+        "roof_triangle" in str(source_name or "")
+        and bool(getattr(args, "jimu_skip_return_to_cycle_start_after_roof_place", False))
+    ):
+        return "roof_after_post_place_clearance"
+    return "none"
 
 
 def _attached_source_exclude_names(args, rule=None) -> set[str]:
@@ -11002,6 +12070,9 @@ def set_payload_collision_mode(
 
 def _retreat_pose_for_place_mode(demo, place_mode: str, args, place_choice=None):
     if isinstance(place_choice, dict):
+        retreat_pose = place_choice.get("retreat_pose")
+        if retreat_pose is not None:
+            return retreat_pose
         hover_pose = place_choice.get("hover_pose") or place_choice.get("pre_place_pose")
         if hover_pose is not None:
             return hover_pose
@@ -11013,6 +12084,32 @@ def _retreat_pose_for_place_mode(demo, place_mode: str, args, place_choice=None)
             (p + np.array([0.0, 0.0, distance], dtype=np.float32)).astype(np.float32),
         )
     return targeted.base.make_tcp_axis_retreat_pose(demo, 0.05)
+
+
+def _retreat_pose_candidates_for_place_mode(demo, place_mode: str, args, place_choice=None) -> list[dict]:
+    candidates: list[dict] = []
+    if isinstance(place_choice, dict):
+        raw_candidates = place_choice.get("retreat_pose_candidates") or []
+        for idx, raw in enumerate(raw_candidates):
+            pose = None
+            label = f"candidate_{idx:02d}"
+            if isinstance(raw, dict):
+                pose = raw.get("pose")
+                if pose is None:
+                    pose = raw.get("retreat_pose")
+                label = str(raw.get("label", label) or label)
+                candidate = dict(raw)
+            else:
+                pose = raw
+                candidate = {}
+            if pose is None:
+                continue
+            candidate["label"] = label
+            candidate["pose"] = pose
+            candidates.append(candidate)
+    if candidates:
+        return candidates
+    return [{"label": "default", "pose": _retreat_pose_for_place_mode(demo, place_mode, args, place_choice)}]
 
 
 def _build_direct_pre_place_candidates(demo, bridge_mod, scene_capture_cache, rule, place_state_cache, args, *, T_tcp_obj_override=None):
@@ -11935,7 +13032,10 @@ def _fast_chain_evaluate_paired_relation_records(
         grasp_chain_ok = (
             bool(grasp_candidate.get("_winner_preselect_pregrasp_success", False))
             and bool(grasp_candidate.get("_winner_preselect_grasp_success", False))
-            and bool(grasp_candidate.get("_winner_preselect_grasp_approach_q_path"))
+            and (
+                bool(grasp_candidate.get("_winner_preselect_grasp_approach_q_path"))
+                or not bool(getattr(args, "short_linear_endpoint_ik_first", True))
+            )
         )
         if not grasp_chain_ok:
             continue
@@ -12387,33 +13487,38 @@ def _fast_chain_preselect_grasp_place_pair(
                 pos_err, rot_err = _ik_debug_errors(ik_result)
                 grasp_ik_success_count += 1
                 q_grasp = np.asarray(ik_result.goal_joint, dtype=np.float32).reshape(-1)[:7]
-                approach_q_path = _build_validated_linear_path_to_q(
-                    demo,
-                    args,
-                    candidate["_winner_preselect_q_pregrasp"],
-                    q_grasp,
-                    candidate["pregrasp_pose"],
-                    candidate["pose"],
-                    label=f"{candidate.get('label', 'grasp')}_winner_chain_grasp_approach",
-                    use_attach=False,
-                    validation_pos_tol_m=float(
-                        max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.015), 0.0)
-                    ),
-                )
-                if approach_q_path is None:
-                    print(
-                        "[winner_chain] rejected grasp candidate before transport: "
-                        f"{candidate.get('label')} has IK but no validated straight pregrasp->grasp primitive"
+                approach_q_path = []
+                if bool(getattr(args, "short_linear_endpoint_ik_first", True)):
+                    approach_q_path = _build_validated_linear_path_to_q(
+                        demo,
+                        args,
+                        candidate["_winner_preselect_q_pregrasp"],
+                        q_grasp,
+                        candidate["pregrasp_pose"],
+                        candidate["pose"],
+                        label=f"{candidate.get('label', 'grasp')}_winner_chain_grasp_approach",
+                        use_attach=False,
+                        validation_pos_tol_m=float(
+                            max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.015), 0.0)
+                        ),
                     )
-                    continue
+                    if approach_q_path is None:
+                        print(
+                            "[winner_chain] rejected grasp candidate before transport: "
+                            f"{candidate.get('label')} has IK but no validated straight pregrasp->grasp primitive"
+                        )
+                        continue
                 grasp_approach_valid_count += 1
                 grasp_score = _ik_score(pos_err, rot_err)
                 candidate["_winner_preselect_grasp_success"] = True
                 candidate["_winner_preselect_q_grasp"] = q_grasp
                 candidate["q_grasp"] = q_grasp
-                candidate["_winner_preselect_grasp_approach_q_path"] = [
-                    np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in approach_q_path
-                ]
+                if approach_q_path:
+                    candidate["_winner_preselect_grasp_approach_q_path"] = [
+                        np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in approach_q_path
+                    ]
+                else:
+                    candidate.pop("_winner_preselect_grasp_approach_q_path", None)
                 candidate["_winner_preselect_grasp_ik_score"] = float(grasp_score)
                 grasp_ik_candidates.append(candidate)
         finally:
@@ -12427,6 +13532,11 @@ def _fast_chain_preselect_grasp_place_pair(
         prof["pregrasp_ok_count"] = len(pregrasp_ok)
         prof["grasp_ik_success_count"] = int(grasp_ik_success_count)
         prof["grasp_approach_valid_count"] = int(grasp_approach_valid_count)
+        prof["grasp_approach_validation_mode"] = (
+            "endpoint_ik_joint_linear"
+            if bool(getattr(args, "short_linear_endpoint_ik_first", True))
+            else "pose_metric_deferred"
+        )
         prof["candidate_count_after_ik"] = len(grasp_ik_candidates)
         pregrasp_success_tokens = _fast_chain_unique_relation_tokens(
             [item for item in candidates if bool(item.get("_winner_preselect_pregrasp_success", False))]
@@ -12811,9 +13921,14 @@ def plan_final_contact_approach(
         and not use_segmented_final_contact
         and (place_mode == "insert_place" or (verticality_target is not None and verticality_target < 0.5))
     ):
+        final_contact_fast_path = bool(getattr(args, "short_linear_endpoint_ik_first", True))
         print(
             f"[place_state] {final_label}: using selected-pair straight final-contact primitive "
-            "(cached q_release / endpoint IK first; constrained metric only as fallback)"
+            + (
+                "(cached q_release / endpoint IK first; constrained metric only as fallback)"
+                if final_contact_fast_path
+                else "(cuRobo PoseCostMetric first; cached q_release / endpoint IK disabled)"
+            )
         )
     if bool(getattr(args, "curobo_debug", False)) and strict_linear_final_contact:
         start_p = _get_pose_position(hover_pose)
@@ -12828,10 +13943,11 @@ def plan_final_contact_approach(
         cached_release_q = _q7_or_none(
             transport_choice.get("q_release", transport_choice.get("fast_chain_release_q"))
         )
+        final_contact_fast_path = bool(getattr(args, "short_linear_endpoint_ik_first", True))
         final_contact_backtrack_tol_m = float(
             max(getattr(args, "strict_final_contact_waypoint_backtrack_tol_m", 0.008), 0.0)
         )
-        if cached_release_q is not None:
+        if cached_release_q is not None and final_contact_fast_path:
             release_q_path = _build_validated_linear_path_to_q(
                 demo,
                 args,
@@ -12849,7 +13965,7 @@ def plan_final_contact_approach(
                     f"[place_state] {final_label}: using pair-first cached q_release "
                     f"as the straight final-contact primitive ({len(release_q_path)} waypoint(s))"
                 )
-        if release_q_path is None:
+        if release_q_path is None and final_contact_fast_path:
             release_q_path = _plan_short_linear_segment_via_goal_ik(
                 planner,
                 demo,
@@ -13395,6 +14511,10 @@ def _evaluate_joint_grasp_place_chains(
         exclude_names.add(target_obj_name)
     exclude_names = exclude_names or None
     direct_place_disabled_links = _direct_place_contact_tolerant_disabled_links(planner)
+    direct_transport_disabled_links = _transport_attached_contact_disabled_links(
+        planner,
+        direct_place_disabled_links,
+    )
     try:
         object_dims = targeted.base.get_asset_box_size(args.sim_asset_file, args.sim_asset_scale)
     except Exception:
@@ -13558,7 +14678,7 @@ def _evaluate_joint_grasp_place_chains(
                             all_direct_place_candidates,
                             grasp_terminal_q,
                             label=f"{grasp_label}_fast_chain",
-                            disabled_world_collision_links=direct_place_disabled_links,
+                            disabled_world_collision_links=direct_transport_disabled_links,
                         )
                         fast_records = list(getattr(planner, "_last_fast_chain_prefilter_records", []) or [])
                         prof["candidate_count_after_ik"] = len(fast_records)
@@ -13824,7 +14944,7 @@ def _evaluate_joint_grasp_place_chains(
                             total_score = float(grasp_choice["score"]) + float(candidate["score"]) + float(release_score)
                             chain = {
                                 "grasp_choice": grasp_choice,
-                                "pre_place_choice": candidate,
+                                "pre_place_choice": validated_place_choice if validated_place_choice is not None else candidate,
                                 "q_pre_place_path": q_direct_place_path,
                                 "q_place_path": [
                                     np.asarray(q, dtype=np.float32).reshape(-1)[:7]
@@ -13879,7 +14999,7 @@ def _evaluate_joint_grasp_place_chains(
                             label=f"joint_transport_hover_pairs_{safe_label}_{pass_label}",
                             include_table=True,
                             exclude_object_names=exclude_names,
-                            disabled_world_collision_links=direct_place_disabled_links,
+                            disabled_world_collision_links=direct_transport_disabled_links,
                         )
                     if (
                         source_name == "lvmukuai"
@@ -13942,7 +15062,7 @@ def _evaluate_joint_grasp_place_chains(
                                     max_winners=fast_lane_max_winners,
                                     include_table=True,
                                     exclude_object_names=exclude_names,
-                                    disabled_world_collision_links=direct_place_disabled_links,
+                                    disabled_world_collision_links=direct_transport_disabled_links,
                                 )
                                 _copy_last_candidate_counts_to_profile(prof, planner)
                                 prof["winner_count"] = len(fast_lane_successes)
@@ -14007,7 +15127,7 @@ def _evaluate_joint_grasp_place_chains(
                                     max_winners=transport_max_winners,
                                     include_table=True,
                                     exclude_object_names=exclude_names,
-                                    disabled_world_collision_links=direct_place_disabled_links,
+                                    disabled_world_collision_links=direct_transport_disabled_links,
                                 )
                                 _copy_last_candidate_counts_to_profile(prof, planner)
                                 prof["winner_count"] = len(direct_place_successes)
@@ -14128,7 +15248,7 @@ def _evaluate_joint_grasp_place_chains(
                                         max_winners=transport_max_winners,
                                         include_table=True,
                                         exclude_object_names=exclude_names,
-                                        disabled_world_collision_links=direct_place_disabled_links,
+                                        disabled_world_collision_links=direct_transport_disabled_links,
                                     )
                                     _copy_last_candidate_counts_to_profile(prof, planner)
                                     prof["winner_count"] = len(direct_place_successes)
@@ -14259,7 +15379,7 @@ def _evaluate_joint_grasp_place_chains(
                                         max_winners=lifted_max_winners,
                                         include_table=True,
                                         exclude_object_names=lift_exclude_names,
-                                        disabled_world_collision_links=direct_place_disabled_links,
+                                        disabled_world_collision_links=direct_transport_disabled_links,
                                     )
                                     _copy_last_candidate_counts_to_profile(prof, planner)
                                     prof["winner_count"] = len(direct_place_successes)
@@ -14494,6 +15614,9 @@ def run_targeted_place_episode_curobo_direct(
             print(f"[prefetch] failed to consume cached plan for {args.object_name}: {exc}")
             prefetched_plan = None
     preselected_grasp = None
+    preselected_pair_grasps = []
+    lazy_pair_first_pregrasp = bool(getattr(args, "jimu_pair_first_lazy_pregrasp_motiongen", False))
+    lazy_preselected_pair_grasps_remaining = []
     two_step_pregrasp_successes = []
     if isinstance(prefetched_plan, dict):
         prefetched_chain = prefetched_plan.get("selected_joint_chain")
@@ -14577,11 +15700,39 @@ def run_targeted_place_episode_curobo_direct(
             "candidate-stage grasp MotionGen is skipped"
         )
     if preselected_grasp is not None:
-        preselected_pair_grasps = [
-            dict(item)
-            for item in list(preselected_grasp.get("_winner_chain_top_pair_grasps") or [preselected_grasp])
-        ]
-        for pair_grasp in preselected_pair_grasps:
+        if not preselected_pair_grasps:
+            preselected_pair_grasps = [
+                dict(item)
+                for item in list(preselected_grasp.get("_winner_chain_top_pair_grasps") or [preselected_grasp])
+            ]
+        if lazy_pair_first_pregrasp:
+            lazy_preselected_pair_grasps_remaining = [dict(item) for item in preselected_pair_grasps[1:]]
+            preselected_pair_grasps_to_make = [dict(preselected_pair_grasps[0])] if preselected_pair_grasps else []
+            pregrasp_mode = (
+                "MotionGen"
+                if bool(getattr(args, "jimu_pair_first_pregrasp_motiongen", False))
+                else "joint interpolation"
+            )
+            print(
+                f"[grasp] lazy pair-first pregrasp {pregrasp_mode} enabled: planning top candidate first "
+                f"and keeping {len(lazy_preselected_pair_grasps_remaining)} candidate(s) for on-demand retry"
+            )
+        else:
+            preselected_pair_grasps_to_make = [dict(item) for item in preselected_pair_grasps]
+        for pair_grasp in preselected_pair_grasps_to_make:
+            preselected_success = _make_ik_preselected_grasp_success(args, grasp_start_q, pair_grasp)
+            if preselected_success is not None:
+                two_step_pregrasp_successes.append(preselected_success)
+        while (
+            lazy_pair_first_pregrasp
+            and not two_step_pregrasp_successes
+            and lazy_preselected_pair_grasps_remaining
+        ):
+            pair_grasp = lazy_preselected_pair_grasps_remaining.pop(0)
+            print(
+                "[grasp] lazy pair-first top candidate had no pregrasp path; "
+                f"planning next candidate {str(pair_grasp.get('label', ''))!r}"
+            )
             preselected_success = _make_ik_preselected_grasp_success(args, grasp_start_q, pair_grasp)
             if preselected_success is not None:
                 two_step_pregrasp_successes.append(preselected_success)
@@ -14695,59 +15846,87 @@ def run_targeted_place_episode_curobo_direct(
         )
         pair_first_chain_attempt = any(bool(item.get("pair_first_ik_only", False)) for item in grasp_successes)
         if not joint_chains:
+            if pair_first_chain_attempt and lazy_pair_first_pregrasp and lazy_preselected_pair_grasps_remaining:
+                while not joint_chains and lazy_preselected_pair_grasps_remaining:
+                    pair_grasp = lazy_preselected_pair_grasps_remaining.pop(0)
+                    pair_label = str(pair_grasp.get("label", "") or "")
+                    print(
+                        "[joint_search] lazy pair-first chain failed for current pregrasp; "
+                        f"planning next pregrasp candidate {pair_label!r} "
+                        f"({len(lazy_preselected_pair_grasps_remaining)} remaining after this)"
+                    )
+                    targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
+                    preselected_success = _make_ik_preselected_grasp_success(args, grasp_start_q, pair_grasp)
+                    if preselected_success is None:
+                        continue
+                    grasp_successes = [preselected_success]
+                    grasp_successes.sort(key=_candidate_sort_key)
+                    two_step_pregrasp_lookup[str(preselected_success.get("label", ""))] = preselected_success
+                    joint_chains = _evaluate_joint_grasp_place_chains(
+                        planner,
+                        demo,
+                        bridge_mod,
+                        args,
+                        scene_capture_cache,
+                        place_state_cache,
+                        rule,
+                        grasp_successes,
+                    )
+                pair_first_chain_attempt = any(bool(item.get("pair_first_ik_only", False)) for item in grasp_successes)
             fallback_grasp_successes = []
             fast_chain_legacy_fallback_allowed = _fast_chain_allow_legacy_fallback(args)
-            if pair_first_chain_attempt and not fast_chain_legacy_fallback_allowed:
-                print(
-                    "[joint_search] pair-first top pair produced no complete chain; "
-                    "legacy discarded-grasp fallback is disabled for fast-chain testing"
-                )
-            elif pair_first_chain_attempt and len(all_grasp_candidates_for_fallback) > 1:
-                fallback_winners = min(
-                    max(2, expanded_direct_grasp_max_winners, requested_direct_grasp_max_winners),
-                    len(all_grasp_candidates_for_fallback),
-                )
-                print(
-                    "[joint_search] pair-first top pair produced no complete chain; "
-                    f"trying discarded grasp candidates with expanded winners={fallback_winners}"
-                )
-                targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
-                fallback_grasp_successes = _evaluate_two_step_grasp_candidates(
-                    planner,
-                    demo,
-                    args,
-                    grasp_start_q,
-                    all_grasp_candidates_for_fallback,
-                    label="two_step_grasp_pair_first_fallback",
-                    max_winners=fallback_winners,
-                    include_active_object=True,
-                    disabled_world_collision_links=direct_grasp_disabled_links,
-                )
-            elif (
-                direct_grasp_max_winners == 1
-                and len(grasp_candidates) > 1
-                and fast_chain_legacy_fallback_allowed
-            ):
-                fallback_winners = min(
-                    max(2, expanded_direct_grasp_max_winners, requested_direct_grasp_max_winners),
-                    len(grasp_candidates),
-                )
-                print(
-                    "[joint_search] first grasp winner produced no complete chain; "
-                    f"expanding grasp goalset winners 1->{fallback_winners} before failing"
-                )
-                targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
-                fallback_grasp_successes = _evaluate_two_step_grasp_candidates(
-                    planner,
-                    demo,
-                    args,
-                    grasp_start_q,
-                    all_grasp_candidates_for_fallback,
-                    label="two_step_grasp_fallback",
-                    max_winners=fallback_winners,
-                    include_active_object=True,
-                    disabled_world_collision_links=direct_grasp_disabled_links,
-                )
+            if not joint_chains:
+                if pair_first_chain_attempt and not fast_chain_legacy_fallback_allowed:
+                    print(
+                        "[joint_search] pair-first top pair produced no complete chain; "
+                        "legacy discarded-grasp fallback is disabled for fast-chain testing"
+                    )
+                elif pair_first_chain_attempt and len(all_grasp_candidates_for_fallback) > 1:
+                    fallback_winners = min(
+                        max(2, expanded_direct_grasp_max_winners, requested_direct_grasp_max_winners),
+                        len(all_grasp_candidates_for_fallback),
+                    )
+                    print(
+                        "[joint_search] pair-first top pair produced no complete chain; "
+                        f"trying discarded grasp candidates with expanded winners={fallback_winners}"
+                    )
+                    targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
+                    fallback_grasp_successes = _evaluate_two_step_grasp_candidates(
+                        planner,
+                        demo,
+                        args,
+                        grasp_start_q,
+                        all_grasp_candidates_for_fallback,
+                        label="two_step_grasp_pair_first_fallback",
+                        max_winners=fallback_winners,
+                        include_active_object=True,
+                        disabled_world_collision_links=direct_grasp_disabled_links,
+                    )
+                elif (
+                    direct_grasp_max_winners == 1
+                    and len(grasp_candidates) > 1
+                    and fast_chain_legacy_fallback_allowed
+                ):
+                    fallback_winners = min(
+                        max(2, expanded_direct_grasp_max_winners, requested_direct_grasp_max_winners),
+                        len(grasp_candidates),
+                    )
+                    print(
+                        "[joint_search] first grasp winner produced no complete chain; "
+                        f"expanding grasp goalset winners 1->{fallback_winners} before failing"
+                    )
+                    targeted.base.sync_demo_arm_qpos(demo, grasp_start_q)
+                    fallback_grasp_successes = _evaluate_two_step_grasp_candidates(
+                        planner,
+                        demo,
+                        args,
+                        grasp_start_q,
+                        all_grasp_candidates_for_fallback,
+                        label="two_step_grasp_fallback",
+                        max_winners=fallback_winners,
+                        include_active_object=True,
+                        disabled_world_collision_links=direct_grasp_disabled_links,
+                    )
             if fallback_grasp_successes:
                 merged_by_label = {str(item.get("label", "")): item for item in grasp_successes}
                 for item in list(fallback_grasp_successes or []):
@@ -14816,6 +15995,8 @@ def run_targeted_place_episode_curobo_direct(
                         prof["status"] = "Success" if joint_chains else "NO_CHAIN"
             if not joint_chains:
                 print("[FAIL] no grasp candidate yielded a complete grasp->pre_place->release chain")
+                args._episode_failure_kind = "planning_no_complete_chain"
+                args._episode_failure_phase = str(getattr(demo, "_last_joint_chain_failed_label", "") or "joint_chain")
                 failed_place_pose = getattr(demo, "_last_joint_chain_failed_pose", None)
                 failed_place_label = str(getattr(demo, "_last_joint_chain_failed_label", "") or "place")
                 failed_place_candidates = list(getattr(demo, "_last_joint_chain_failed_candidate_poses", []) or [])
@@ -14858,6 +16039,15 @@ def run_targeted_place_episode_curobo_direct(
         return False
     if selected_joint_chain is not None:
         selected_joint_chain["grasp_choice"] = grasp_choice
+        if not _prevalidate_post_place_clearance_before_release(
+            planner,
+            demo,
+            args,
+            start_q,
+            selected_joint_chain.get("pre_place_choice"),
+            selected_joint_chain.get("q_place_path"),
+        ):
+            return False
 
     pregrasp_waypoints = int(max(grasp_choice.get("pregrasp_waypoints", 0), 0))
     if pregrasp_waypoints > 0 and bool(getattr(args, "fuse_grasp_approach_stages", True)):
@@ -15189,6 +16379,10 @@ def run_targeted_place_episode_curobo_direct(
         exclude_names_place.add(target_obj_name_place)
     exclude_names_place = exclude_names_place or None
     direct_place_disabled_links = _direct_place_contact_tolerant_disabled_links(planner)
+    direct_transport_disabled_links = _transport_attached_contact_disabled_links(
+        planner,
+        direct_place_disabled_links,
+    )
     place_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     transport_screen_args = _transport_screen_args_for_object(args, _current_source_object_name(args))
     transport_successes = None
@@ -15275,7 +16469,7 @@ def run_targeted_place_episode_curobo_direct(
                 direct_place_candidates,
                 include_table=bool(getattr(args, "curobo_table_collision", True)),
                 exclude_object_names=exclude_names_place,
-                disabled_world_collision_links=direct_place_disabled_links,
+                disabled_world_collision_links=direct_transport_disabled_links,
             )
     if not transport_successes:
         if pair_first_selected_chain:
@@ -15358,7 +16552,7 @@ def run_targeted_place_episode_curobo_direct(
                 direct_place_candidates,
                 include_table=bool(getattr(args, "curobo_table_collision", True)),
                 exclude_object_names=lift_exclude_names,
-                disabled_world_collision_links=direct_place_disabled_links,
+                disabled_world_collision_links=direct_transport_disabled_links,
             )
     if not transport_successes:
         print("[FAIL] cuRobo transport_to_hover planning failed")
@@ -15408,7 +16602,7 @@ def run_targeted_place_episode_curobo_direct(
                 direct_place_candidates,
                 include_table=bool(getattr(args, "curobo_table_collision", True)),
                 exclude_object_names=exclude_names_place,
-                disabled_world_collision_links=direct_place_disabled_links,
+                disabled_world_collision_links=direct_transport_disabled_links,
             )
             for transport_choice in transport_successes:
                 place_choice = plan_final_contact_approach(
@@ -15453,7 +16647,7 @@ def run_targeted_place_episode_curobo_direct(
                     retry_candidates,
                     include_table=bool(getattr(args, "curobo_table_collision", True)),
                     exclude_object_names=exclude_names_place,
-                    disabled_world_collision_links=direct_place_disabled_links,
+                    disabled_world_collision_links=direct_transport_disabled_links,
                 )
                 prof["transport_winner_count"] = len(retry_transport_successes)
                 for transport_choice in retry_transport_successes:
@@ -15506,6 +16700,15 @@ def run_targeted_place_episode_curobo_direct(
         np.asarray(q, dtype=np.float32).reshape(-1)[:7]
         for q in place_choice.get("q_place_path", [np.asarray(q_pre_place_path[-1], dtype=np.float32).reshape(-1)[:7]])
     ]
+    if not _prevalidate_post_place_clearance_before_release(
+        planner,
+        demo,
+        args,
+        start_q,
+        place_choice,
+        q_place_path,
+    ):
+        return False
     if bool(getattr(args, "_planning_prefetch_capture_only", False)):
         args._planning_prefetch_result = _build_prefetch_capture_result(
             args,
@@ -15522,9 +16725,16 @@ def run_targeted_place_episode_curobo_direct(
             f"transport_waypoints={len(q_pre_place_path)}, place_waypoints={len(q_place_path)}"
         )
         return True
+    skip_return_after_place = _should_skip_return_to_cycle_start_for_current_place(args, place_choice)
+    prevalidated_return_ready_before_place = (
+        isinstance(place_choice.get("_prevalidated_post_place_clearance"), dict)
+        and isinstance(place_choice["_prevalidated_post_place_clearance"].get("return_payload"), dict)
+        and bool(place_choice["_prevalidated_post_place_clearance"]["return_payload"].get("q_path"))
+    )
     if (
-        not bool(getattr(args, "skip_return_to_cycle_start", False))
+        not skip_return_after_place
         and bool(getattr(args, "return_to_start_preplan", True))
+        and not prevalidated_return_ready_before_place
     ):
         predicted_return_start_q = None
         place_mode_for_return_preplan = str(place_choice.get("place_mode", "drop_place"))
@@ -15564,6 +16774,8 @@ def run_targeted_place_episode_curobo_direct(
                 prelift_lift_m=prelift_lift_m,
                 extra_scene_obstacles=return_extra_obstacles,
             )
+    elif prevalidated_return_ready_before_place:
+        print("[return_preplan] pre-release validated return_to_start path already cached before place")
     prefetch_manager = getattr(args, "_next_cycle_prefetch_manager", None)
     if prefetch_manager is not None:
         try:
@@ -15793,15 +17005,21 @@ def run_targeted_place_episode_curobo_direct(
         # empty gripper away so the scene state represents the intended place.
         targeted.base.settle_released_active_object_for_scene_cache(demo, args)
         settled_before_clearance = True
-    clearance_pose = _retreat_pose_for_place_mode(
+    clearance_candidates = _retreat_pose_candidates_for_place_mode(
         demo,
         place_mode_name,
         args,
         place_choice,
     )
+    clearance_pose = clearance_candidates[0]["pose"]
     q_clearance_path = None
     skip_clearance_requested = bool(getattr(args, "skip_post_place_clearance", False))
     placed_object_obstacles = _return_to_start_placed_obstacles(demo, args, place_choice=place_choice)
+    prevalidated_clearance = (
+        place_choice.get("_prevalidated_post_place_clearance")
+        if isinstance(place_choice, dict)
+        else None
+    )
     if placed_object_obstacles:
         args._return_to_start_extra_scene_obstacles = _copy_scene_obstacle_entries(placed_object_obstacles)
     force_clearance_after_insert = (
@@ -15826,6 +17044,28 @@ def run_targeted_place_episode_curobo_direct(
             prof["success"] = True
             prof["status"] = "SKIPPED_BY_REQUEST"
             prof["path_waypoints"] = 0
+        elif isinstance(prevalidated_clearance, dict) and prevalidated_clearance.get("q_clearance_path"):
+            clearance_pose = prevalidated_clearance.get("clearance_pose", clearance_pose)
+            q_clearance_path = [
+                np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                for q in list(prevalidated_clearance.get("q_clearance_path") or [])
+            ]
+            if q_clearance_path:
+                q_clearance_path[0] = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7].copy()
+            prevalidated_obstacles = prevalidated_clearance.get("placed_object_obstacles")
+            if prevalidated_obstacles:
+                placed_object_obstacles = _copy_scene_obstacle_entries(prevalidated_obstacles)
+                args._return_to_start_extra_scene_obstacles = _copy_scene_obstacle_entries(placed_object_obstacles)
+            prof["success"] = True
+            prof["status"] = "PREVALIDATED_BEFORE_RELEASE"
+            prof["path_waypoints"] = len(q_clearance_path)
+            prof["retreat_candidate_index"] = int(prevalidated_clearance.get("candidate_index", -1))
+            prof["retreat_candidate_label"] = str(prevalidated_clearance.get("candidate_label", ""))
+            prof["prevalidated_before_release"] = True
+            print(
+                "[place] post_place_clearance reusing pre-release validated path: "
+                f"{prof['retreat_candidate_label']} ({len(q_clearance_path)} waypoint(s))"
+            )
         else:
             current_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
             current_pose = demo.tcp.pose
@@ -15842,6 +17082,368 @@ def run_targeted_place_episode_curobo_direct(
                 np.asarray(q, dtype=np.float32).reshape(-1)[:7]
                 for q in list(place_choice.get("q_place_path") or [])
             ] if place_mode_name != "insert_place" else []
+            force_clearance_replan = bool(
+                place_choice.get("force_replan_post_place_clearance", False)
+                or getattr(args, "force_replan_post_place_clearance", False)
+            )
+            prof["retreat_candidate_count"] = len(clearance_candidates)
+
+            def _plan_clearance_candidate_set(label_prefix: str) -> list[np.ndarray] | None:
+                nonlocal clearance_pose
+                endpoint_audits: list[dict] = []
+                return_checks: list[dict] = []
+
+                def _clearance_endpoint_self_collision_ok(candidate_idx: int, candidate_label: str, q_path: list[np.ndarray]) -> bool:
+                    if not (
+                        len(clearance_candidates) > 1
+                        and bool(
+                            getattr(
+                                args,
+                                "post_place_clearance_endpoint_self_collision_audit",
+                                getattr(args, "return_to_start_self_collision_audit", True),
+                            )
+                        )
+                        and planner is not None
+                        and q_path
+                    ):
+                        return True
+                    audit = _audit_return_to_start_self_collision_path(
+                        planner,
+                        args,
+                        [np.asarray(q_path[-1], dtype=np.float32).reshape(-1)[:7]],
+                        label=f"{label_prefix}_{candidate_label}_endpoint",
+                        mode="post_place_clearance_endpoint",
+                    )
+                    record = {
+                        "candidate_index": int(candidate_idx),
+                        "candidate_label": str(candidate_label),
+                        "success": bool(audit.get("success", False)),
+                        "status": str(audit.get("status", "")),
+                        "min_clearance_mm": audit.get("min_clearance_mm"),
+                        "min_pair": audit.get("min_pair"),
+                    }
+                    endpoint_audits.append(record)
+                    prof["retreat_candidate_endpoint_audits"] = endpoint_audits
+                    if bool(audit.get("success", False)):
+                        prof["retreat_candidate_endpoint_self_collision_status"] = str(audit.get("status", ""))
+                        prof["retreat_candidate_endpoint_min_clearance_mm"] = audit.get("min_clearance_mm")
+                        return True
+                    print(
+                        "[place] post_place_clearance rejected retreat candidate "
+                        f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}: "
+                        f"endpoint self-collision {audit.get('status')} "
+                        f"min_clearance={float(audit.get('min_clearance_mm', 0.0) or 0.0):.2f}mm"
+                    )
+                    return False
+
+                def _cache_validated_return_to_start_path(candidate_idx: int, candidate_label: str, q_path: list[np.ndarray]) -> bool:
+                    if not (
+                        bool(getattr(args, "validate_post_place_clearance_return_to_start", False))
+                        and not _should_skip_return_to_cycle_start_for_current_place(args, place_choice)
+                        and planner is not None
+                        and q_path
+                    ):
+                        return True
+                    return_start_q = np.asarray(q_path[-1], dtype=np.float32).reshape(-1)[:7]
+                    return_goal_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+                    return_extra_obstacles = placed_object_obstacles or _return_to_start_placed_obstacles(
+                        demo,
+                        args,
+                        place_choice=place_choice,
+                    )
+                    safe_return_label = re.sub(r"[^A-Za-z0-9_]+", "_", candidate_label)[:48] or f"candidate_{candidate_idx:02d}"
+                    check_start_t = time.perf_counter()
+                    payload = _plan_return_to_start_joint_curobo(
+                        planner,
+                        demo,
+                        args,
+                        return_start_q,
+                        return_goal_q,
+                        label=f"{label_prefix}_{safe_return_label}_return_check",
+                        extra_scene_obstacles=return_extra_obstacles,
+                    )
+                    elapsed_ms = round((time.perf_counter() - check_start_t) * 1000.0, 3)
+                    success = bool(payload.get("success", False)) and bool(payload.get("q_path"))
+                    record = {
+                        "candidate_index": int(candidate_idx),
+                        "candidate_label": str(candidate_label),
+                        "success": success,
+                        "status": str(payload.get("status", "FAILED")),
+                        "elapsed_ms": elapsed_ms,
+                        "path_waypoints": int(payload.get("path_waypoints", 0) or len(payload.get("q_path") or [])),
+                        "start_world_relief_obstacles": list(payload.get("start_world_relief_obstacles") or []),
+                    }
+                    return_checks.append(record)
+                    prof["retreat_candidate_return_checks"] = return_checks
+                    _record_profile(
+                        args,
+                        "post_place_clearance_return_check",
+                        success=success,
+                        status=record["status"],
+                        candidate_index=int(candidate_idx),
+                        candidate_label=str(candidate_label),
+                        elapsed_ms=elapsed_ms,
+                        path_waypoints=record["path_waypoints"],
+                        start_world_relief_obstacles=record["start_world_relief_obstacles"],
+                    )
+                    if not success:
+                        print(
+                            "[place] post_place_clearance rejected retreat candidate "
+                            f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}: "
+                            f"return_to_start check failed status={record['status']}"
+                        )
+                        return False
+                    return_payload = {
+                        "status": str(payload.get("status", "Success")),
+                        "success": True,
+                        "elapsed_ms": elapsed_ms,
+                        "q_path": payload.get("q_path"),
+                        "start_q": return_start_q.copy(),
+                        "goal_q": return_goal_q.copy(),
+                        "mode": "post_place_clearance_return_check",
+                        "direct_status": str(payload.get("status", "Success")),
+                        "prelift_waypoints": None,
+                        "return_waypoints": record["path_waypoints"],
+                        "extra_scene_obstacle_count": len(return_extra_obstacles or []),
+                        "error_text": None,
+                    }
+                    args._return_to_start_preplan_state = {
+                        "lock": threading.Lock(),
+                        "result": return_payload,
+                        "start_q": return_start_q.copy(),
+                        "goal_q": return_goal_q.copy(),
+                        "prelift_enabled": False,
+                        "extra_scene_obstacles": _copy_scene_obstacle_entries(return_extra_obstacles),
+                        "started_ts": time.time(),
+                        "thread": None,
+                    }
+                    prof["retreat_candidate_return_check_status"] = record["status"]
+                    prof["retreat_candidate_return_check_waypoints"] = record["path_waypoints"]
+                    prof["retreat_candidate_return_check_elapsed_ms"] = elapsed_ms
+                    return True
+
+                def _plan_single_clearance_segment(
+                    start_q,
+                    start_pose,
+                    goal_pose,
+                    *,
+                    segment_label: str,
+                    candidate_label: str,
+                    allow_free_motiongen: bool,
+                ) -> list[np.ndarray] | None:
+                    q_path = _plan_constrained_linear_segment(
+                        planner,
+                        demo,
+                        args,
+                        np.asarray(start_q, dtype=np.float32).reshape(-1)[:7],
+                        start_pose,
+                        goal_pose,
+                        label=segment_label,
+                        validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
+                        validation_backtrack_tol_m=float(
+                            max(getattr(args, "strict_short_linear_waypoint_backtrack_tol_m", 0.008), 0.0)
+                        ),
+                    )
+                    if q_path is None and allow_free_motiongen:
+                        planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
+                            demo,
+                            goal_pose,
+                            ee_link_name=str(getattr(planner.config, "ee_link", "gripper_tcp")),
+                        )
+                        result = _profile_plan_to_pose(
+                            planner,
+                            np.asarray(start_q, dtype=np.float32).reshape(-1)[:7],
+                            planner_pose,
+                            enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
+                            max_attempts=max(int(getattr(args, "curobo_max_attempts", 2)), 2),
+                            timeout=max(float(getattr(args, "curobo_timeout", 5.0)), 3.0),
+                            num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
+                            num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+                            num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
+                        )
+                        if bool(getattr(result, "success", False)) and getattr(result, "joint_path", None) is not None:
+                            q_path = [
+                                np.asarray(q, dtype=np.float32).reshape(-1)[:7]
+                                for q in list(result.joint_path)
+                            ]
+                            final_diag = _measure_realized_tcp_error(demo, q_path[-1], goal_pose)
+                            if _terminal_error_within_limits(final_diag, args):
+                                print(
+                                    "[place] post_place_clearance free MotionGen selected for "
+                                    f"{candidate_label}: waypoints={len(q_path)}, "
+                                    f"pos_err={final_diag['pos_err']:.4f}m, "
+                                    f"rot_err={final_diag['rot_err_deg']:.2f}deg"
+                                )
+                            else:
+                                print(
+                                    "[place] post_place_clearance free MotionGen reached poor endpoint for "
+                                    f"{candidate_label}: pos_err={final_diag['pos_err']:.4f}m, "
+                                    f"rot_err={final_diag['rot_err_deg']:.2f}deg"
+                                )
+                                q_path = None
+                        else:
+                            print(
+                                "[place] post_place_clearance free MotionGen failed for "
+                                f"{candidate_label}: status={getattr(result, 'status', None)}"
+                            )
+                    return q_path
+
+                for candidate_idx, candidate in enumerate(clearance_candidates):
+                    candidate_pose = candidate["pose"]
+                    candidate_label = str(candidate.get("label", f"candidate_{candidate_idx:02d}") or f"candidate_{candidate_idx:02d}")
+                    safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", candidate_label)[:48] or f"candidate_{candidate_idx:02d}"
+                    segment_label = (
+                        f"{label_prefix}_{candidate_idx:02d}_{safe_label}"
+                        if len(clearance_candidates) > 1
+                        else label_prefix
+                    )
+                    candidate_delta_m = float(
+                        np.linalg.norm(_get_pose_position(candidate_pose) - _get_pose_position(current_pose))
+                    )
+                    candidate_rot_delta_deg = float(
+                        np.degrees(
+                            _quat_angle_rad_wxyz(
+                                targeted.base.flatten_np(current_pose.q)[:4],
+                                targeted.base.flatten_np(candidate_pose.q)[:4],
+                            )
+                        )
+                    )
+                    if candidate_delta_m <= 1e-5 and candidate_rot_delta_deg <= 0.05:
+                        zero_path = [current_q.copy()]
+                        if not _clearance_endpoint_self_collision_ok(candidate_idx, candidate_label, zero_path):
+                            continue
+                        if not _cache_validated_return_to_start_path(candidate_idx, candidate_label, zero_path):
+                            continue
+                        clearance_pose = candidate_pose
+                        prof["retreat_candidate_index"] = candidate_idx
+                        prof["retreat_candidate_label"] = candidate_label
+                        prof["retreat_candidate_delta_m"] = candidate_delta_m
+                        prof["retreat_candidate_rot_delta_deg"] = candidate_rot_delta_deg
+                        for meta_key in ("plane_main_m", "plane_perp_m", "plane_normal_error_m"):
+                            if meta_key in candidate:
+                                prof[f"retreat_candidate_{meta_key}"] = candidate.get(meta_key)
+                        print(
+                            "[place] post_place_clearance candidate "
+                            f"{candidate_idx}/{len(clearance_candidates)} is already at clearance pose"
+                        )
+                        return zero_path
+                    q_path = _plan_single_clearance_segment(
+                        np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
+                        demo.tcp.pose,
+                        candidate_pose,
+                        segment_label=segment_label,
+                        candidate_label=candidate_label,
+                        allow_free_motiongen=bool(candidate.get("allow_post_place_free_motiongen", False)),
+                    )
+                    if q_path is not None:
+                        selected_meta = candidate
+                        followup_candidates = []
+                        for follow_idx, raw_follow in enumerate(
+                            list(
+                                candidate.get("followup_retreat_pose_candidates")
+                                or candidate.get("post_place_followup_candidates")
+                                or []
+                            )
+                        ):
+                            follow_pose = None
+                            follow_label = f"followup_{follow_idx:02d}"
+                            follow_meta = {}
+                            if isinstance(raw_follow, dict):
+                                follow_pose = raw_follow.get("pose") or raw_follow.get("retreat_pose")
+                                follow_label = str(raw_follow.get("label", follow_label) or follow_label)
+                                follow_meta = dict(raw_follow)
+                            else:
+                                follow_pose = raw_follow
+                            if follow_pose is None:
+                                continue
+                            follow_meta["label"] = follow_label
+                            follow_meta["pose"] = follow_pose
+                            followup_candidates.append(follow_meta)
+                        if followup_candidates:
+                            followup_path = None
+                            followup_meta = None
+                            for follow_idx, follow in enumerate(followup_candidates):
+                                follow_label = str(follow.get("label", f"followup_{follow_idx:02d}") or f"followup_{follow_idx:02d}")
+                                safe_follow_label = re.sub(r"[^A-Za-z0-9_]+", "_", follow_label)[:48] or f"followup_{follow_idx:02d}"
+                                followup_path = _plan_single_clearance_segment(
+                                    np.asarray(q_path[-1], dtype=np.float32).reshape(-1)[:7],
+                                    candidate_pose,
+                                    follow["pose"],
+                                    segment_label=f"{segment_label}_follow_{follow_idx:02d}_{safe_follow_label}",
+                                    candidate_label=follow_label,
+                                    allow_free_motiongen=bool(
+                                        follow.get(
+                                            "allow_post_place_free_motiongen",
+                                            candidate.get("allow_post_place_free_motiongen", False),
+                                        )
+                                    ),
+                                )
+                                if followup_path is not None:
+                                    followup_meta = follow
+                                    break
+                            if followup_path is None:
+                                print(
+                                    "[place] post_place_clearance rejected retreat candidate "
+                                    f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}: "
+                                    "required follow-up clearance failed"
+                                )
+                                if bool(candidate.get("require_followup_retreat", False)):
+                                    continue
+                            else:
+                                if len(followup_path) > 1:
+                                    q_path = list(q_path) + list(followup_path[1:])
+                                candidate_pose = followup_meta["pose"]
+                                selected_meta = followup_meta
+                                candidate_label = f"{candidate_label}+{followup_meta['label']}"
+                                candidate_delta_m = float(
+                                    np.linalg.norm(_get_pose_position(candidate_pose) - _get_pose_position(current_pose))
+                                )
+                                candidate_rot_delta_deg = float(
+                                    np.degrees(
+                                        _quat_angle_rad_wxyz(
+                                            targeted.base.flatten_np(current_pose.q)[:4],
+                                            targeted.base.flatten_np(candidate_pose.q)[:4],
+                                        )
+                                    )
+                                )
+                                prof["retreat_followup_index"] = int(follow_idx)
+                                prof["retreat_followup_label"] = str(followup_meta.get("label", ""))
+                                prof["retreat_followup_path_waypoints"] = int(len(followup_path))
+                                for meta_key in (
+                                    "followup_plane_main_m",
+                                    "followup_plane_perp_m",
+                                    "followup_world_z_m",
+                                    "followup_delta_norm_m",
+                                ):
+                                    if meta_key in followup_meta:
+                                        prof[f"retreat_{meta_key}"] = followup_meta.get(meta_key)
+                        if not _clearance_endpoint_self_collision_ok(candidate_idx, candidate_label, q_path):
+                            continue
+                        if not _cache_validated_return_to_start_path(candidate_idx, candidate_label, q_path):
+                            continue
+                        clearance_pose = candidate_pose
+                        prof["retreat_candidate_index"] = candidate_idx
+                        prof["retreat_candidate_label"] = candidate_label
+                        prof["retreat_candidate_delta_m"] = candidate_delta_m
+                        prof["retreat_candidate_rot_delta_deg"] = candidate_rot_delta_deg
+                        for meta_key in (
+                            "plane_main_m",
+                            "plane_perp_m",
+                            "world_z_m",
+                            "retreat_up_ratio",
+                            "retreat_delta_norm_m",
+                            "plane_normal_error_m",
+                        ):
+                            if meta_key in selected_meta:
+                                prof[f"retreat_candidate_{meta_key}"] = selected_meta.get(meta_key)
+                        if len(clearance_candidates) > 1:
+                            print(
+                                "[place] post_place_clearance selected retreat candidate "
+                                f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}"
+                            )
+                        return q_path
+                return None
+
             if clearance_delta_m <= 1e-5 and clearance_rot_delta_deg <= 0.05:
                 q_clearance_path = [current_q.copy()]
                 print("[place] post_place_clearance is already at clearance pose; using zero-length path")
@@ -15850,18 +17452,65 @@ def run_targeted_place_episode_curobo_direct(
                 prof["path_waypoints"] = 1
                 prof["world_changed"] = False
                 prof["cache_hit"] = True
-            elif len(reverse_place_path) >= 2:
-                q_clearance_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7].copy() for q in reversed(reverse_place_path)]
-                q_clearance_path[0] = current_q.copy()
-                print(
-                    "[place] post_place_clearance reusing reversed final-contact path "
-                    f"({len(q_clearance_path)} waypoint(s))"
-                )
-                prof["success"] = True
-                prof["status"] = "REUSED_FINAL_CONTACT_REVERSE"
-                prof["path_waypoints"] = len(q_clearance_path)
-                prof["world_changed"] = False
-                prof["cache_hit"] = True
+            elif len(reverse_place_path) >= 2 and not force_clearance_replan:
+                reverse_clearance_path = [
+                    np.asarray(q, dtype=np.float32).reshape(-1)[:7].copy()
+                    for q in reversed(reverse_place_path)
+                ]
+                reverse_clearance_path[0] = current_q.copy()
+                reverse_endpoint_valid = True
+                if (
+                    placed_object_obstacles
+                    and bool(getattr(args, "audit_post_place_clearance_reverse_endpoint", True))
+                ):
+                    _refresh_curobo_world(
+                        planner,
+                        demo,
+                        args,
+                        label="post_place_clearance_reverse_audit",
+                        include_active_object=False,
+                        include_table=bool(getattr(args, "curobo_table_collision", True)),
+                        extra_scene_obstacles=placed_object_obstacles,
+                    )
+                    try:
+                        reverse_diag = planner.diagnose_start_state_world_collision(
+                            np.asarray(reverse_clearance_path[-1], dtype=np.float32).reshape(-1)[:7]
+                        )
+                    except Exception as exc:
+                        reverse_diag = {"valid": True, "diagnostic_error": str(exc)}
+                    reverse_endpoint_valid = bool(reverse_diag.get("valid", True))
+                    prof["reverse_endpoint_world_valid"] = reverse_endpoint_valid
+                    prof["reverse_endpoint_world_status"] = str(reverse_diag.get("status", ""))
+                    prof["reverse_endpoint_world_obstacle_names"] = list(
+                        reverse_diag.get("world_obstacle_names") or []
+                    )
+                if reverse_endpoint_valid:
+                    q_clearance_path = reverse_clearance_path
+                    print(
+                        "[place] post_place_clearance reusing reversed final-contact path "
+                        f"({len(q_clearance_path)} waypoint(s))"
+                    )
+                    prof["success"] = True
+                    prof["status"] = "REUSED_FINAL_CONTACT_REVERSE"
+                    prof["path_waypoints"] = len(q_clearance_path)
+                    prof["world_changed"] = False
+                    prof["cache_hit"] = True
+                else:
+                    print(
+                        "[place] post_place_clearance reverse final-contact endpoint collides with the placed object; "
+                        "planning a fresh clearance path"
+                    )
+                    prof["status"] = "REVERSE_ENDPOINT_COLLISION_REPLAN"
+                    _refresh_curobo_world(
+                        planner,
+                        demo,
+                        args,
+                        label="post_place_clearance_replan_after_reverse_collision",
+                        include_active_object=False,
+                        include_table=bool(getattr(args, "curobo_table_collision", True)),
+                        extra_scene_obstacles=placed_object_obstacles,
+                    )
+                    q_clearance_path = _plan_clearance_candidate_set("post_place_clearance_replan_after_reverse_collision")
             else:
                 _refresh_curobo_world(
                     planner,
@@ -15872,16 +17521,25 @@ def run_targeted_place_episode_curobo_direct(
                     include_table=bool(getattr(args, "curobo_table_collision", True)),
                     extra_scene_obstacles=placed_object_obstacles,
                 )
-                q_clearance_path = _plan_constrained_linear_segment(
-                    planner,
-                    demo,
-                    args,
-                    np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7],
-                    demo.tcp.pose,
-                    clearance_pose,
-                    label="post_place_clearance",
-                    validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
-                )
+                q_clearance_path = _plan_clearance_candidate_set("post_place_clearance")
+                if q_clearance_path is None and force_clearance_replan and placed_object_obstacles:
+                    print(
+                        "[place] post_place_clearance could not solve with the placed object as an obstacle; "
+                        "retrying a geometry-only start-relief retreat"
+                    )
+                    _refresh_curobo_world(
+                        planner,
+                        demo,
+                        args,
+                        label="post_place_clearance_start_relief",
+                        include_active_object=False,
+                        include_table=bool(getattr(args, "curobo_table_collision", True)),
+                        extra_scene_obstacles=[],
+                    )
+                    q_clearance_path = _plan_clearance_candidate_set("post_place_clearance_start_relief")
+                    if q_clearance_path is not None:
+                        prof["start_relief_without_placed_obstacle"] = True
+                        prof["status"] = "Success_START_RELIEF_WITHOUT_PLACED_OBSTACLE"
             if not q_clearance_path and bool(getattr(args, "allow_demo_planner_rescue", False)):
                 _, q_clearance_path = targeted.base.plan_post_place_clearance_path(
                     demo,
@@ -15897,9 +17555,16 @@ def run_targeted_place_episode_curobo_direct(
     skipped_clearance_by_request = skip_clearance_requested and not force_clearance_after_insert
     if not q_clearance_path and not skipped_clearance_by_request:
         print("[place] skipped legacy post_place_clearance planner; enable --allow-demo-planner-rescue to use it")
+    skip_return_after_place = _should_skip_return_to_cycle_start_for_current_place(args, place_choice)
+    prevalidated_return_ready = (
+        isinstance(prevalidated_clearance, dict)
+        and isinstance(prevalidated_clearance.get("return_payload"), dict)
+        and bool(prevalidated_clearance["return_payload"].get("q_path"))
+    )
     if (
-        not bool(getattr(args, "skip_return_to_cycle_start", False))
+        not skip_return_after_place
         and bool(getattr(args, "return_to_start_preplan", True))
+        and not prevalidated_return_ready
     ):
         return_preplan_start_q = None
         if q_clearance_path:
@@ -15931,9 +17596,13 @@ def run_targeted_place_episode_curobo_direct(
                 prelift_lift_m=prelift_lift_m,
                 extra_scene_obstacles=return_extra_obstacles,
             )
+    elif prevalidated_return_ready:
+        print("[return_preplan] keeping pre-release validated return_to_start path")
     clearance_executed = False
     if q_clearance_path:
         _mark_real_motion_started("post_place_clearance_execute")
+        clearance_execute_start_t = time.perf_counter()
+        q_clearance_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
         ok, _ = targeted.base.execute_pose_path_stage(
             demo,
             bridge_mod,
@@ -15945,6 +17614,18 @@ def run_targeted_place_episode_curobo_direct(
             args,
             use_attach=False,
             skip_confirmation=True,
+        )
+        q_clearance_goal = np.asarray(q_clearance_path[-1], dtype=np.float32).reshape(-1)[:7]
+        q_clearance_after = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+        _record_profile(
+            args,
+            "post_place_clearance_execute",
+            success=bool(ok),
+            status="Success" if ok else "EXEC_FAIL_CONTINUE",
+            elapsed_ms=round((time.perf_counter() - clearance_execute_start_t) * 1000.0, 3),
+            path_waypoints=len(q_clearance_path),
+            start_to_goal_delta=float(np.max(np.abs(q_clearance_goal - q_clearance_start))),
+            final_goal_delta=float(np.max(np.abs(q_clearance_after - q_clearance_goal))),
         )
         if not ok:
             print("[warn] post-place clearance execution failed after release; continuing to settle the object in place")
@@ -15965,7 +17646,8 @@ def run_targeted_place_episode_curobo_direct(
     if relaxed_target_collision:
         targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
         relaxed_target_collision = False
-    if bool(getattr(args, "skip_return_to_cycle_start", False)):
+    skip_return_after_place = _should_skip_return_to_cycle_start_for_current_place(args, place_choice)
+    if skip_return_after_place:
         if force_clearance_after_insert and not clearance_executed:
             print(
                 "[place] insert post_place_clearance failed; falling back to return_to_cycle_start "
@@ -15986,10 +17668,17 @@ def run_targeted_place_episode_curobo_direct(
                 )
                 return True
             return return_ok
+        skip_reason = _return_to_cycle_start_skip_reason(args, place_choice)
         if clearance_executed:
-            print("[place] completed targeted place and clearance; skipping return_to_cycle_start by request")
+            print(
+                "[place] completed targeted place and clearance; "
+                f"skipping return_to_cycle_start ({skip_reason})"
+            )
         else:
-            print("[place] completed targeted place without clearance; skipping return_to_cycle_start by request")
+            print(
+                "[place] completed targeted place without clearance; "
+                f"skipping return_to_cycle_start ({skip_reason})"
+            )
         return True
     if clearance_executed:
         print("[place] completed targeted place and clearance; returning to the cycle start pose")
@@ -16026,6 +17715,30 @@ def _single_scene_actor_name(actor, fallback: str = "") -> str:
     except Exception:
         pass
     return str(fallback)
+
+
+def _single_scene_remaining_build_targets_after(
+    scene_capture_cache,
+    cycle_object_sequence,
+    available_rule_names,
+    selected_name: str,
+) -> list[str]:
+    selected_name = curobo_wrapper.normalize_object_name(selected_name)
+    if selected_name is None:
+        return []
+    source_names = cycle_object_sequence if cycle_object_sequence else available_rule_names
+    remaining = []
+    seen = set()
+    for raw_name in list(source_names or []):
+        name = curobo_wrapper.normalize_object_name(raw_name)
+        if name is None or name == selected_name or name in seen:
+            continue
+        seen.add(name)
+        entry = _single_scene_cache_entry(scene_capture_cache, name)
+        if isinstance(entry, dict) and bool(entry.get("placed", False)):
+            continue
+        remaining.append(name)
+    return remaining
 
 
 def _single_scene_actor_pose_matrix(actor) -> np.ndarray | None:
@@ -16478,6 +18191,7 @@ def _single_scene_restore_after_failed_attempt(
     scene_capture_cache,
     selected_name: str,
     cycle_start_q,
+    bridge_mod=None,
 ) -> None:
     if demo is None:
         return
@@ -16539,8 +18253,43 @@ def _single_scene_restore_after_failed_attempt(
     q_restore = _q7_or_none(cycle_start_q)
     if q_restore is not None:
         try:
+            q_now = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+            animated = False
+            restore_path_len = 0
+            if (
+                bridge_mod is not None
+                and not bool(getattr(args, "execute_real", False))
+                and _dry_run_motion_window_enabled(args)
+                and bool(getattr(args, "jimu_render_failed_attempt_restore_motion", False))
+                and float(np.max(np.abs(q_now - q_restore))) > 1e-4
+            ):
+                step = float(max(getattr(args, "jimu_failed_attempt_restore_step_rad", 0.035), 1e-3))
+                restore_path = _linear_joint_path(q_now, q_restore, max_step_rad=step)
+                restore_path_len = len(restore_path)
+                print(
+                    "[single_scene] animating failed-attempt arm restore with joint interpolation "
+                    f"({restore_path_len} waypoint(s))"
+                )
+                _play_dry_run_motion_window(
+                    demo,
+                    bridge_mod,
+                    f"failed_attempt_restore_{selected_name}",
+                    q_now,
+                    restore_path,
+                    args,
+                )
+                animated = True
             targeted.base.sync_demo_arm_qpos(demo, q_restore)
             restored_fields.append("arm_q")
+            _record_profile(
+                args,
+                "failed_attempt_restore_arm_motion",
+                success=True,
+                status="ANIMATED" if animated else "SYNC_ONLY",
+                target_name=selected_name,
+                path_waypoints=restore_path_len,
+                start_delta=float(np.max(np.abs(q_now - q_restore))),
+            )
         except Exception as exc:
             print(f"[single_scene] warning: failed to restore arm q after failed {selected_name}: {exc}")
     try:
@@ -17607,51 +19356,6 @@ def _install_dry_run_motion_window_wrappers() -> None:
             *extra_args,
             **kwargs,
         )
-        if not ok and real_exec is not None:
-            use_attach = bool(kwargs.get("use_attach", False))
-            allow_start_in_collision = bool(kwargs.get("allow_start_in_collision", False))
-            dense_validate_delta = 0.01 if use_attach else 0.03
-            try:
-                exec_diag = _diagnose_dense_joint_path_collision(
-                    demo,
-                    q_start,
-                    q_path,
-                    use_attach=use_attach,
-                    max_delta=dense_validate_delta,
-                    allow_start_in_collision=allow_start_in_collision,
-                )
-            except Exception as exc:
-                exec_diag = {
-                    "success": False,
-                    "status": type(exc).__name__,
-                    "error": str(exc),
-                }
-            if not bool(exec_diag.get("success", False)):
-                _print_dense_collision_diagnosis(f"{label}_execute", exec_diag)
-            _record_profile(
-                args,
-                "pose_stage_execute_collision_diagnosis",
-                success=bool(exec_diag.get("success", False)),
-                status=str(exec_diag.get("status", "UNKNOWN")),
-                execution_label=str(label),
-                failure_phase=str(getattr(args, "_episode_failure_phase", "") or ""),
-                path_waypoints=len(list(q_path or [])),
-                max_delta=float(dense_validate_delta),
-                use_attach=use_attach,
-                allow_start_in_collision=allow_start_in_collision,
-                collision_kind=exec_diag.get("collision_kind"),
-                path_segment_idx=exec_diag.get("path_segment_idx"),
-                path_waypoint_idx=exec_diag.get("path_waypoint_idx"),
-                segment_step=exec_diag.get("segment_step"),
-                segment_steps=exec_diag.get("segment_steps"),
-                alpha=exec_diag.get("alpha"),
-                self_collision_count=exec_diag.get("self_collision_count"),
-                env_collision_count=exec_diag.get("env_collision_count"),
-                collision_pair_texts=exec_diag.get("collision_pair_texts"),
-                self_collisions=exec_diag.get("self_collisions"),
-                env_collisions=exec_diag.get("env_collisions"),
-                error=exec_diag.get("error"),
-            )
         if ok and real_exec is None and _dry_run_motion_window_enabled(args):
             try:
                 _play_dry_run_motion_window(demo, bridge_mod, str(label), q_start, q_path, args)
@@ -17716,6 +19420,39 @@ def _install_dry_run_motion_window_wrappers() -> None:
         targeted.base.execute_joint_path_stage = _execute_joint_path_stage_with_motion_window
 
     targeted.base._direct_pre_place_dry_run_motion_window_wrapped = True
+
+
+def _wait_before_close_on_failure(args, env) -> None:
+    configured = getattr(args, "wait_on_failure_before_close", None)
+    if configured is None:
+        configured = getattr(args, "jimu_wait_on_failure_before_close", False)
+    if not bool(configured):
+        return
+    if str(getattr(args, "render_mode", "") or "") != "human":
+        return
+    if not sys.stdin.isatty():
+        print("[inspect] skip wait-on-failure-before-close because stdin is not interactive")
+        return
+
+    prompt = "[inspect] final failure. Press Enter to close simulation..."
+    try:
+        print(prompt, flush=True)
+        while True:
+            try:
+                env.render()
+            except Exception as exc:
+                print(f"[inspect] live failure-view render stopped: {type(exc).__name__}: {exc}")
+                input(prompt)
+                return
+            ready, _, _ = select.select([sys.stdin], [], [], 0.03)
+            if ready:
+                sys.stdin.readline()
+                return
+    except EOFError:
+        return
+    except KeyboardInterrupt:
+        print("")
+        return
 
 
 def _run_single_scene_main(create_demo_func) -> None:
@@ -17895,6 +19632,21 @@ def _run_single_scene_main(create_demo_func) -> None:
             cycle_args, spec = targeted.base.make_cycle_args(base_args, selected_name)
             cycle_args._targeted_place_state_cache = place_state_cache
             cycle_args._single_scene_cycle_idx = int(cycle_idx)
+            remaining_build_targets_after_selected = _single_scene_remaining_build_targets_after(
+                scene_capture_cache,
+                cycle_object_sequence,
+                available_rule_names,
+                selected_name,
+            )
+            cycle_args._single_scene_no_remaining_after_current = len(remaining_build_targets_after_selected) == 0
+            cycle_args._single_scene_remaining_after_current = list(remaining_build_targets_after_selected)
+            if bool(getattr(cycle_args, "_single_scene_no_remaining_after_current", False)):
+                print(f"[cycle {cycle_idx}] selected target is the final remaining build target")
+            else:
+                print(
+                    f"[cycle {cycle_idx}] remaining build targets after selected: "
+                    f"{remaining_build_targets_after_selected}"
+                )
             cycle_args._next_cycle_prefetch_manager = prefetch_manager
             cycle_args._next_cycle_prefetch_failed_targets_this_cycle = set(failed_targets_this_cycle)
             cycle_args._next_cycle_prefetch_deferred_failed_targets = set(deferred_failed_targets)
@@ -17959,6 +19711,55 @@ def _run_single_scene_main(create_demo_func) -> None:
                     f"[cycle {cycle_idx}] final sim arm q after place cycle: "
                     f"{np.round(final_sim_arm_q, 5).tolist()}"
                 )
+                if real_exec is not None and not bool(getattr(cycle_args, "_single_scene_no_remaining_after_current", False)):
+                    try:
+                        q_real_now = np.asarray(real_exec.get_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                    except Exception:
+                        q_real_now = final_sim_arm_q
+                    q_cycle_start = np.asarray(cycle_start_q, dtype=np.float32).reshape(-1)[:7]
+                    q_start_delta = (q_real_now - q_cycle_start + np.pi) % (2.0 * np.pi) - np.pi
+                    max_start_delta = float(np.max(np.abs(q_start_delta)))
+                    _record_profile(
+                        cycle_args,
+                        "post_success_real_return_guard",
+                        success=max_start_delta <= 0.03,
+                        status="ALREADY_AT_START" if max_start_delta <= 0.03 else "RETURN_REQUIRED",
+                        target_name=selected_name,
+                        start_delta=max_start_delta,
+                    )
+                    if max_start_delta > 0.03:
+                        print(
+                            "[single_scene] completed place but real robot is not at cycle start "
+                            f"(max_delta={max_start_delta:.4f}rad); returning before next cycle"
+                        )
+                        try:
+                            targeted.base.sync_demo_arm_qpos(demo, q_real_now)
+                        except Exception:
+                            pass
+                        return_ok = _plan_and_execute_return_to_cycle_start(
+                            demo,
+                            bridge_mod,
+                            real_exec,
+                            cycle_args,
+                            cycle_start_q,
+                            use_attach=False,
+                            gripper_pos=cycle_args.real_gripper_open,
+                        )
+                        _record_profile(
+                            cycle_args,
+                            "post_success_real_return_guard",
+                            success=bool(return_ok),
+                            status="RETURN_SUCCESS" if return_ok else "RETURN_FAIL",
+                            target_name=selected_name,
+                            start_delta=max_start_delta,
+                        )
+                        if not return_ok:
+                            print(
+                                "[single_scene] failed to return the real robot to the cycle start after "
+                                f"successful target={selected_name}; stopping before the next cycle."
+                            )
+                            final_ok = False
+                            break
 
             print(f"\ncycle {cycle_idx} success = {ok}")
             if not ok:
@@ -17978,6 +19779,7 @@ def _run_single_scene_main(create_demo_func) -> None:
                             scene_capture_cache,
                             selected_name,
                             cycle_start_q,
+                            bridge_mod=bridge_mod,
                         )
                     else:
                         if object_grasped:
@@ -18071,6 +19873,7 @@ def _run_single_scene_main(create_demo_func) -> None:
                             scene_capture_cache,
                             selected_name,
                             cycle_start_q,
+                            bridge_mod=bridge_mod,
                         )
                         if empty_grasp_failure:
                             print(
@@ -18149,6 +19952,8 @@ def _run_single_scene_main(create_demo_func) -> None:
     finally:
         if prefetch_manager is not None:
             prefetch_manager.shutdown(timeout=30.0)
+        if env is not None and not final_ok:
+            _wait_before_close_on_failure(args, env)
         if env is not None:
             targeted.base.close_env_quietly(env)
             gc.collect()

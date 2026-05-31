@@ -222,8 +222,11 @@ class RM75CuRoboPlanner:
         try:
             for name in obstacle_names:
                 ablated_world = self._world_without_obstacles(original_world, excluded_names={name})
-                self.motion_gen.update_world(ablated_world)
-                self.ik_solver.update_world(ablated_world)
+                if self._world_obstacle_count(ablated_world) <= 0:
+                    self.clear_world()
+                else:
+                    self.motion_gen.update_world(ablated_world)
+                    self.ik_solver.update_world(ablated_world)
                 ablated_valid, ablated_status = self.check_start_state(q_np)
                 diagnosis["ablation"].append(
                     {
@@ -236,6 +239,7 @@ class RM75CuRoboPlanner:
             self.motion_gen.update_world(original_world)
             self.ik_solver.update_world(original_world)
             self._world = original_world
+            self._update_cuda_graph_batch_ik_world(original_world)
         return diagnosis
 
     def _compute_world_link_spheres(self, q: Sequence[float]) -> np.ndarray:
@@ -1341,6 +1345,9 @@ class RM75CuRoboPlanner:
                 "World collision updates need a formal robot config with collision_spheres."
             )
         world_cfg = self.build_world_from_obstacles(cuboids=cuboids, meshes=meshes)
+        if self._world_obstacle_count(world_cfg) <= 0:
+            self.clear_world()
+            return
         needs_mesh_world = len(list(meshes or [])) > 0
         if needs_mesh_world and not self._mesh_world_initialized:
             self._world = world_cfg
@@ -1354,9 +1361,40 @@ class RM75CuRoboPlanner:
         self._world = world_cfg
         self._update_cuda_graph_batch_ik_world(world_cfg)
 
+    @staticmethod
+    def _world_obstacle_count(world) -> int:
+        if world is None:
+            return 0
+        total = 0
+        for attr in ("cuboid", "sphere", "capsule", "cylinder", "mesh", "blox", "voxel"):
+            try:
+                total += len(list(getattr(world, attr, []) or []))
+            except Exception:
+                pass
+        return int(total)
+
+    @staticmethod
+    def _clear_solver_world_cache(solver) -> None:
+        try:
+            if hasattr(solver, "clear_world_cache"):
+                solver.clear_world_cache()
+                return
+        except Exception:
+            pass
+        try:
+            world_coll_checker = getattr(solver, "world_coll_checker", None)
+            if world_coll_checker is not None and hasattr(world_coll_checker, "clear_cache"):
+                world_coll_checker.clear_cache()
+        except Exception:
+            pass
+
     def clear_world(self) -> None:
         if not self.collision_enabled:
             return
+        self._clear_solver_world_cache(self.motion_gen)
+        self._clear_solver_world_cache(self.ik_solver)
+        for solver in list(self._cuda_graph_batch_ik_solvers.values()):
+            self._clear_solver_world_cache(solver)
         self.motion_gen.update_world(self._empty_world)
         self.ik_solver.update_world(self._empty_world)
         self._world = self._empty_world

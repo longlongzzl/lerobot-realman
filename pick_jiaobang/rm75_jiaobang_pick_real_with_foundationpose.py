@@ -4118,17 +4118,6 @@ def execute_real_waypoint_path_with_shadow(
     q_prev = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     q_sent = q_prev
     if bool(getattr(args, "real_stream_waypoint_path", True)):
-        dense_ok = validate_joint_path_segments(
-            demo,
-            q_prev,
-            q_path,
-            use_attach=use_attach,
-            label=label,
-            max_delta=_dense_collision_validate_max_delta(use_attach),
-            allow_start_in_collision=allow_start_in_collision,
-        )
-        if not dense_ok:
-            return False, None
         hold_steps = int(args.real_hold_steps) if q_path else 0
         q_sent = real_exec.move_waypoint_path(
             q_path,
@@ -4145,15 +4134,6 @@ def execute_real_waypoint_path_with_shadow(
         return True, q_sent
     for idx, q_target in enumerate(q_path):
         stage_label = f"{label}_wp{idx}"
-        if not _validate_real_waypoint_segment(
-            demo,
-            q_prev,
-            q_target,
-            use_attach=use_attach,
-            label=stage_label,
-            allow_start_in_collision=bool(allow_start_in_collision and idx == 0),
-        ):
-            return False, None
         hold_steps = int(args.real_hold_steps) if idx == len(q_path) - 1 else 0
         q_sent = real_exec.move_linear(
             q_target,

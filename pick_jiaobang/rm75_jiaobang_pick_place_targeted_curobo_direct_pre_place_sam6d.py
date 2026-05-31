@@ -157,6 +157,7 @@ def _sam6d_cache_key(args, object_names: list[str]):
         int(getattr(args, "sam3_max_masks_per_item", 1)),
         bool(getattr(args, "sam3_full_scene_keep_multi_instances", False)),
         int(getattr(args, "sam3_instance_index", 0)),
+        int(getattr(args, "same_object_instance_start_index", 0) or 0),
         bool(getattr(args, "sam6d_fix_bitong_mouth_up", True)),
     )
 
@@ -305,6 +306,12 @@ def _provider_command(args, object_names: list[str]) -> list[str]:
         cmd += ["--use-direct-camera-extrinsic"]
     if bool(getattr(args, "sam3_full_scene_keep_multi_instances", False)):
         cmd += ["--sam3-full-scene-keep-multi-instances"]
+    sam3_result_json = str(getattr(args, "sam3_full_scene_result_json", "") or "").strip()
+    if sam3_result_json:
+        cmd += ["--sam3-full-scene-result-json", sam3_result_json]
+    same_object_start = int(getattr(args, "same_object_instance_start_index", 0) or 0)
+    if same_object_start > 0:
+        cmd += ["--same-object-instance-start-index", str(same_object_start)]
     if getattr(args, "sam3_instance_index", 0) != 0:
         cmd += ["--sam3-instance-index", str(int(getattr(args, "sam3_instance_index", 0)))]
     cmd += _provider_bool_args(args)

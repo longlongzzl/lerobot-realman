@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+import random
 import re
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -30,10 +33,26 @@ import sam6d_to_assembly_state as assembly_sam6d  # noqa: E402
 
 JIMU_PROVIDER_OBJECT_NAME = "red_bricks_cube"
 JIMU_FLOOR_ROLE = "floor"
-JIMU_PICK_ROLES = ("right_wall", "back_wall", "left_wall", "front_wall")
+JIMU_FIRST_LAYER_ROLES = ("right_wall", "back_wall", "left_wall", "front_wall")
+JIMU_SECOND_LAYER_ROLES = ("right_second_wall", "back_second_wall", "left_second_wall", "front_second_wall")
+JIMU_PICK_ROLES = (*JIMU_FIRST_LAYER_ROLES, *JIMU_SECOND_LAYER_ROLES)
 JIMU_SCENE_ROLES = (JIMU_FLOOR_ROLE, *JIMU_PICK_ROLES)
-DEFAULT_JIMU_MESH_EXTENTS_M = np.asarray([0.100058, 0.013194, 0.088722], dtype=np.float32)
+JIMU_DEFAULT_SIM_ASSET_FILE = BETA_DIR / "jimu_portable_repro" / "assets" / "red_jimu_plate_74x6x74.glb"
+JIMU_PLATE_SIZE_M = 0.074
+JIMU_PLATE_THICKNESS_M = 0.006
+DEFAULT_JIMU_PHYSICAL_EXTENTS_M = np.asarray(
+    [JIMU_PLATE_SIZE_M, JIMU_PLATE_THICKNESS_M, JIMU_PLATE_SIZE_M],
+    dtype=np.float32,
+)
+DEFAULT_JIMU_MESH_EXTENTS_M = DEFAULT_JIMU_PHYSICAL_EXTENTS_M.copy()
 DEFAULT_JIMU_CAD_TO_SIM_RPY_DEG = (90.0, 0.0, 0.0)
+_JIMU_SECOND_LAYER_PARENT = {
+    "right_second_wall": "right_wall",
+    "back_second_wall": "back_wall",
+    "left_second_wall": "left_wall",
+    "front_second_wall": "front_wall",
+}
+_JIMU_RUNTIME_CONTEXT = threading.local()
 _ORIGINAL_TARGETED_BUILD_PLACE_PLAN_VARIANTS = None
 _ORIGINAL_FAST_CHAIN_RANK_PAIRED_RELATION_CANDIDATES = None
 _ORIGINAL_FAST_CHAIN_RELATION_MATCH_KEY = None
@@ -43,6 +62,11 @@ _ORIGINAL_PROFILE_PLAN_TO_JOINT_STATE = None
 _ORIGINAL_PROFILE_PLAN_GOALSET_TO_POSES = None
 _ORIGINAL_PROFILE_PLAN_BATCH_START_GOAL_PAIRS = None
 _ORIGINAL_ATTACH_TRANSPORT_PAYLOAD_TO_CUROBO = None
+_ORIGINAL_PROFILE_STAGE = None
+_ORIGINAL_EXECUTE_POSE_PATH_STAGE = None
+_ORIGINAL_REALMAN_SET_GRIPPER = None
+_ORIGINAL_SYNC_DEMO_GRIPPER_STATE = None
+_ORIGINAL_SELECT_RANDOM_CYCLE_TARGET = None
 
 
 def _split_names(value: Any) -> list[str]:
@@ -62,6 +86,125 @@ def _split_names(value: Any) -> list[str]:
             seen.add(name)
             result.append(name)
     return result
+
+
+def _argv_has_option(option_name: str) -> bool:
+    prefix = f"{option_name}="
+    return any(arg == option_name or str(arg).startswith(prefix) for arg in sys.argv[1:])
+
+
+def _default_pick_roles_for_layers(layers: str | None) -> list[str]:
+    mode = str(layers or "two").strip().lower()
+    if mode in {"1", "first", "first_layer", "one"}:
+        return list(JIMU_FIRST_LAYER_ROLES)
+    if mode in {"2", "two", "second", "two_layers", "full"}:
+        return list(JIMU_PICK_ROLES)
+    raise ValueError(f"invalid Jimu layer mode: {layers!r}")
+
+
+def _default_scene_roles_for_layers(layers: str | None) -> list[str]:
+    return [JIMU_FLOOR_ROLE, *_default_pick_roles_for_layers(layers)]
+
+
+def _is_jimu_role_placed(scene_capture_cache: dict | None, role: str) -> bool:
+    try:
+        return bool(direct.targeted._is_cached_scene_object_placed(scene_capture_cache, role))
+    except Exception:
+        objects = scene_capture_cache.get("objects") if isinstance(scene_capture_cache, dict) else None
+        entry = objects.get(role) if isinstance(objects, dict) else None
+        return isinstance(entry, dict) and bool(entry.get("placed", False))
+
+
+def _jimu_layer_filtered_target_pool(
+    base_args: argparse.Namespace,
+    pool: list[str],
+    scene_capture_cache: dict | None,
+) -> tuple[list[str], list[str]]:
+    if not bool(getattr(base_args, "jimu_enforce_layer_order", True)):
+        return pool, []
+    normalized_pool = [
+        direct.curobo_wrapper.normalize_object_name(item)
+        for item in list(pool or [])
+    ]
+    normalized_pool = [item for item in normalized_pool if item is not None]
+    if not any(role in set(JIMU_PICK_ROLES) for role in normalized_pool):
+        return pool, []
+
+    pool_set = set(normalized_pool)
+    pending_first_layer = [
+        role
+        for role in JIMU_FIRST_LAYER_ROLES
+        if role in pool_set and not _is_jimu_role_placed(scene_capture_cache, role)
+    ]
+    if not pending_first_layer:
+        return pool, []
+    allowed = set(pending_first_layer)
+    return [role for role in normalized_pool if role in allowed], pending_first_layer
+
+
+def select_random_cycle_target_jimu_layered(
+    base_args,
+    cycle_object_sequence,
+    scene_capture_cache,
+    available_rule_names,
+    failed_targets_this_cycle: set[str],
+    deferred_failed_targets: set[str] | None,
+    cycle_idx: int,
+) -> tuple[str | None, list[str], list[str]]:
+    original = _ORIGINAL_SELECT_RANDOM_CYCLE_TARGET
+    if original is None:
+        return None, [], []
+    if not bool(getattr(base_args, "jimu_enforce_layer_order", True)):
+        return original(
+            base_args,
+            cycle_object_sequence,
+            scene_capture_cache,
+            available_rule_names,
+            failed_targets_this_cycle,
+            deferred_failed_targets,
+            cycle_idx,
+        )
+    pool = direct.targeted._random_target_pool_for_cycle(
+        base_args,
+        cycle_object_sequence,
+        scene_capture_cache,
+        available_rule_names,
+        cycle_idx,
+    )
+    gated_pool, pending_first_layer = _jimu_layer_filtered_target_pool(base_args, pool, scene_capture_cache)
+    if not pending_first_layer:
+        return original(
+            base_args,
+            cycle_object_sequence,
+            scene_capture_cache,
+            available_rule_names,
+            failed_targets_this_cycle,
+            deferred_failed_targets,
+            cycle_idx,
+        )
+
+    failed = set(failed_targets_this_cycle or set())
+    deferred = set(deferred_failed_targets or set())
+    candidates = [name for name in gated_pool if name not in failed and name not in deferred]
+    if not candidates:
+        candidates = [name for name in gated_pool if name not in failed]
+    if not candidates:
+        print(
+            "[jimu-order] first layer is not complete, but all first-layer candidates failed; "
+            f"pending_first_layer={pending_first_layer}"
+        )
+        return None, gated_pool, []
+
+    order = str(getattr(base_args, "target_selection_order", "random") or "random")
+    if order == "cycle":
+        selected = candidates[0]
+    else:
+        selected = random.choice(candidates)
+    print(
+        "[jimu-order] holding second layer until first layer is complete: "
+        f"pending_first_layer={pending_first_layer}, candidates={candidates}, selected={selected}"
+    )
+    return selected, gated_pool, candidates
 
 
 def _parse_role_instance_map(value: Any) -> dict[str, int]:
@@ -93,11 +236,27 @@ def _split_mapping_items(value: Any) -> list[str]:
     return items
 
 
-def _load_scaled_jimu_extents() -> np.ndarray:
+def _jimu_physical_extents(args: argparse.Namespace | None = None) -> np.ndarray:
+    size = float(getattr(args, "jimu_plate_size_m", JIMU_PLATE_SIZE_M) if args is not None else JIMU_PLATE_SIZE_M)
+    thickness = float(
+        getattr(args, "jimu_plate_thickness_m", JIMU_PLATE_THICKNESS_M)
+        if args is not None
+        else JIMU_PLATE_THICKNESS_M
+    )
+    if not np.isfinite(size) or size <= 1e-6:
+        size = JIMU_PLATE_SIZE_M
+    if not np.isfinite(thickness) or thickness <= 1e-6:
+        thickness = JIMU_PLATE_THICKNESS_M
+    return np.asarray([size, thickness, size], dtype=np.float32)
+
+
+def _load_scaled_jimu_extents(args: argparse.Namespace | None = None) -> np.ndarray:
+    if not bool(getattr(args, "jimu_use_mesh_extents", False) if args is not None else False):
+        return _jimu_physical_extents(args)
     try:
         spec = object_specs.get_object_spec(JIMU_PROVIDER_OBJECT_NAME)
         if spec is None:
-            return DEFAULT_JIMU_MESH_EXTENTS_M.copy()
+            return _jimu_physical_extents(args)
         _, sim_scale = object_specs.resolve_object_spec_scales(spec)
         mesh_path = Path(spec.sim_asset_file or spec.mesh_file).expanduser()
         loaded = trimesh.load(mesh_path, force="scene")
@@ -107,7 +266,16 @@ def _load_scaled_jimu_extents() -> np.ndarray:
             return extents.astype(np.float32)
     except Exception as exc:
         print(f"[jimu config] warning: failed to read red_jimu_cube extents, using fallback: {exc}")
-    return DEFAULT_JIMU_MESH_EXTENTS_M.copy()
+    return _jimu_physical_extents(args)
+
+
+def _jimu_sim_asset_file_override(args: argparse.Namespace | None = None) -> str | None:
+    raw = str(getattr(args, "jimu_sim_asset_file", "") if args is not None else "").strip()
+    if raw:
+        return str(Path(raw).expanduser())
+    if JIMU_DEFAULT_SIM_ASSET_FILE.exists():
+        return str(JIMU_DEFAULT_SIM_ASSET_FILE)
+    return None
 
 
 def _rpy_deg_from_matrix(rotation: np.ndarray) -> tuple[float, float, float]:
@@ -268,15 +436,15 @@ def _jimu_symmetry_degrees(args: argparse.Namespace) -> list[float]:
     return values or [0.0]
 
 
-def _jimu_wall_local_pose_specs() -> dict[str, place_rules.LocalPoseSpec]:
+def _jimu_wall_local_pose_specs(args: argparse.Namespace | None = None) -> dict[str, place_rules.LocalPoseSpec]:
     # The red_jimu_cube mesh uses local Y as the thin axis. In the floor frame,
     # local Y is the floor normal, local X/Z span the plate.
-    extents = _load_scaled_jimu_extents()
+    extents = _load_scaled_jimu_extents(args)
     half_x = float(extents[0] * 0.5)
     half_thick = float(extents[1] * 0.5)
     half_z = float(extents[2] * 0.5)
 
-    wall_center_y = half_thick + half_z
+    wall_center_y = half_z
     x_offset = half_x + half_thick
     z_offset = half_z + half_thick
 
@@ -321,7 +489,21 @@ def _jimu_wall_local_pose_specs() -> dict[str, place_rules.LocalPoseSpec]:
             position=tuple(float(v) for v in positions[role]),
             rpy_deg=_rpy_deg_from_matrix(rotations[role]),
         )
-        for role in JIMU_PICK_ROLES
+        for role in JIMU_FIRST_LAYER_ROLES
+    }
+
+
+def _jimu_second_layer_local_pose_specs(args: argparse.Namespace | None = None) -> dict[str, place_rules.LocalPoseSpec]:
+    extents = _load_scaled_jimu_extents(args)
+    wall_height = float(extents[2])
+    z_extra = float(getattr(args, "jimu_second_layer_z_extra", 0.0) if args is not None else 0.0)
+    center_offset_z = wall_height + z_extra
+    return {
+        role: place_rules.LocalPoseSpec(
+            position=(0.0, 0.0, center_offset_z),
+            rpy_deg=(0.0, 0.0, 0.0),
+        )
+        for role in JIMU_SECOND_LAYER_ROLES
     }
 
 
@@ -354,10 +536,18 @@ def install_jimu_object_specs(args: argparse.Namespace | None = None) -> None:
     base_spec = object_specs.get_object_spec(JIMU_PROVIDER_OBJECT_NAME)
     if base_spec is None:
         raise RuntimeError(f"Missing base object spec: {JIMU_PROVIDER_OBJECT_NAME}")
+    role_base_spec = base_spec
+    sim_asset_file = _jimu_sim_asset_file_override(args)
+    if sim_asset_file:
+        role_base_spec = replace(
+            role_base_spec,
+            sim_asset_file=sim_asset_file,
+            sim_asset_scale=1.0,
+        )
     local_rotation_offset = _jimu_cad_to_sim_rpy_deg(args)
     for role in JIMU_SCENE_ROLES:
         object_specs.OBJECT_SPECS[role] = replace(
-            base_spec,
+            role_base_spec,
             name=role,
             grounding_prompt="small square plastic building block.",
             foundationpose_local_rotation_offset_deg=local_rotation_offset,
@@ -370,13 +560,29 @@ def install_jimu_place_rules(args: argparse.Namespace | None = None) -> None:
     release_retreat_height = float(
         getattr(args, "jimu_wall_release_retreat_height", 0.08) if args is not None else 0.08
     )
-    for role, local_pose in _jimu_wall_local_pose_specs().items():
+    for role, local_pose in _jimu_wall_local_pose_specs(args).items():
         place_rules.PLACE_RULES[role] = place_rules.PlaceRule(
             source_object_name=role,
             target_object_name=JIMU_FLOOR_ROLE,
             primitive="jimu_relative_pose",
             hover_height=hover_height,
             release_retreat_height=release_retreat_height,
+            preserve_long_axis_vertical=True,
+            object_pose_local=local_pose,
+        )
+    second_hover_height = float(getattr(args, "jimu_second_layer_hover_height", hover_height) if args is not None else hover_height)
+    second_release_retreat_height = float(
+        getattr(args, "jimu_second_layer_release_retreat_height", release_retreat_height)
+        if args is not None
+        else release_retreat_height
+    )
+    for role, local_pose in _jimu_second_layer_local_pose_specs(args).items():
+        place_rules.PLACE_RULES[role] = place_rules.PlaceRule(
+            source_object_name=role,
+            target_object_name=_JIMU_SECOND_LAYER_PARENT[role],
+            primitive="jimu_relative_pose",
+            hover_height=second_hover_height,
+            release_retreat_height=second_release_retreat_height,
             preserve_long_axis_vertical=True,
             object_pose_local=local_pose,
         )
@@ -564,7 +770,7 @@ def _ensure_floor_local_y_points_up(item: dict, args: argparse.Namespace, T_base
 
 def _print_assignment(debug: dict) -> None:
     print("[jimu-sam6d] role assignment:")
-    for role in JIMU_SCENE_ROLES:
+    for role in list((debug.get("assignments") or {}).keys()):
         item = (debug.get("assignments") or {}).get(role)
         if not item:
             continue
@@ -581,7 +787,7 @@ def _print_assignment(debug: dict) -> None:
 
 def _jimu_cache_key(args: argparse.Namespace, role_names: list[str], provider_names: list[str]) -> tuple:
     return (
-        "jimu_four_wall_sam6d",
+        "jimu_layered_wall_sam6d",
         tuple(role_names),
         tuple(provider_names),
         direct_sam6d._sam6d_cache_key(args, provider_names),
@@ -629,7 +835,10 @@ def capture_or_reuse_jimu_sam6d_scene(args, bridge_mod, scene_capture_cache=None
     role_names = [name for name in role_names if name in set(JIMU_SCENE_ROLES)]
     if JIMU_FLOOR_ROLE not in role_names:
         role_names.insert(0, JIMU_FLOOR_ROLE)
-    for role in JIMU_PICK_ROLES:
+    build_roles = _split_names(getattr(args, "cycle_object_names", None)) or _default_pick_roles_for_layers(
+        getattr(args, "jimu_build_layers", "two")
+    )
+    for role in build_roles:
         if role not in role_names:
             role_names.append(role)
 
@@ -649,7 +858,7 @@ def capture_or_reuse_jimu_sam6d_scene(args, bridge_mod, scene_capture_cache=None
     ):
         cached_objects = dict(scene_capture_cache.get("objects", {}) or {})
         if target_name in cached_objects and all(name in cached_objects for name in required_obstacles):
-            print("[jimu-sam6d] reusing cached five-block SAM6D scene")
+            print("[jimu-sam6d] reusing cached Jimu SAM6D scene")
             return (
                 None,
                 np.asarray(scene_capture_cache["T_base_cam"], dtype=np.float32),
@@ -755,6 +964,87 @@ def relocalize_active_target_after_empty_grasp_jimu(demo, bridge_mod, args, scen
         return False
 
 
+def _jimu_second_layer_target_pose_from_floor(demo, bridge_mod, scene_capture_cache, source_name: str, args) -> np.ndarray | None:
+    parent_name = _JIMU_SECOND_LAYER_PARENT.get(source_name)
+    if parent_name is None:
+        return None
+    T_world_floor = direct.targeted._get_scene_object_world_transform(
+        demo,
+        bridge_mod,
+        scene_capture_cache,
+        JIMU_FLOOR_ROLE,
+    )
+    if T_world_floor is None:
+        return None
+    parent_specs = _jimu_wall_local_pose_specs(args)
+    parent_spec = parent_specs.get(parent_name)
+    if parent_spec is None:
+        return None
+    T_floor_parent_target = direct.targeted._local_pose_spec_to_matrix(parent_spec)
+    T_world_parent_target = (
+        np.asarray(T_world_floor, dtype=np.float32).reshape(4, 4)
+        @ np.asarray(T_floor_parent_target, dtype=np.float32).reshape(4, 4)
+    ).astype(np.float32)
+    extents = _load_scaled_jimu_extents(args)
+    z_extra = float(getattr(args, "jimu_second_layer_z_extra", 0.0) or 0.0)
+    T_world_second_target = T_world_parent_target.copy()
+    T_world_second_target[:3, 3] = (
+        T_world_parent_target[:3, 3] + np.asarray([0.0, 0.0, float(extents[2]) + z_extra], dtype=np.float32)
+    ).astype(np.float32)
+    return T_world_second_target
+
+
+def _jimu_rebuild_place_plan_for_target(plan, T_world_obj_target: np.ndarray):
+    T_world_obj_target = np.asarray(T_world_obj_target, dtype=np.float32).reshape(4, 4)
+    T_world_obj_old = getattr(plan, "T_world_obj_desired", None)
+    if T_world_obj_old is None:
+        return plan
+    try:
+        T_world_obj_old = np.asarray(T_world_obj_old, dtype=np.float32).reshape(4, 4)
+        T_world_tcp_old = direct._pose_to_matrix_from_pose_obj(plan.place_pose).astype(np.float32)
+        T_tcp_obj = (np.linalg.inv(T_world_tcp_old).astype(np.float32) @ T_world_obj_old).astype(np.float32)
+        T_world_tcp_new = (T_world_obj_target @ np.linalg.inv(T_tcp_obj).astype(np.float32)).astype(np.float32)
+        place_pose = direct._pose_from_world_matrix(T_world_tcp_new)
+        old_place_p = direct.targeted.base.flatten_np(plan.place_pose.p)[:3].astype(np.float32)
+        new_place_p = T_world_tcp_new[:3, 3].astype(np.float32)
+
+        def shifted_pose(old_pose):
+            if old_pose is None:
+                return None
+            old_p = direct.targeted.base.flatten_np(old_pose.p)[:3].astype(np.float32)
+            return direct.targeted.base.make_pose_with_position(place_pose, new_place_p + (old_p - old_place_p))
+
+        return direct.targeted.TargetedPlacePlan(
+            rule=plan.rule,
+            target_name=plan.target_name,
+            slot_name=plan.slot_name,
+            variant_label=plan.variant_label,
+            T_world_obj_desired=T_world_obj_target,
+            staging_pose=shifted_pose(plan.staging_pose),
+            pre_place_pose=shifted_pose(plan.pre_place_pose),
+            place_pose=place_pose,
+            retreat_pose=shifted_pose(plan.retreat_pose),
+            tcp_verticality=float(getattr(plan, "tcp_verticality", 0.0)),
+        )
+    except Exception as exc:
+        print(f"[jimu place] failed to rebuild floor-anchored second-layer plan: {exc}")
+        return plan
+
+
+def _jimu_floor_anchor_second_layer_plans(plans, demo, bridge_mod, scene_capture_cache, source_name: str | None, args) -> list:
+    if source_name not in set(JIMU_SECOND_LAYER_ROLES):
+        return list(plans or [])
+    T_target = _jimu_second_layer_target_pose_from_floor(demo, bridge_mod, scene_capture_cache, source_name, args)
+    if T_target is None:
+        return list(plans or [])
+    anchored = [_jimu_rebuild_place_plan_for_target(plan, T_target) for plan in list(plans or [])]
+    print(
+        f"[jimu place] {source_name}: second-layer target anchored from floor/first-layer goal, "
+        f"target_xyz={np.round(T_target[:3, 3], 6).tolist()}"
+    )
+    return anchored
+
+
 def build_targeted_place_plan_variants_jimu(
     demo,
     bridge_mod,
@@ -781,6 +1071,7 @@ def build_targeted_place_plan_variants_jimu(
         or []
     )
     source_name = direct.curobo_wrapper.normalize_object_name(getattr(rule, "source_object_name", None))
+    plans = _jimu_floor_anchor_second_layer_plans(plans, demo, bridge_mod, scene_capture_cache, source_name, args)
     if (
         source_name not in set(JIMU_PICK_ROLES)
         or bool(getattr(args, "jimu_parallel_grasp_place", True))
@@ -1627,10 +1918,7 @@ def attach_transport_payload_to_curobo_jimu(planner, demo, args, *, label: str) 
     try:
         if getattr(planner, "attached_object_active", False):
             planner.detach_object_from_robot()
-        raw_dims = np.asarray(
-            direct.targeted.base.get_asset_box_size(args.sim_asset_file, args.sim_asset_scale),
-            dtype=np.float32,
-        ).reshape(3)
+        raw_dims = _load_scaled_jimu_extents(args)
         dim_scale = float(np.clip(getattr(args, "jimu_attached_sphere_dim_scale", 0.94), 0.6, 1.05))
         dims = np.maximum(raw_dims * dim_scale, 1e-4).astype(np.float32)
         radius = float(np.clip(getattr(args, "jimu_attached_sphere_radius_m", 0.008), 0.003, 0.030))
@@ -1707,13 +1995,194 @@ def attach_transport_payload_to_curobo_jimu(planner, demo, args, *, label: str) 
         )
 
 
+def _jimu_partial_release_gripper_value(args: argparse.Namespace) -> float:
+    open_value = float(getattr(args, "real_gripper_open", 0.0))
+    close_value = float(getattr(args, "real_gripper_close", 0.91))
+    fraction_closed = float(np.clip(getattr(args, "jimu_release_partial_open_fraction", 0.70), 0.0, 1.0))
+    return float(open_value + (close_value - open_value) * fraction_closed)
+
+
+def _jimu_partial_release_sim_gripper_value(args: argparse.Namespace | None) -> float:
+    open_value = float(getattr(args, "gripper_open", -1.0) if args is not None else -1.0)
+    close_value = float(getattr(args, "gripper_close", 1.0) if args is not None else 1.0)
+    fraction_closed = float(np.clip(getattr(args, "jimu_release_partial_open_fraction", 0.70), 0.0, 1.0))
+    return float(open_value + (close_value - open_value) * fraction_closed)
+
+
+def _jimu_partial_release_enabled(args: argparse.Namespace | None) -> bool:
+    return bool(args is not None and getattr(args, "jimu_partial_open_during_post_place_clearance", True))
+
+
+@contextmanager
+def profile_stage_jimu(args, stage_name: str, **fields):
+    if _ORIGINAL_PROFILE_STAGE is None:
+        raise RuntimeError("Jimu profile stage wrapper was installed before original _profile_stage was captured")
+    prev_stage = getattr(_JIMU_RUNTIME_CONTEXT, "profile_stage", None)
+    prev_args = getattr(_JIMU_RUNTIME_CONTEXT, "profile_args", None)
+    _JIMU_RUNTIME_CONTEXT.profile_stage = str(stage_name)
+    _JIMU_RUNTIME_CONTEXT.profile_args = args
+    try:
+        with _ORIGINAL_PROFILE_STAGE(args, stage_name, **fields) as prof:
+            yield prof
+    finally:
+        if prev_stage is None:
+            try:
+                delattr(_JIMU_RUNTIME_CONTEXT, "profile_stage")
+            except AttributeError:
+                pass
+        else:
+            _JIMU_RUNTIME_CONTEXT.profile_stage = prev_stage
+        if prev_args is None:
+            try:
+                delattr(_JIMU_RUNTIME_CONTEXT, "profile_args")
+            except AttributeError:
+                pass
+        else:
+            _JIMU_RUNTIME_CONTEXT.profile_args = prev_args
+
+
+def realman_set_gripper_jimu(self, gripper_pos: float, repeats: int | None = None, hz: float | None = None):
+    if _ORIGINAL_REALMAN_SET_GRIPPER is None:
+        raise RuntimeError("Jimu Realman set_gripper wrapper was installed before original method was captured")
+    stage = str(getattr(_JIMU_RUNTIME_CONTEXT, "profile_stage", "") or "")
+    args = getattr(_JIMU_RUNTIME_CONTEXT, "profile_args", None)
+    if stage == "place_open_gripper" and _jimu_partial_release_enabled(args):
+        full_open = float(getattr(args, "real_gripper_open", 0.0))
+        if abs(float(gripper_pos) - full_open) <= 1e-6:
+            partial = _jimu_partial_release_gripper_value(args)
+            print(
+                "[jimu gripper] place release uses partial open before clearance: "
+                f"{full_open:.3f} -> {partial:.3f}"
+            )
+            setattr(args, "_jimu_release_partial_open_used", True)
+            return _ORIGINAL_REALMAN_SET_GRIPPER(self, partial, repeats=repeats, hz=hz)
+    return _ORIGINAL_REALMAN_SET_GRIPPER(self, gripper_pos, repeats=repeats, hz=hz)
+
+
+def sync_demo_gripper_state_jimu(demo, closed: bool, steps: int = 3):
+    if _ORIGINAL_SYNC_DEMO_GRIPPER_STATE is None:
+        raise RuntimeError("Jimu sync_demo_gripper_state wrapper was installed before original function was captured")
+    stage = str(getattr(_JIMU_RUNTIME_CONTEXT, "profile_stage", "") or "")
+    args = getattr(_JIMU_RUNTIME_CONTEXT, "profile_args", None) or getattr(demo, "args", None)
+    if stage != "place_open_gripper" or bool(closed) or not _jimu_partial_release_enabled(args):
+        return _ORIGINAL_SYNC_DEMO_GRIPPER_STATE(demo, closed, steps=steps)
+
+    sim_value = _jimu_partial_release_sim_gripper_value(args)
+    min_steps = int(max(getattr(args, "sim_gripper_sync_min_steps", 20), 0))
+    total_steps = max(int(steps), min_steps)
+    try:
+        demo.hold_current_and_set_gripper(sim_value, steps=total_steps)
+        direct.targeted.base.refresh_frozen_active_object_pose(demo)
+        demo.refresh_runtime_handles(rebuild_visual=False)
+        direct.targeted.base.sync_planner_qpos_from_demo(demo)
+        direct.targeted.base.update_attached_box_visual(demo)
+        gap = direct.targeted.base.get_sim_gripper_pad_gap(demo)
+        gap_text = "unknown" if gap is None else f"{gap:.4f} m"
+        print(
+            "[jimu gripper] simulated partial release open before clearance: "
+            f"value={sim_value:.3f}, steps={total_steps}, pad_gap={gap_text}"
+        )
+    except Exception as exc:
+        print(f"[warn] failed to sync simulated partial release gripper state: {exc}")
+
+
+def execute_pose_path_stage_jimu(
+    demo,
+    bridge_mod,
+    real_exec,
+    label: str,
+    pose,
+    q_path,
+    gripper_pos: float,
+    args,
+    *,
+    use_attach: bool = False,
+    allow_start_in_collision: bool = False,
+    skip_confirmation: bool = False,
+):
+    if _ORIGINAL_EXECUTE_POSE_PATH_STAGE is None:
+        raise RuntimeError("Jimu execute_pose_path_stage wrapper was installed before original function was captured")
+    label_text = str(label or "")
+    if label_text != "post_place_clearance" or not _jimu_partial_release_enabled(args):
+        return _ORIGINAL_EXECUTE_POSE_PATH_STAGE(
+            demo,
+            bridge_mod,
+            real_exec,
+            label,
+            pose,
+            q_path,
+            gripper_pos,
+            args,
+            use_attach=use_attach,
+            allow_start_in_collision=allow_start_in_collision,
+            skip_confirmation=skip_confirmation,
+        )
+
+    partial = _jimu_partial_release_gripper_value(args)
+    full_open = float(getattr(args, "real_gripper_open", gripper_pos))
+    print(
+        "[jimu gripper] post-place clearance keeps partial open during lift: "
+        f"{partial:.3f}; full open after clearance: {full_open:.3f}"
+    )
+    ok, q_sent = _ORIGINAL_EXECUTE_POSE_PATH_STAGE(
+        demo,
+        bridge_mod,
+        real_exec,
+        label,
+        pose,
+        q_path,
+        partial,
+        args,
+        use_attach=use_attach,
+        allow_start_in_collision=allow_start_in_collision,
+        skip_confirmation=skip_confirmation,
+    )
+    if ok and bool(getattr(args, "jimu_full_open_after_post_place_clearance", True)):
+        try:
+            if real_exec is not None:
+                if _ORIGINAL_REALMAN_SET_GRIPPER is None:
+                    real_exec.set_gripper(full_open)
+                else:
+                    _ORIGINAL_REALMAN_SET_GRIPPER(
+                        real_exec,
+                        full_open,
+                        repeats=int(getattr(args, "real_gripper_command_repeats", 2)),
+                        hz=float(getattr(args, "real_gripper_command_hz", 10.0)),
+                    )
+            else:
+                sync_fn = getattr(direct.targeted.base, "sync_demo_gripper_state", None)
+                if callable(sync_fn):
+                    sync_fn(demo, closed=False, steps=max(int(getattr(args, "sim_gripper_sync_min_steps", 8)), 1))
+            direct._record_profile(
+                args,
+                "jimu_full_open_after_post_place_clearance",
+                success=True,
+                status="Success",
+                partial_gripper_pos=partial,
+                full_open_gripper_pos=full_open,
+            )
+            print("[jimu gripper] post-place clearance finished; gripper opened to maximum")
+        except Exception as exc:
+            direct._record_profile(
+                args,
+                "jimu_full_open_after_post_place_clearance",
+                success=False,
+                status=type(exc).__name__,
+                partial_gripper_pos=partial,
+                full_open_gripper_pos=full_open,
+                error=str(exc),
+            )
+            raise
+    return ok, q_sent
+
+
 def build_arg_parser():
     install_jimu_object_specs()
     parser = direct_sam6d.build_arg_parser()
     parser.description = (
-        "Jimu five-block SAM6D/SAM3 scene capture -> direct cuRobo grasp/place. "
+        "Jimu multi-block SAM6D/SAM3 scene capture -> direct cuRobo grasp/place. "
         "This entrypoint keeps pick_jiaobang direct/sam6d logic unchanged and only registers "
-        "floor + four wall roles at runtime."
+        "floor + first/second-layer wall roles at runtime."
     )
     parser.set_defaults(
         object_name="right_wall",
@@ -1752,21 +2221,77 @@ def build_arg_parser():
         transport_prefilter_q_goal_timeout=2.0,
         transport_prefilter_q_goal_num_trajopt_seeds=1,
         vertical_place_hover_height_m=0.08,
-        final_contact_clearance_m=0.005,
+        final_contact_clearance_m=0.0,
         planner_virtual_top_wall_z=1.5,
+    )
+    parser.add_argument(
+        "--jimu-build-layers",
+        choices=["first", "two"],
+        default="two",
+        help="Default build set: first builds four walls; two also builds four second-layer walls.",
+    )
+    parser.add_argument(
+        "--jimu-enforce-layer-order",
+        dest="jimu_enforce_layer_order",
+        action="store_true",
+        default=True,
+        help="Only allow second-layer Jimu roles after every selectable first-layer role has been placed.",
+    )
+    parser.add_argument(
+        "--no-jimu-enforce-layer-order",
+        dest="jimu_enforce_layer_order",
+        action="store_false",
+        help="Allow first-layer and second-layer Jimu roles to be selected from the same target pool.",
+    )
+    parser.add_argument(
+        "--jimu-wait-on-failure-before-close",
+        dest="jimu_wait_on_failure_before_close",
+        action="store_true",
+        default=True,
+        help="When the final Jimu run fails in human render mode, keep rendering the scene until Enter is pressed.",
+    )
+    parser.add_argument(
+        "--no-jimu-wait-on-failure-before-close",
+        dest="jimu_wait_on_failure_before_close",
+        action="store_false",
     )
     parser.add_argument(
         "--jimu-scene-roles",
         type=str,
         nargs="*",
         default=list(JIMU_SCENE_ROLES),
-        help="Role names represented by the five same-object SAM6D detections.",
+        help="Role names represented by the same-object SAM6D detections.",
     )
     parser.add_argument(
         "--jimu-provider-object-name",
         type=str,
         default=JIMU_PROVIDER_OBJECT_NAME,
         help="Object spec sent to SAM6D for every Jimu instance.",
+    )
+    parser.add_argument(
+        "--jimu-sim-asset-file",
+        type=str,
+        default="",
+        help="Override the Jimu GLB used by ManiSkill visual/collision. Defaults to a bundled 74x6x74mm red box.",
+    )
+    parser.add_argument(
+        "--jimu-plate-size-m",
+        type=float,
+        default=JIMU_PLATE_SIZE_M,
+        help="Logical Jimu square plate side length used for placement, stacking, and attached payload collision.",
+    )
+    parser.add_argument(
+        "--jimu-plate-thickness-m",
+        type=float,
+        default=JIMU_PLATE_THICKNESS_M,
+        help="Logical Jimu plate thickness used for placement, stacking, and attached payload collision.",
+    )
+    parser.add_argument(
+        "--jimu-use-mesh-extents",
+        dest="jimu_use_mesh_extents",
+        action="store_true",
+        default=False,
+        help="Use the GLB scaled bounds instead of the logical 74mm square plate dimensions.",
     )
     parser.add_argument(
         "--jimu-assembly-sam6d-provider-script",
@@ -1789,6 +2314,14 @@ def build_arg_parser():
     )
     parser.add_argument("--jimu-wall-hover-height", type=float, default=0.08)
     parser.add_argument("--jimu-wall-release-retreat-height", type=float, default=0.08)
+    parser.add_argument("--jimu-second-layer-hover-height", type=float, default=0.08)
+    parser.add_argument("--jimu-second-layer-release-retreat-height", type=float, default=0.08)
+    parser.add_argument(
+        "--jimu-second-layer-z-extra",
+        type=float,
+        default=0.0,
+        help="Extra offset along the parent wall local Z when stacking a second-layer wall.",
+    )
     parser.add_argument(
         "--jimu-place-symmetry-deg",
         type=float,
@@ -1809,7 +2342,7 @@ def build_arg_parser():
         dest="jimu_parallel_grasp_place",
         action="store_true",
         default=True,
-        help="For Jimu walls, keep the solved grasp TCP rotation and only translate it to the target object center.",
+        help="For Jimu walls, keep the solved grasp TCP relation and apply only the required world-Z yaw plus translation to the target center.",
     )
     parser.add_argument("--no-jimu-parallel-grasp-place", dest="jimu_parallel_grasp_place", action="store_false")
     parser.add_argument(
@@ -1872,6 +2405,35 @@ def build_arg_parser():
     parser.add_argument("--jimu-attached-sphere-span-scale", type=float, default=0.88)
     parser.add_argument("--jimu-attached-sphere-dim-scale", type=float, default=0.94)
     parser.add_argument(
+        "--jimu-partial-open-during-post-place-clearance",
+        dest="jimu_partial_open_during_post_place_clearance",
+        action="store_true",
+        default=True,
+        help="Release with a partial gripper opening, lift away with that opening, then fully open after clearance.",
+    )
+    parser.add_argument(
+        "--no-jimu-partial-open-during-post-place-clearance",
+        dest="jimu_partial_open_during_post_place_clearance",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--jimu-release-partial-open-fraction",
+        type=float,
+        default=0.70,
+        help="Partial release opening as a fraction from full-open to closed; 0=open, 1=closed.",
+    )
+    parser.add_argument(
+        "--jimu-full-open-after-post-place-clearance",
+        dest="jimu_full_open_after_post_place_clearance",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no-jimu-full-open-after-post-place-clearance",
+        dest="jimu_full_open_after_post_place_clearance",
+        action="store_false",
+    )
+    parser.add_argument(
         "--jimu-print-role-assignment",
         dest="jimu_print_role_assignment",
         action="store_true",
@@ -1883,20 +2445,45 @@ def build_arg_parser():
 
 def parse_args():
     args = build_arg_parser().parse_args()
-    args.jimu_scene_roles = _split_names(getattr(args, "jimu_scene_roles", None)) or list(JIMU_SCENE_ROLES)
-    args.cycle_object_names = _split_names(getattr(args, "cycle_object_names", None)) or list(JIMU_PICK_ROLES)
+    default_pick_roles = _default_pick_roles_for_layers(getattr(args, "jimu_build_layers", "two"))
+    default_scene_roles = [JIMU_FLOOR_ROLE, *default_pick_roles]
+    if _argv_has_option("--cycle-object-names"):
+        args.cycle_object_names = _split_names(getattr(args, "cycle_object_names", None)) or default_pick_roles
+    else:
+        args.cycle_object_names = default_pick_roles
+    if _argv_has_option("--jimu-scene-roles"):
+        args.jimu_scene_roles = _split_names(getattr(args, "jimu_scene_roles", None)) or default_scene_roles
+    else:
+        args.jimu_scene_roles = default_scene_roles
     args.tracked_scene_object_names = _split_names(getattr(args, "tracked_scene_object_names", None))
     if JIMU_FLOOR_ROLE not in args.tracked_scene_object_names:
         args.tracked_scene_object_names.insert(0, JIMU_FLOOR_ROLE)
-    args.repeat_count = max(int(getattr(args, "repeat_count", len(JIMU_PICK_ROLES))), len(args.cycle_object_names))
+    if _argv_has_option("--repeat-count"):
+        args.repeat_count = max(int(getattr(args, "repeat_count", len(default_pick_roles))), len(args.cycle_object_names))
+    else:
+        args.repeat_count = len(args.cycle_object_names)
     args.sam3_full_scene_keep_multi_instances = True
     args.sam3_max_masks_per_item = max(int(getattr(args, "sam3_max_masks_per_item", 1) or 1), len(args.jimu_scene_roles))
     if bool(getattr(args, "skip_foundationpose", False)):
         print("[jimu-sam6d] ignoring --skip-foundationpose; this entrypoint uses SAM6D camera poses")
         args.skip_foundationpose = False
     install_jimu_runtime_config(args)
+    sim_asset_file = _jimu_sim_asset_file_override(args)
+    print(f"[jimu config] sim_asset_file={sim_asset_file or 'object_specs default'}")
+    jimu_extents = _load_scaled_jimu_extents(args)
+    print(
+        "[jimu config] logical_plate_extents_mm="
+        f"{np.round(jimu_extents * 1000.0, 2).tolist()} "
+        f"(use_mesh_extents={bool(getattr(args, 'jimu_use_mesh_extents', False))})"
+    )
     print(f"[jimu config] cad_to_sim_local_rpy_deg={list(_jimu_cad_to_sim_rpy_deg(args))}")
     print(f"[jimu config] snap_low_profile_objects_flat_on_table={bool(args.snap_low_profile_objects_flat_on_table)}")
+    print(
+        "[jimu config] build_layers="
+        f"{str(args.jimu_build_layers)}, scene_roles={list(args.jimu_scene_roles)}, "
+        f"cycle_roles={list(args.cycle_object_names)}, repeat_count={int(args.repeat_count)}, "
+        f"enforce_layer_order={bool(args.jimu_enforce_layer_order)}"
+    )
     print(
         "[jimu config] fast_chain_flow=ik_batch_intersection, "
         f"slots={int(args.fast_chain_relation_ik_slots)}, "
@@ -1938,6 +2525,13 @@ def parse_args():
         f"span_scale={float(args.jimu_attached_sphere_span_scale):.2f}, "
         f"dim_scale={float(args.jimu_attached_sphere_dim_scale):.2f}"
     )
+    print(
+        "[jimu config] post_place_gripper="
+        f"partial_enabled={bool(args.jimu_partial_open_during_post_place_clearance)}, "
+        f"partial_fraction={float(args.jimu_release_partial_open_fraction):.2f}, "
+        f"partial_value={_jimu_partial_release_gripper_value(args):.3f}, "
+        f"full_open_after_clearance={bool(args.jimu_full_open_after_post_place_clearance)}"
+    )
     direct._configure_curobo_torch_extensions(args)
     return args
 
@@ -1952,6 +2546,11 @@ def main():
     global _ORIGINAL_PROFILE_PLAN_GOALSET_TO_POSES
     global _ORIGINAL_PROFILE_PLAN_BATCH_START_GOAL_PAIRS
     global _ORIGINAL_ATTACH_TRANSPORT_PAYLOAD_TO_CUROBO
+    global _ORIGINAL_PROFILE_STAGE
+    global _ORIGINAL_EXECUTE_POSE_PATH_STAGE
+    global _ORIGINAL_REALMAN_SET_GRIPPER
+    global _ORIGINAL_SYNC_DEMO_GRIPPER_STATE
+    global _ORIGINAL_SELECT_RANDOM_CYCLE_TARGET
     install_jimu_runtime_config()
     original_capture = direct.targeted.base.capture_or_reuse_foundationpose_scene
     original_relocalize = direct._relocalize_active_target_after_empty_grasp
@@ -1966,6 +2565,11 @@ def main():
     original_profile_plan_goalset = direct._profile_plan_goalset_to_poses
     original_profile_plan_batch_pairs = direct._profile_plan_batch_start_goal_pairs
     original_attach_transport_payload = direct._attach_transport_payload_to_curobo
+    original_profile_stage = direct._profile_stage
+    original_execute_pose_path_stage = direct.targeted.base.execute_pose_path_stage
+    original_realman_set_gripper = direct.targeted.base.RealmanJointExecutor.set_gripper
+    original_sync_demo_gripper_state = direct.targeted.base.sync_demo_gripper_state
+    original_select_random_cycle_target = direct.targeted._select_random_cycle_target
     _ORIGINAL_TARGETED_BUILD_PLACE_PLAN_VARIANTS = original_build_place_variants
     _ORIGINAL_FAST_CHAIN_RANK_PAIRED_RELATION_CANDIDATES = original_rank_paired
     _ORIGINAL_FAST_CHAIN_RELATION_MATCH_KEY = original_relation_match_key
@@ -1975,6 +2579,11 @@ def main():
     _ORIGINAL_PROFILE_PLAN_GOALSET_TO_POSES = original_profile_plan_goalset
     _ORIGINAL_PROFILE_PLAN_BATCH_START_GOAL_PAIRS = original_profile_plan_batch_pairs
     _ORIGINAL_ATTACH_TRANSPORT_PAYLOAD_TO_CUROBO = original_attach_transport_payload
+    _ORIGINAL_PROFILE_STAGE = original_profile_stage
+    _ORIGINAL_EXECUTE_POSE_PATH_STAGE = original_execute_pose_path_stage
+    _ORIGINAL_REALMAN_SET_GRIPPER = original_realman_set_gripper
+    _ORIGINAL_SYNC_DEMO_GRIPPER_STATE = original_sync_demo_gripper_state
+    _ORIGINAL_SELECT_RANDOM_CYCLE_TARGET = original_select_random_cycle_target
     try:
         direct.targeted.base.capture_or_reuse_foundationpose_scene = capture_or_reuse_jimu_sam6d_scene
         direct._relocalize_active_target_after_empty_grasp = relocalize_active_target_after_empty_grasp_jimu
@@ -1991,6 +2600,11 @@ def main():
         direct._profile_plan_goalset_to_poses = profile_plan_goalset_to_poses_jimu
         direct._profile_plan_batch_start_goal_pairs = profile_plan_batch_start_goal_pairs_jimu
         direct._attach_transport_payload_to_curobo = attach_transport_payload_to_curobo_jimu
+        direct._profile_stage = profile_stage_jimu
+        direct.targeted.base.execute_pose_path_stage = execute_pose_path_stage_jimu
+        direct.targeted.base.RealmanJointExecutor.set_gripper = realman_set_gripper_jimu
+        direct.targeted.base.sync_demo_gripper_state = sync_demo_gripper_state_jimu
+        direct.targeted._select_random_cycle_target = select_random_cycle_target_jimu_layered
         direct.main()
     finally:
         direct.targeted.base.capture_or_reuse_foundationpose_scene = original_capture
@@ -2006,6 +2620,11 @@ def main():
         direct._profile_plan_goalset_to_poses = original_profile_plan_goalset
         direct._profile_plan_batch_start_goal_pairs = original_profile_plan_batch_pairs
         direct._attach_transport_payload_to_curobo = original_attach_transport_payload
+        direct._profile_stage = original_profile_stage
+        direct.targeted.base.execute_pose_path_stage = original_execute_pose_path_stage
+        direct.targeted.base.RealmanJointExecutor.set_gripper = original_realman_set_gripper
+        direct.targeted.base.sync_demo_gripper_state = original_sync_demo_gripper_state
+        direct.targeted._select_random_cycle_target = original_select_random_cycle_target
         _ORIGINAL_TARGETED_BUILD_PLACE_PLAN_VARIANTS = None
         _ORIGINAL_FAST_CHAIN_RANK_PAIRED_RELATION_CANDIDATES = None
         _ORIGINAL_FAST_CHAIN_RELATION_MATCH_KEY = None
@@ -2015,6 +2634,11 @@ def main():
         _ORIGINAL_PROFILE_PLAN_GOALSET_TO_POSES = None
         _ORIGINAL_PROFILE_PLAN_BATCH_START_GOAL_PAIRS = None
         _ORIGINAL_ATTACH_TRANSPORT_PAYLOAD_TO_CUROBO = None
+        _ORIGINAL_PROFILE_STAGE = None
+        _ORIGINAL_EXECUTE_POSE_PATH_STAGE = None
+        _ORIGINAL_REALMAN_SET_GRIPPER = None
+        _ORIGINAL_SYNC_DEMO_GRIPPER_STATE = None
+        _ORIGINAL_SELECT_RANDOM_CYCLE_TARGET = None
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import json
 import os
 import time
@@ -78,6 +79,30 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
     return labels == best
 
 
+def _component_boxes(mask: np.ndarray, *, min_area: int = 1) -> list[dict]:
+    mask_u8 = np.asarray(mask > 0, dtype=np.uint8)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_u8, 8)
+    boxes: list[dict] = []
+    for idx in range(1, count):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area < int(min_area):
+            continue
+        x = int(stats[idx, cv2.CC_STAT_LEFT])
+        y = int(stats[idx, cv2.CC_STAT_TOP])
+        w = int(stats[idx, cv2.CC_STAT_WIDTH])
+        h = int(stats[idx, cv2.CC_STAT_HEIGHT])
+        boxes.append(
+            {
+                "component_index": int(idx),
+                "area": area,
+                "bbox_xyxy": [x, y, x + w, y + h],
+                "centroid_px": [float(centroids[idx][0]), float(centroids[idx][1])],
+            }
+        )
+    boxes.sort(key=lambda item: int(item.get("area", 0)), reverse=True)
+    return boxes
+
+
 def _safe_name(text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in str(text))
 
@@ -129,13 +154,29 @@ def _rank_masks(masks: np.ndarray, boxes: np.ndarray, scores: np.ndarray, select
     return candidates
 
 
-def _save_overlay(rgb: np.ndarray, box_xyxy, mask: np.ndarray, out_path: Path, label: str):
+def _save_overlay(rgb: np.ndarray, box_xyxy, mask: np.ndarray, out_path: Path, label: str, component_boxes: list[dict] | None = None):
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     overlay = bgr.copy()
     overlay[np.asarray(mask > 0, dtype=bool)] = (0, 180, 255)
     canvas = cv2.addWeighted(overlay, 0.35, bgr, 0.65, 0.0)
     x1, y1, x2, y2 = [int(round(v)) for v in np.asarray(box_xyxy, dtype=np.float32).reshape(-1)[:4]]
     cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    for comp in list(component_boxes or []):
+        bbox = comp.get("bbox_xyxy")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        cx1, cy1, cx2, cy2 = [int(round(float(v))) for v in bbox]
+        cv2.rectangle(canvas, (cx1, cy1), (cx2, cy2), (255, 255, 0), 1, lineType=cv2.LINE_AA)
+        cv2.putText(
+            canvas,
+            f"c{int(comp.get('component_index', 0))}:{int(comp.get('area', 0))}",
+            (cx1, max(18, cy1 - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
     cv2.putText(canvas, label[:80], (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
     cv2.imwrite(str(out_path), canvas)
 
@@ -155,6 +196,12 @@ def parse_args():
     parser.add_argument("--min-mask-area", type=int, default=64)
     parser.add_argument("--morph-kernel", type=int, default=3)
     parser.add_argument("--sam3-max-masks-per-item", type=int, default=1, help="Maximum SAM3 candidates to output per item.")
+    parser.add_argument(
+        "--sam3-component-mode",
+        choices=["largest", "all"],
+        default="largest",
+        help="Whether to keep only the largest connected component per SAM3 candidate or preserve all components.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -212,7 +259,8 @@ def _run_one_item(processor, base_state: dict, rgb: np.ndarray, args, item: dict
         best_mask = np.asarray(masks[best_idx], dtype=bool)
         if best_mask.ndim == 3:
             best_mask = best_mask[0]
-        best_mask = _largest_component(best_mask)
+        if str(getattr(args, "sam3_component_mode", "largest")) == "largest":
+            best_mask = _largest_component(best_mask)
         kernel_size = max(int(args.morph_kernel), 0)
         if kernel_size > 1:
             kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
@@ -227,7 +275,15 @@ def _run_one_item(processor, base_state: dict, rgb: np.ndarray, args, item: dict
             overlay_path = item_output_dir / f"sam3_overlay_{rank_idx:02d}.png"
 
         cv2.imwrite(str(mask_path), best_mask.astype(np.uint8) * 255)
-        _save_overlay(rgb, select_box, best_mask, overlay_path, f"SAM3 {mode} r{rank_idx} {meta['model_score']:.3f}")
+        components = _component_boxes(best_mask, min_area=int(args.min_mask_area))
+        _save_overlay(
+            rgb,
+            select_box,
+            best_mask,
+            overlay_path,
+            f"SAM3 {mode} r{rank_idx} {meta['model_score']:.3f}",
+            components,
+        )
         mask_bbox = _mask_bbox_xyxy(best_mask)
         outputs.append(
             {
@@ -242,6 +298,9 @@ def _run_one_item(processor, base_state: dict, rgb: np.ndarray, args, item: dict
                 "overlay_path": str(overlay_path),
                 "mask_pixels": int(np.count_nonzero(best_mask)),
                 "mask_bbox": mask_bbox.tolist() if mask_bbox is not None else None,
+                "component_mode": str(getattr(args, "sam3_component_mode", "largest")),
+                "component_count": int(len(components)),
+                "component_bboxes": components,
                 "selected_index": int(best_idx),
                 "candidate_rank": int(rank_idx),
                 "selected": meta,
@@ -340,9 +399,9 @@ def main():
     candidates = _run_one_item(processor, base_state, rgb, args, item, output_dir)
     if not candidates:
         raise RuntimeError("SAM3 did not return any candidate masks")
-    result = candidates[0]
+    result = copy.deepcopy(candidates[0])
     if len(candidates) > 1:
-        result["all_candidates"] = candidates
+        result["all_candidates"] = copy.deepcopy(candidates)
     result.update(
         {
             "rgb_path": str(rgb_path),
