@@ -129,6 +129,7 @@ class RM75CuRoboPlanner:
         self._world = self._empty_world
         self._mesh_world_initialized = False
         self._disabled_collision_links: set[str] = set()
+        self._disabled_world_obstacles: set[str] = set()
         self._cuda_graph_batch_ik_solvers: dict[tuple[int, int], Any] = {}
         self._cuda_graph_batch_ik_disabled_reason: Optional[str] = None
         self.ik_solver = self._build_ik_solver()
@@ -187,6 +188,132 @@ class RM75CuRoboPlanner:
                 self._set_solver_world_collision_for_links(solver, link_names, enabled=enabled)
         return link_names
 
+    def set_world_obstacles_enabled(
+        self,
+        obstacle_names: Sequence[str],
+        *,
+        enabled: bool,
+    ) -> list[str]:
+        names = []
+        seen = set()
+        for item in list(obstacle_names or []):
+            name = str(item)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        if not names:
+            return []
+
+        changed = []
+        for name in names:
+            applied = self._set_world_obstacle_enabled_on_checkers(name, enabled=enabled)
+            if applied:
+                changed.append(name)
+        if enabled:
+            self._disabled_world_obstacles.difference_update(names)
+        else:
+            self._disabled_world_obstacles.update(changed)
+        return changed
+
+    def _iter_world_collision_checkers_for_owners(self, owners):
+        seen: set[int] = set()
+        for owner in list(owners or []):
+            if owner is None:
+                continue
+            candidates = [getattr(owner, "world_coll_checker", None)]
+            try:
+                rollout_fn = getattr(owner, "rollout_fn", None)
+                primitive = getattr(rollout_fn, "primitive_collision_constraint", None)
+                candidates.append(getattr(primitive, "world_coll_checker", None))
+            except Exception:
+                pass
+            try:
+                rollouts = list(owner.get_all_rollout_instances() or [])
+            except Exception:
+                rollouts = []
+            for rollout in rollouts:
+                candidates.append(getattr(rollout, "world_coll_checker", None))
+                try:
+                    primitive = getattr(rollout, "primitive_collision_constraint", None)
+                    candidates.append(getattr(primitive, "world_coll_checker", None))
+                except Exception:
+                    pass
+            for checker in candidates:
+                if checker is None:
+                    continue
+                checker_id = id(checker)
+                if checker_id in seen:
+                    continue
+                seen.add(checker_id)
+                yield checker
+
+    def _iter_world_collision_checkers(self):
+        owners = [getattr(self, "motion_gen", None), getattr(self, "ik_solver", None)]
+        owners.extend(list(getattr(self, "_cuda_graph_batch_ik_solvers", {}).values()))
+        yield from self._iter_world_collision_checkers_for_owners(owners)
+
+    @staticmethod
+    def _checker_obstacle_names(checker: Any) -> list[str]:
+        checker_names = []
+        try:
+            if hasattr(checker, "get_obstacle_names"):
+                checker_names = list(checker.get_obstacle_names() or [])
+        except Exception:
+            checker_names = []
+        if not checker_names:
+            try:
+                checker_names = [
+                    str(getattr(obj, "name", ""))
+                    for obj in list(getattr(getattr(checker, "world_model", None), "objects", []) or [])
+                ]
+            except Exception:
+                checker_names = []
+        names = []
+        seen = set()
+        for item in checker_names:
+            name = str(item)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        return names
+
+    @classmethod
+    def _checker_has_world_obstacle(cls, checker: Any, name: str) -> bool:
+        return str(name) in set(cls._checker_obstacle_names(checker))
+
+    def _set_world_obstacle_enabled_on_checkers(self, name: str, *, enabled: bool, owners=None) -> bool:
+        applied = False
+        checkers = (
+            self._iter_world_collision_checkers()
+            if owners is None
+            else self._iter_world_collision_checkers_for_owners(owners)
+        )
+        for checker in checkers:
+            if not hasattr(checker, "enable_obstacle"):
+                continue
+            if not self._checker_has_world_obstacle(checker, name):
+                continue
+            try:
+                checker.enable_obstacle(name=str(name), enable=bool(enabled))
+                applied = True
+            except Exception:
+                pass
+        return applied
+
+    def world_collision_checker_obstacle_names(self) -> list[str]:
+        names = []
+        seen = set()
+        for checker in self._iter_world_collision_checkers():
+            for item in self._checker_obstacle_names(checker):
+                name = str(item)
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                names.append(name)
+        return names
+
     @staticmethod
     def _set_solver_world_collision_for_links(solver, link_names: Sequence[str], *, enabled: bool) -> None:
         try:
@@ -209,37 +336,34 @@ class RM75CuRoboPlanner:
             str(getattr(obj, "name", f"obstacle_{idx:02d}"))
             for idx, obj in enumerate(list(getattr(world, "objects", []) or []))
         ]
+        checker_obstacle_names = self.world_collision_checker_obstacle_names()
+        obstacle_names = list(dict.fromkeys([*obstacle_names, *checker_obstacle_names]))
         diagnosis: dict[str, Any] = {
             "valid": bool(valid),
             "status": status,
             "world_obstacle_names": obstacle_names,
+            "checker_obstacle_names": checker_obstacle_names,
             "ablation": [],
         }
         if valid or status != "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION" or not obstacle_names:
             return diagnosis
 
-        original_world = world
-        try:
-            for name in obstacle_names:
-                ablated_world = self._world_without_obstacles(original_world, excluded_names={name})
-                if self._world_obstacle_count(ablated_world) <= 0:
-                    self.clear_world()
-                else:
-                    self.motion_gen.update_world(ablated_world)
-                    self.ik_solver.update_world(ablated_world)
+        for name in obstacle_names:
+            disabled = []
+            try:
+                disabled = self.set_world_obstacles_enabled([name], enabled=False)
                 ablated_valid, ablated_status = self.check_start_state(q_np)
                 diagnosis["ablation"].append(
                     {
                         "removed": str(name),
+                        "disabled": list(disabled),
                         "valid": bool(ablated_valid),
                         "status": ablated_status,
                     }
                 )
-        finally:
-            self.motion_gen.update_world(original_world)
-            self.ik_solver.update_world(original_world)
-            self._world = original_world
-            self._update_cuda_graph_batch_ik_world(original_world)
+            finally:
+                if disabled:
+                    self.set_world_obstacles_enabled(disabled, enabled=True)
         return diagnosis
 
     def _compute_world_link_spheres(self, q: Sequence[float]) -> np.ndarray:
@@ -662,6 +786,7 @@ class RM75CuRoboPlanner:
             collision_cache=self._cuda_graph_ik_collision_cache(),
         )
         self._apply_disabled_collision_links_to_solver(solver)
+        self._apply_disabled_world_obstacles_to_solver(solver)
         self._cuda_graph_batch_ik_solvers[key] = solver
         print(f"[curobo] created CUDA graph batch IK solver: batch={int(batch_size)}, seeds={int(num_seeds)}")
         return solver
@@ -694,6 +819,13 @@ class RM75CuRoboPlanner:
         if not disabled:
             return
         self._set_solver_world_collision_for_links(solver, disabled, enabled=False)
+
+    def _apply_disabled_world_obstacles_to_solver(self, solver) -> None:
+        disabled = sorted(str(x) for x in self._disabled_world_obstacles if str(x))
+        if not disabled:
+            return
+        for name in disabled:
+            self._set_world_obstacle_enabled_on_checkers(name, enabled=False, owners=[solver])
 
     def estimate_batch_start_goal_ik_errors(
         self,

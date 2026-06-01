@@ -10,9 +10,9 @@ import numpy as np
 
 
 BETA_DIR = Path(__file__).resolve().parent
-DEFAULT_CAMERA_EXTRINSIC = (
-    "/home/zhangzhao/Desktop/lerobot-sim2real/results/realman/realman_home/"
-    "base_camera/camera_extrinsic_opencv.npy"
+REPO_ROOT = BETA_DIR.parent
+DEFAULT_CAMERA_EXTRINSIC = str(
+    REPO_ROOT / "rm75_pick_place_app" / "assets" / "tingzi_calibration" / "camera_extrinsic_opencv.npy"
 )
 DEFAULT_OUT = BETA_DIR / "fixed_scenes" / "jimu_9objects_default" / "full_scene_pose_results.json"
 DEFAULT_EXTENTS_M = np.asarray([0.100058, 0.013194, 0.088722], dtype=np.float32)

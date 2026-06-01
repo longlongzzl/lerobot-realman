@@ -13,7 +13,9 @@ import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_CAMERA_EXTRINSIC = REPO_ROOT / "rm75_pick_place_app" / "assets" / "calibration" / "camera_extrinsic_opencv.npy"
+DEFAULT_CAMERA_EXTRINSIC = (
+    REPO_ROOT / "rm75_pick_place_app" / "assets" / "tingzi_calibration" / "camera_extrinsic_opencv.npy"
+)
 DEFAULT_OUT_DIR = SCRIPT_DIR / "jimu_portable_repro" / "scenes" / "random"
 
 

@@ -120,10 +120,18 @@ PORTABLE_DEFAULT_LOADED_TRAY_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "jimu_l
 PORTABLE_DEFAULT_BASE_ASSEMBLY_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "jimu_base_assembly_5plates.glb"
 PORTABLE_DEFAULT_TRAY_APRILTAG_CENTER_OFFSET_X_M = 0.0
 PORTABLE_DEFAULT_TRAY_APRILTAG_CENTER_OFFSET_Y_M = 0.0
+PORTABLE_DEFAULT_BASE_WORLD_OFFSET_X_M = 0.0
+PORTABLE_DEFAULT_BASE_WORLD_OFFSET_Y_M = 0.0
+PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_X_M = 0.0
+PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_Y_M = 0.0
 PORTABLE_DEFAULT_TRAY_SLOT_X_OFFSET_M = 0.006
 PORTABLE_DEFAULT_SAM6D_PROVIDER_SCRIPT = SCRIPT_DIR / "jimu_sam6d_pose_provider.py"
 PORTABLE_LEROBOT_SIM2REAL_ROOT = REPO_ROOT / "lerobot-sim2real"
-PORTABLE_CAMERA_EXTRINSIC = REPO_ROOT / "rm75_pick_place_app" / "assets" / "calibration" / "camera_extrinsic_opencv.npy"
+PORTABLE_TINGZI_CALIBRATION_DIR = REPO_ROOT / "rm75_pick_place_app" / "assets" / "tingzi_calibration"
+PORTABLE_CAMERA_EXTRINSIC = PORTABLE_TINGZI_CALIBRATION_DIR / "camera_extrinsic_opencv.npy"
+PORTABLE_FALLBACK_CAMERA_EXTRINSIC = (
+    REPO_ROOT / "rm75_pick_place_app" / "assets" / "calibration" / "camera_extrinsic_opencv.npy"
+)
 PORTABLE_MANISKILL_ROOT = PORTABLE_REPRO_DIR / "maniskill_env" / "mani_skill"
 PORTABLE_MANISKILL_ROBOTS_DIR = PORTABLE_MANISKILL_ROOT / "agents" / "robots"
 PORTABLE_MANISKILL_DT_DIR = PORTABLE_MANISKILL_ROOT / "envs" / "tasks" / "digital_twins"
@@ -164,6 +172,12 @@ _ORIGINAL_PLAN_SHORT_TCP_UP_AXIS_LIFT_IK = None
 _ORIGINAL_BUILD_HOVER_POSE = None
 _ORIGINAL_PROFILE_STAGE = None
 _ORIGINAL_EXECUTE_POSE_PATH_STAGE = None
+
+
+def _portable_camera_extrinsic_path() -> Path:
+    if PORTABLE_CAMERA_EXTRINSIC.exists():
+        return PORTABLE_CAMERA_EXTRINSIC
+    return PORTABLE_FALLBACK_CAMERA_EXTRINSIC
 _ORIGINAL_EXECUTE_JOINT_PATH_STAGE = None
 _ORIGINAL_PLAN_JOINT_PATH = None
 _ORIGINAL_REALMAN_SET_GRIPPER = None
@@ -953,6 +967,24 @@ def _normalize_vec(vec: np.ndarray, eps: float = 1e-8) -> np.ndarray | None:
     if norm <= eps:
         return None
     return (arr / norm).astype(np.float32)
+
+
+def _axis_angle_rotation_matrix(axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    axis = _normalize_vec(axis)
+    if axis is None:
+        return np.eye(3, dtype=np.float32)
+    x, y, z = [float(v) for v in axis[:3]]
+    c = float(np.cos(angle_rad))
+    s = float(np.sin(angle_rad))
+    C = 1.0 - c
+    return np.asarray(
+        [
+            [x * x * C + c, x * y * C - z * s, x * z * C + y * s],
+            [y * x * C + z * s, y * y * C + c, y * z * C - x * s],
+            [z * x * C - y * s, z * y * C + x * s, z * z * C + c],
+        ],
+        dtype=np.float32,
+    )
 
 
 def _horizontal_axis(vec: np.ndarray, *, snap_cardinal: bool) -> np.ndarray | None:
@@ -2384,6 +2416,12 @@ def _jimu_cache_key(args: argparse.Namespace, role_names: list[str], provider_na
         tuple(role_names),
         tuple(provider_names),
         direct_sam6d._sam6d_cache_key(args, provider_names),
+        float(getattr(args, "jimu_apriltag_tray_center_offset_x_m", PORTABLE_DEFAULT_TRAY_APRILTAG_CENTER_OFFSET_X_M)),
+        float(getattr(args, "jimu_apriltag_tray_center_offset_y_m", PORTABLE_DEFAULT_TRAY_APRILTAG_CENTER_OFFSET_Y_M)),
+        float(getattr(args, "jimu_apriltag_base_world_offset_x_m", PORTABLE_DEFAULT_BASE_WORLD_OFFSET_X_M)),
+        float(getattr(args, "jimu_apriltag_base_world_offset_y_m", PORTABLE_DEFAULT_BASE_WORLD_OFFSET_Y_M)),
+        float(getattr(args, "jimu_apriltag_tray_world_offset_x_m", PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_X_M)),
+        float(getattr(args, "jimu_apriltag_tray_world_offset_y_m", PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_Y_M)),
         str(
             getattr(args, "jimu_sam6d_provider_script", "")
             or getattr(args, "sam6d_provider_script", direct_sam6d.DEFAULT_SAM6D_PROVIDER_SCRIPT)
@@ -2472,6 +2510,12 @@ def _run_jimu_sam6d_provider_batch(
         jimu_apriltag_tray_size_m=float(getattr(args, "jimu_apriltag_tray_size_m", 0.06)),
         jimu_apriltag_base_yaw_deg=float(getattr(args, "jimu_apriltag_base_yaw_deg", 0.0)),
         jimu_apriltag_tray_yaw_deg=float(getattr(args, "jimu_apriltag_tray_yaw_deg", 90.0)),
+        jimu_apriltag_tray_center_offset_x_m=float(getattr(args, "jimu_apriltag_tray_center_offset_x_m", PORTABLE_DEFAULT_TRAY_APRILTAG_CENTER_OFFSET_X_M)),
+        jimu_apriltag_tray_center_offset_y_m=float(getattr(args, "jimu_apriltag_tray_center_offset_y_m", PORTABLE_DEFAULT_TRAY_APRILTAG_CENTER_OFFSET_Y_M)),
+        jimu_apriltag_base_world_offset_x_m=float(getattr(args, "jimu_apriltag_base_world_offset_x_m", PORTABLE_DEFAULT_BASE_WORLD_OFFSET_X_M)),
+        jimu_apriltag_base_world_offset_y_m=float(getattr(args, "jimu_apriltag_base_world_offset_y_m", PORTABLE_DEFAULT_BASE_WORLD_OFFSET_Y_M)),
+        jimu_apriltag_tray_world_offset_x_m=float(getattr(args, "jimu_apriltag_tray_world_offset_x_m", PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_X_M)),
+        jimu_apriltag_tray_world_offset_y_m=float(getattr(args, "jimu_apriltag_tray_world_offset_y_m", PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_Y_M)),
     )
     print("[jimu-sam6d] using portable same-object SAM3/SAM6D subprocess call")
     return direct_sam6d._run_sam6d_provider(run_args, provider_names)
@@ -3633,6 +3677,25 @@ def _jimu_tilt_abs_relation_label(label: str) -> str:
     return text
 
 
+def _jimu_grasp_tilt_abs_deg(item: dict | None) -> float:
+    if not isinstance(item, dict):
+        return 0.0
+    for key in ("jimu_grasp_tilt_deg", "grasp_tilt_deg"):
+        if item.get(key) is not None:
+            try:
+                return abs(float(item.get(key) or 0.0))
+            except Exception:
+                pass
+    label = str(item.get("label", "") or "")
+    match = re.search(r"tilt_(?:toward|away)_robot_([+-]?\d+(?:\.\d+)?)deg", label)
+    if match:
+        return abs(float(match.group(1)))
+    match = re.search(r"tilt_([+-]?\d+(?:\.\d+)?)deg", label)
+    if match:
+        return abs(float(match.group(1)))
+    return 0.0
+
+
 def _jimu_float_list_from_args(args, name: str, default, *, min_value: float | None = None) -> list[float]:
     try:
         return list(direct._unique_finite_float_list(getattr(args, name, default), min_value=min_value))
@@ -3943,6 +4006,9 @@ def fast_chain_rank_paired_relation_candidates_jimu(
     paired_debug["paired_jimu_parallel_candidate_count"] = int(len(records))
     paired_debug["paired_place_expansion_kind"] = "jimu_parallel_grasp"
     tilted_symmetry_bias = 0
+    tilt_penalty_count = 0
+    max_tilt_penalty = 0.0
+    tilt_penalty_per_deg = float(max(getattr(args, "jimu_grasp_tilt_score_penalty_per_deg", 0.25) or 0.0, 0.0))
     return_start_penalty_count = 0
     max_return_start_penalty = 0.0
     symmetry_bias = float(getattr(args, "jimu_tilted_symmetry_score_bias", 0.75) or 0.0)
@@ -3962,13 +4028,37 @@ def fast_chain_rank_paired_relation_candidates_jimu(
             rec["score"] = float(rec.get("score", 0.0)) - symmetry_bias
             place_candidate["jimu_parallel_tilt_symmetry_preferred"] = True
             tilted_symmetry_bias += 1
+        tilt_abs_deg = _jimu_grasp_tilt_abs_deg(rec.get("grasp_candidate", {}))
+        if tilt_penalty_per_deg > 0.0 and tilt_abs_deg > 1.0e-6:
+            tilt_penalty = tilt_penalty_per_deg * float(tilt_abs_deg)
+            rec["score"] = float(rec.get("score", 0.0)) + float(tilt_penalty)
+            place_candidate["jimu_grasp_tilt_abs_deg"] = float(tilt_abs_deg)
+            place_candidate["jimu_grasp_tilt_score_penalty"] = float(tilt_penalty)
+            tilt_penalty_count += 1
+            max_tilt_penalty = max(max_tilt_penalty, float(tilt_penalty))
         return_penalty = _jimu_return_to_start_pair_score_penalty(rec, start_q, args)
         if return_penalty > 0.0:
             rec["score"] = float(rec.get("score", 0.0)) + float(return_penalty)
             return_start_penalty_count += 1
             max_return_start_penalty = max(max_return_start_penalty, float(return_penalty))
+    score_preview = []
+    for rec in sorted(pair_records, key=lambda item: float(item.get("score", 0.0)))[:8]:
+        grasp_candidate = rec.get("grasp_candidate", {})
+        place_candidate = rec.get("place_candidate", {})
+        score_preview.append(
+            {
+                "score": float(rec.get("score", 0.0)),
+                "grasp": str(grasp_candidate.get("label", "")),
+                "tilt_abs_deg": float(_jimu_grasp_tilt_abs_deg(grasp_candidate)),
+                "place": str(place_candidate.get("label", "")),
+            }
+        )
     paired_debug["paired_jimu_parallel_tilt_symmetry_bias_count"] = int(tilted_symmetry_bias)
     paired_debug["paired_jimu_parallel_tilt_symmetry_bias"] = float(symmetry_bias)
+    paired_debug["paired_jimu_grasp_tilt_penalty_count"] = int(tilt_penalty_count)
+    paired_debug["paired_jimu_grasp_tilt_penalty_per_deg"] = float(tilt_penalty_per_deg)
+    paired_debug["paired_jimu_grasp_tilt_penalty_max"] = float(max_tilt_penalty)
+    paired_debug["paired_jimu_score_preview"] = score_preview
     paired_debug["paired_jimu_return_to_start_penalty_count"] = int(return_start_penalty_count)
     paired_debug["paired_jimu_return_to_start_penalty_max"] = float(max_return_start_penalty)
     return pair_records, paired_debug
@@ -4089,39 +4179,30 @@ def _jimu_start_collision_diagnosis(planner, args_ns, candidates, label: str, di
         ],
         "all_scene_obstacles": list(obstacle_names),
     }
-    original_world = getattr(planner, "_world", None)
-    if original_world is not None and hasattr(planner, "_world_without_obstacles"):
+    if hasattr(planner, "set_world_obstacles_enabled"):
         try:
             for group_name, removed_names in group_specs.items():
                 removed_names = [name for name in removed_names if name]
                 if not removed_names:
                     continue
-                ablated_world = planner._world_without_obstacles(original_world, excluded_names=set(removed_names))
-                if hasattr(planner, "_world_obstacle_count") and planner._world_obstacle_count(ablated_world) <= 0:
-                    planner.clear_world()
-                else:
-                    planner.motion_gen.update_world(ablated_world)
-                    planner.ik_solver.update_world(ablated_world)
-                group_valid, group_status = planner.check_start_state(start_q)
-                group_ablation.append(
-                    {
-                        "removed_group": group_name,
-                        "removed": removed_names[:32],
-                        "valid": bool(group_valid),
-                        "status": str(group_status),
-                    }
-                )
+                disabled_group = []
+                try:
+                    disabled_group = planner.set_world_obstacles_enabled(removed_names, enabled=False)
+                    group_valid, group_status = planner.check_start_state(start_q)
+                    group_ablation.append(
+                        {
+                            "removed_group": group_name,
+                            "removed": removed_names[:32],
+                            "disabled": list(disabled_group[:32]),
+                            "valid": bool(group_valid),
+                            "status": str(group_status),
+                        }
+                    )
+                finally:
+                    if disabled_group:
+                        planner.set_world_obstacles_enabled(disabled_group, enabled=True)
         except Exception as exc:
             group_ablation.append({"error": f"{type(exc).__name__}: {exc}"})
-        finally:
-            try:
-                planner.motion_gen.update_world(original_world)
-                planner.ik_solver.update_world(original_world)
-                planner._world = original_world
-                if hasattr(planner, "_update_cuda_graph_batch_ik_world"):
-                    planner._update_cuda_graph_batch_ik_world(original_world)
-            except Exception:
-                pass
     original_world = getattr(planner, "_world", None)
     try:
         if hasattr(planner, "clear_world"):
@@ -4254,6 +4335,10 @@ def _jimu_start_collision_diagnosis(planner, args_ns, candidates, label: str, di
         bottom_z = None
     attached_sphere_summary = {}
     attached_robot_sphere_contacts = []
+    attached_world_obstacle_contacts = []
+    robot_world_obstacle_contacts = []
+    robot_internal_cube_contacts = []
+    curobo_raw_world_collision = {}
     try:
         attached_spheres = list(planner.get_attached_spheres_world(start_q) or [])
         attached_sphere_summary = {
@@ -4322,8 +4407,24 @@ def _jimu_start_collision_diagnosis(planner, args_ns, candidates, label: str, di
                 )
         pairs.sort(key=lambda item: float(item["clearance_m"]))
         attached_robot_sphere_contacts = pairs[:16]
+        attached_world_obstacle_contacts = _jimu_attached_world_obstacle_contacts(planner, attached_spheres)
+        robot_world_obstacle_contacts = _jimu_robot_world_obstacle_contacts(
+            planner,
+            start_q,
+            disabled_world_collision_links=disabled_world_collision_links,
+        )
+        robot_internal_cube_contacts = _jimu_robot_internal_cube_contacts(
+            planner,
+            start_q,
+            disabled_world_collision_links=disabled_world_collision_links,
+        )
+        curobo_raw_world_collision = _jimu_curobo_raw_world_collision_snapshot(planner, start_q)
     except Exception as exc:
         attached_robot_sphere_contacts = [{"error": f"{type(exc).__name__}: {exc}"}]
+        attached_world_obstacle_contacts = [{"error": f"{type(exc).__name__}: {exc}"}]
+        robot_world_obstacle_contacts = [{"error": f"{type(exc).__name__}: {exc}"}]
+        robot_internal_cube_contacts = [{"error": f"{type(exc).__name__}: {exc}"}]
+        curobo_raw_world_collision = {"error": f"{type(exc).__name__}: {exc}"}
         attached_sphere_summary = {"error": f"{type(exc).__name__}: {exc}"}
     result = {
         "valid": bool((diag or {}).get("valid", False)),
@@ -4336,6 +4437,10 @@ def _jimu_start_collision_diagnosis(planner, args_ns, candidates, label: str, di
         "link_ablation": link_ablation[:32],
         "attached_sphere_summary": attached_sphere_summary,
         "attached_robot_sphere_contacts": attached_robot_sphere_contacts,
+        "attached_world_obstacle_contacts": attached_world_obstacle_contacts,
+        "robot_world_obstacle_contacts": robot_world_obstacle_contacts,
+        "robot_internal_cube_contacts": robot_internal_cube_contacts,
+        "curobo_raw_world_collision": curobo_raw_world_collision,
         "valid_after_removing": valid_after_removing[:16],
         "attached_sphere_bottom_z": None if bottom_z is None else float(bottom_z),
         "virtual_table_top_z": float(getattr(args_ns, "curobo_table_z_offset", -0.01)),
@@ -4470,6 +4575,24 @@ def plan_return_to_start_joint_curobo_jimu(
     return payload
 
 
+def _jimu_rebind_curobo_world_cache(planner, *, label: str) -> bool:
+    world = getattr(planner, "_world", None)
+    if planner is None or world is None:
+        return False
+    try:
+        if getattr(planner, "motion_gen", None) is not None:
+            planner.motion_gen.update_world(world)
+        if getattr(planner, "ik_solver", None) is not None:
+            planner.ik_solver.update_world(world)
+        if hasattr(planner, "_update_cuda_graph_batch_ik_world"):
+            planner._update_cuda_graph_batch_ik_world(world)
+        print(f"[jimu-curobo] {label}: rebound cuRobo world cache before after-lift transport")
+        return True
+    except Exception as exc:
+        print(f"[jimu-curobo] {label}: failed to rebind cuRobo world cache: {exc}")
+        return False
+
+
 def profile_plan_goalset_to_poses_jimu(planner, *args, **kwargs):
     original = _ORIGINAL_PROFILE_PLAN_GOALSET_TO_POSES
     if original is None:
@@ -4519,6 +4642,12 @@ def evaluate_curobo_pose_candidates_multi_start_jimu(planner, *args, **kwargs):
     if original is None:
         raise RuntimeError("original _evaluate_curobo_pose_candidates_multi_start is not installed")
     label = str(kwargs.get("label", "") or "")
+    if (
+        "after_lift" in label
+        and getattr(planner, "attached_object_active", False)
+        and getattr(planner, "_last_world_cache_hit", False)
+    ):
+        _jimu_rebind_curobo_world_cache(planner, label=label)
     planner._jimu_motiongen_capture_active = True
     planner._jimu_motiongen_capture_label = label
     planner._jimu_motiongen_capture_args = args[1] if len(args) >= 2 else kwargs.get("args", None)
@@ -4607,6 +4736,285 @@ def _jimu_shape_is_triangle(shape_hint: str | None, dims: np.ndarray) -> bool:
     return bool(sorted_dims[-1] > 1.35 * sorted_dims[-2])
 
 
+def _jimu_array_from_attr(value, *, expected: int | None = None) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        elif hasattr(value, "cpu") and hasattr(value, "numpy"):
+            value = value.cpu().numpy()
+        elif hasattr(value, "tolist"):
+            value = value.tolist()
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        if expected is not None and arr.size != int(expected):
+            return None
+        if not np.all(np.isfinite(arr)):
+            return None
+        return arr.astype(np.float32, copy=False)
+    except Exception:
+        return None
+
+
+def _jimu_world_object_pose_dims(world_object) -> tuple[np.ndarray | None, np.ndarray | None]:
+    dims = _jimu_array_from_attr(getattr(world_object, "dims", None), expected=3)
+    if dims is None:
+        dims = _jimu_array_from_attr(getattr(world_object, "scale", None), expected=3)
+
+    pose_value = getattr(world_object, "pose", None)
+    pose = _jimu_array_from_attr(pose_value, expected=7)
+    if pose is None and pose_value is not None:
+        pos = _jimu_array_from_attr(getattr(pose_value, "position", None), expected=3)
+        quat = _jimu_array_from_attr(getattr(pose_value, "quaternion", None), expected=4)
+        if pos is not None and quat is not None:
+            pose = np.concatenate([pos, quat]).astype(np.float32)
+    return pose, dims
+
+
+def _jimu_attached_world_obstacle_contacts(planner, attached_spheres) -> list[dict]:
+    world = getattr(planner, "_world", None)
+    if world is None:
+        return []
+    cuboids = list(getattr(world, "cuboid", []) or [])
+    contacts: list[dict] = []
+    for obstacle_idx, obstacle in enumerate(cuboids):
+        obstacle_name = str(getattr(obstacle, "name", f"cuboid_{obstacle_idx:02d}") or f"cuboid_{obstacle_idx:02d}")
+        pose, dims = _jimu_world_object_pose_dims(obstacle)
+        if pose is None or dims is None or np.min(dims) <= 0:
+            continue
+        obs_p = pose[:3].astype(np.float32)
+        obs_R = planner._quat_wxyz_to_rotmat(pose[3:7])
+        half = 0.5 * dims.astype(np.float32)
+        for attached_idx, attached_sphere in enumerate(attached_spheres or []):
+            center = _jimu_array_from_attr(attached_sphere.get("center"), expected=3)
+            radius = float(attached_sphere.get("radius", 0.0) or 0.0)
+            if center is None or radius <= 0:
+                continue
+            local = obs_R.T @ (center - obs_p)
+            signed_axis = np.abs(local) - half
+            outside = np.maximum(signed_axis, 0.0)
+            outside_dist = float(np.linalg.norm(outside))
+            inside_dist = float(min(float(np.max(signed_axis)), 0.0))
+            sphere_to_box_surface = outside_dist + inside_dist
+            clearance = float(sphere_to_box_surface - radius)
+            contacts.append(
+                {
+                    "obstacle": obstacle_name,
+                    "attached_sphere": int(attached_idx),
+                    "clearance_m": clearance,
+                    "sphere_to_box_surface_m": float(sphere_to_box_surface),
+                    "sphere_radius_m": float(radius),
+                    "attached_center": [float(x) for x in center.tolist()],
+                    "obstacle_center": [float(x) for x in obs_p.tolist()],
+                    "obstacle_dims": [float(x) for x in dims.tolist()],
+                    "local_center": [float(x) for x in local.tolist()],
+                }
+            )
+    contacts.sort(key=lambda item: float(item["clearance_m"]))
+    return contacts[:24]
+
+
+def _jimu_robot_world_obstacle_contacts(planner, q, disabled_world_collision_links=None) -> list[dict]:
+    world = getattr(planner, "_world", None)
+    if world is None:
+        return []
+    cuboids = list(getattr(world, "cuboid", []) or [])
+    if not cuboids:
+        return []
+    robot_spheres = np.asarray(planner._compute_world_link_spheres(q), dtype=np.float32).reshape(-1, 4)
+    robot_link_names = list(planner._collision_sphere_link_names() or [])
+    disabled_links = {str(x) for x in list(disabled_world_collision_links or []) if str(x)}
+    contacts: list[dict] = []
+    for sphere_idx, sphere in enumerate(robot_spheres):
+        link_name = str(robot_link_names[sphere_idx]) if sphere_idx < len(robot_link_names) else f"sphere_{sphere_idx}"
+        if link_name in disabled_links:
+            continue
+        radius = float(sphere[3])
+        if radius <= 0.0:
+            continue
+        center = np.asarray(sphere[:3], dtype=np.float32).reshape(3)
+        for obstacle_idx, obstacle in enumerate(cuboids):
+            obstacle_name = str(getattr(obstacle, "name", f"cuboid_{obstacle_idx:02d}") or f"cuboid_{obstacle_idx:02d}")
+            pose, dims = _jimu_world_object_pose_dims(obstacle)
+            if pose is None or dims is None or np.min(dims) <= 0:
+                continue
+            obs_p = pose[:3].astype(np.float32)
+            obs_R = planner._quat_wxyz_to_rotmat(pose[3:7])
+            half = 0.5 * dims.astype(np.float32)
+            local = obs_R.T @ (center - obs_p)
+            signed_axis = np.abs(local) - half
+            outside = np.maximum(signed_axis, 0.0)
+            outside_dist = float(np.linalg.norm(outside))
+            inside_dist = float(min(float(np.max(signed_axis)), 0.0))
+            sphere_to_box_surface = outside_dist + inside_dist
+            clearance = float(sphere_to_box_surface - radius)
+            contacts.append(
+                {
+                    "obstacle": obstacle_name,
+                    "robot_sphere": int(sphere_idx),
+                    "robot_link": link_name,
+                    "clearance_m": clearance,
+                    "sphere_to_box_surface_m": float(sphere_to_box_surface),
+                    "sphere_radius_m": float(radius),
+                    "sphere_center": [float(x) for x in center.tolist()],
+                    "obstacle_center": [float(x) for x in obs_p.tolist()],
+                    "obstacle_dims": [float(x) for x in dims.tolist()],
+                    "local_center": [float(x) for x in local.tolist()],
+                }
+            )
+    contacts.sort(key=lambda item: float(item["clearance_m"]))
+    return contacts[:32]
+
+
+def _jimu_robot_internal_cube_contacts(planner, q, disabled_world_collision_links=None) -> list[dict]:
+    """Approximate robot-sphere vs cuRobo's active internal OBB cache.
+
+    planner._world is the high-level WorldConfig.  cuRobo's start-state check
+    ultimately queries the collision checker's cached cube tensors, so inspect
+    those too when the two disagree.
+    """
+
+    try:
+        checker = planner.motion_gen.rollout_fn.primitive_collision_constraint.world_coll_checker
+        cube_tensors = getattr(checker, "_cube_tensor_list", None)
+        if not cube_tensors or len(cube_tensors) < 3:
+            return []
+        dims_t, inv_pose_t, enabled_t = cube_tensors[:3]
+        dims_arr = np.asarray(dims_t.detach().cpu().numpy(), dtype=np.float32)
+        inv_pose_arr = np.asarray(inv_pose_t.detach().cpu().numpy(), dtype=np.float32)
+        enabled_arr = np.asarray(enabled_t.detach().cpu().numpy(), dtype=np.float32)
+        if dims_arr.ndim == 3:
+            dims_arr = dims_arr[0]
+        if inv_pose_arr.ndim == 3:
+            inv_pose_arr = inv_pose_arr[0]
+        if enabled_arr.ndim == 2:
+            enabled_arr = enabled_arr[0]
+        name_map = {}
+        try:
+            raw_names = getattr(checker, "_env_obbs_names", None)
+            if raw_names:
+                env_names = raw_names[0]
+                if isinstance(env_names, dict):
+                    name_map = {int(k): str(v) for k, v in env_names.items()}
+                else:
+                    name_map = {idx: str(v) for idx, v in enumerate(list(env_names or []))}
+        except Exception:
+            name_map = {}
+        robot_spheres = np.asarray(planner._compute_world_link_spheres(q), dtype=np.float32).reshape(-1, 4)
+        robot_link_names = list(planner._collision_sphere_link_names() or [])
+    except Exception as exc:
+        return [{"error": f"{type(exc).__name__}: {exc}"}]
+
+    disabled_links = {str(x) for x in list(disabled_world_collision_links or []) if str(x)}
+    contacts: list[dict] = []
+    for sphere_idx, sphere in enumerate(robot_spheres):
+        link_name = str(robot_link_names[sphere_idx]) if sphere_idx < len(robot_link_names) else f"sphere_{sphere_idx}"
+        if link_name in disabled_links:
+            continue
+        radius = float(sphere[3])
+        if radius <= 0.0:
+            continue
+        center = np.asarray(sphere[:3], dtype=np.float32).reshape(3)
+        for obstacle_idx in range(min(dims_arr.shape[0], inv_pose_arr.shape[0], enabled_arr.shape[0])):
+            if float(enabled_arr[obstacle_idx]) <= 0.0:
+                continue
+            dims = np.asarray(dims_arr[obstacle_idx, :3], dtype=np.float32).reshape(3)
+            inv_pose = np.asarray(inv_pose_arr[obstacle_idx, :7], dtype=np.float32).reshape(7)
+            if np.min(dims) <= 0.0 or not np.all(np.isfinite(inv_pose)):
+                continue
+            inv_R = planner._quat_wxyz_to_rotmat(inv_pose[3:7])
+            local = inv_R @ center + inv_pose[:3]
+            half = 0.5 * dims
+            signed_axis = np.abs(local) - half
+            outside = np.maximum(signed_axis, 0.0)
+            outside_dist = float(np.linalg.norm(outside))
+            inside_dist = float(min(float(np.max(signed_axis)), 0.0))
+            sphere_to_box_surface = outside_dist + inside_dist
+            clearance = float(sphere_to_box_surface - radius)
+            contacts.append(
+                {
+                    "obstacle": name_map.get(obstacle_idx, f"internal_obb_{obstacle_idx:02d}"),
+                    "obstacle_idx": int(obstacle_idx),
+                    "robot_sphere": int(sphere_idx),
+                    "robot_link": link_name,
+                    "clearance_m": clearance,
+                    "sphere_to_box_surface_m": float(sphere_to_box_surface),
+                    "sphere_radius_m": float(radius),
+                    "sphere_center": [float(x) for x in center.tolist()],
+                    "internal_dims": [float(x) for x in dims.tolist()],
+                    "internal_inv_pose": [float(x) for x in inv_pose.tolist()],
+                    "local_center": [float(x) for x in local.tolist()],
+                }
+            )
+    contacts.sort(key=lambda item: float(item["clearance_m"]))
+    return contacts[:32]
+
+
+def _jimu_curobo_raw_world_collision_snapshot(planner, q) -> dict:
+    """Query cuRobo's own primitive collision constraint for this start state."""
+
+    try:
+        rollout = planner.motion_gen.rollout_fn
+        collision = rollout.primitive_collision_constraint
+        joint_state = planner._make_start_state(q)
+        kin_state = rollout.compute_kinematics(joint_state)
+        spheres = getattr(kin_state, "robot_spheres", None)
+        if spheres is None:
+            spheres = getattr(kin_state, "link_spheres_tensor", None)
+        if spheres is None:
+            return {"error": "kinematic state does not expose robot_spheres"}
+        if len(spheres.shape) == 3:
+            spheres_query = spheres.unsqueeze(1)
+        elif len(spheres.shape) == 4:
+            spheres_query = spheres
+        else:
+            return {"error": f"unexpected robot_spheres shape: {tuple(spheres.shape)}"}
+
+        collision._collision_query_buffer.update_buffer_shape(
+            spheres_query.shape,
+            collision.tensor_args,
+            collision.world_coll_checker.collision_types,
+        )
+        raw = collision.coll_check_fn(
+            spheres_query.contiguous(),
+            collision._collision_query_buffer,
+            collision.weight,
+            activation_distance=collision.activation_distance,
+            env_query_idx=None,
+            return_loss=False,
+        )
+        constraint = collision.forward(spheres_query.contiguous())
+        raw_np = np.asarray(raw.detach().cpu().numpy(), dtype=np.float32)
+        constraint_np = np.asarray(constraint.detach().cpu().numpy(), dtype=np.float32)
+        raw_flat = raw_np.reshape(-1)
+        sphere_rows = np.asarray(spheres_query.detach().cpu().numpy(), dtype=np.float32).reshape(-1, 4)
+        link_names = list(planner._collision_sphere_link_names() or [])
+        nonzero = []
+        for sphere_idx, value in enumerate(raw_flat):
+            value_f = float(value)
+            if abs(value_f) <= 1e-8:
+                continue
+            sphere = sphere_rows[sphere_idx] if sphere_idx < sphere_rows.shape[0] else np.zeros((4,), dtype=np.float32)
+            nonzero.append(
+                {
+                    "sphere": int(sphere_idx),
+                    "link": str(link_names[sphere_idx]) if sphere_idx < len(link_names) else f"sphere_{sphere_idx}",
+                    "value": value_f,
+                    "center": [float(x) for x in sphere[:3].tolist()],
+                    "radius": float(sphere[3]),
+                }
+            )
+        nonzero.sort(key=lambda item: abs(float(item["value"])), reverse=True)
+        return {
+            "constraint": constraint_np.reshape(-1).astype(float).tolist()[:16],
+            "raw_shape": [int(x) for x in raw_np.shape],
+            "nonzero_count": int(len(nonzero)),
+            "nonzero": nonzero[:32],
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 def _jimu_local_planar_payload_centers(
     *,
     dims: np.ndarray,
@@ -4628,8 +5036,13 @@ def _jimu_local_planar_payload_centers(
     long_half = float(_jimu_grid_axis_positions(float(dims[long_axis]), 2, radius, span_scale)[-1])
     wide_half = float(_jimu_grid_axis_positions(float(dims[wide_axis]), 2, radius, span_scale)[-1])
     if _jimu_shape_is_triangle(shape_hint, dims):
-        raw_long_half = max(0.0, 0.5 * float(dims[long_axis]) * float(span_scale))
-        raw_wide_half = max(0.0, 0.5 * float(dims[wide_axis]) * float(span_scale))
+        # Keep the attached-payload collision spheres inside the triangle.  If
+        # the centers sit too close to the mathematical vertices, cuRobo can
+        # reject otherwise reasonable lifted starts because the sphere envelope
+        # is much fatter than the real thin roof panel.
+        safe_radius = max(float(radius), 0.0)
+        raw_long_half = max(0.0, 0.5 * float(dims[long_axis]) * float(span_scale) - 0.5 * safe_radius)
+        raw_wide_half = max(0.0, 0.5 * float(dims[wide_axis]) * float(span_scale) - 0.5 * safe_radius)
         apex = np.array([raw_long_half, 0.0], dtype=np.float32)
         base_left = np.array([-raw_long_half, -raw_wide_half], dtype=np.float32)
         base_right = np.array([-raw_long_half, raw_wide_half], dtype=np.float32)
@@ -4656,19 +5069,22 @@ def _jimu_local_planar_payload_centers(
             center_2d = midpoint + normal / norm * float(distance)
             return float(center_2d[0]), float(center_2d[1])
 
-        # Six available attached-object spheres fit a triangle well: three
-        # inset vertices plus three inset edge midpoints.  The sphere boundary
-        # reaches the triangle boundary while the centers stay inside the panel.
+        inset_distance = max(1.75 * safe_radius, 0.006)
+        # Six available attached-object spheres fit a triangle well when they
+        # stay inside the footprint: three inset vertices plus three inset edge
+        # midpoints.  Keep the envelope conservative; the visual/physics mesh
+        # still carries the exact shape, this model is only for transport
+        # obstacle avoidance.
         tri_2d = [
-            _inset_towards_inside(apex, radius),
-            _inset_towards_inside(base_left, radius),
-            _inset_towards_inside(base_right, radius),
-            _inset_edge_midpoint(apex, base_left, radius),
-            _inset_edge_midpoint(base_left, base_right, radius),
-            _inset_edge_midpoint(base_right, apex, radius),
+            _inset_towards_inside(apex, inset_distance),
+            _inset_towards_inside(base_left, inset_distance),
+            _inset_towards_inside(base_right, inset_distance),
+            _inset_edge_midpoint(apex, base_left, inset_distance),
+            _inset_edge_midpoint(base_left, base_right, inset_distance),
+            _inset_edge_midpoint(base_right, apex, inset_distance),
             (0.0, 0.0),
         ]
-        layout = "triangle_inset_vertices_edges"
+        layout = "triangle_inner_vertices_edges"
         chosen_2d = tri_2d[:max_spheres]
     else:
         if max_spheres <= 6:
@@ -5319,6 +5735,20 @@ def _jimu_should_use_partial_open_for_grasp(label: str, gripper_pos: float, args
     return abs(float(gripper_pos) - full_open) <= 1e-6
 
 
+def _jimu_should_keep_partial_open_after_release(label: str, gripper_pos: float, args: argparse.Namespace | None) -> bool:
+    if not _jimu_partial_release_enabled(args):
+        return False
+    if args is None:
+        return False
+    full_open = float(getattr(args, "real_gripper_open", 0.0))
+    if abs(float(gripper_pos) - full_open) > 1e-6:
+        return False
+    label_l = str(label or "").lower()
+    if label_l == "post_place_clearance":
+        return True
+    return "return_to_cycle_start" in label_l or "return_to_start" in label_l
+
+
 def _jimu_refresh_after_no_step_gripper_sync(demo) -> None:
     try:
         direct.targeted.base.refresh_frozen_active_object_pose(demo)
@@ -5760,6 +6190,33 @@ def execute_pose_path_stage_jimu(
                 print("[jimu gripper] real gripper pre-set to partial open before grasp motion")
             except Exception as exc:
                 print(f"[warn] failed to pre-set real gripper partial open before grasp motion: {exc}")
+    if label_text != "post_place_clearance" and _jimu_should_keep_partial_open_after_release(label_text, gripper_pos, args):
+        partial = _jimu_partial_release_gripper_value(args)
+        sim_partial = _jimu_partial_release_sim_gripper_value(args)
+        print(
+            "[jimu gripper] return/clearance pose motion keeps release partial-open gripper: "
+            f"real={partial:.3f}, sim={sim_partial:.3f}, label={label_text}"
+        )
+        try:
+            direct._record_profile(
+                args,
+                "jimu_release_partial_open_motion",
+                success=True,
+                status="POSE_PATH",
+                label=label_text,
+                partial_gripper_pos=partial,
+                requested_gripper_pos=float(gripper_pos),
+            )
+        except Exception:
+            pass
+        gripper_pos = partial
+        if _jimu_skip_physics_gripper_sync(args):
+            _jimu_set_sim_gripper_visual(
+                demo,
+                sim_partial,
+                args,
+                label=f"{label_text}_release_partial",
+            )
     if label_text != "post_place_clearance" or not _jimu_partial_release_enabled(args):
         return _jimu_execute_pose_path_stage_base(
             demo,
@@ -5850,6 +6307,33 @@ def execute_joint_path_stage_jimu(
     if _ORIGINAL_EXECUTE_JOINT_PATH_STAGE is None:
         raise RuntimeError("Jimu execute_joint_path_stage wrapper was installed before original function was captured")
     q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    if _jimu_should_keep_partial_open_after_release(label, gripper_pos, args):
+        partial = _jimu_partial_release_gripper_value(args)
+        sim_partial = _jimu_partial_release_sim_gripper_value(args)
+        print(
+            "[jimu gripper] return/clearance motion keeps release partial-open gripper: "
+            f"real={partial:.3f}, sim={sim_partial:.3f}, label={label}"
+        )
+        try:
+            direct._record_profile(
+                args,
+                "jimu_release_partial_open_motion",
+                success=True,
+                status="JOINT_PATH",
+                label=str(label or ""),
+                partial_gripper_pos=partial,
+                requested_gripper_pos=float(gripper_pos),
+            )
+        except Exception:
+            pass
+        gripper_pos = partial
+        if _jimu_skip_physics_gripper_sync(args):
+            _jimu_set_sim_gripper_visual(
+                demo,
+                sim_partial,
+                args,
+                label=f"{label}_release_partial",
+            )
     if _jimu_render_dry_run_motion_enabled(args, real_exec):
         if not q_path:
             q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
@@ -5903,7 +6387,7 @@ def build_arg_parser():
         lerobot_sim2real_root=str(PORTABLE_LEROBOT_SIM2REAL_ROOT),
         urdf_path=str(PORTABLE_MANISKILL_RM75_URDF),
         srdf_path=str(PORTABLE_MANISKILL_RM75_SRDF),
-        camera_extrinsic_opencv_path=str(PORTABLE_CAMERA_EXTRINSIC),
+        camera_extrinsic_opencv_path=str(_portable_camera_extrinsic_path()),
         curobo_rm75_robot_cfg=PICK_JIAOBANG_DIR / "curobo_rm75_config" / "rm75.yml",
         curobo_rm75_urdf=PORTABLE_MANISKILL_RM75_PLANNING_URDF,
         sam6d_provider_script=str(PORTABLE_DEFAULT_SAM6D_PROVIDER_SCRIPT)
@@ -5936,11 +6420,12 @@ def build_arg_parser():
         joint_search_max_grasp_candidates=16,
         joint_search_validate_final_contact=True,
         joint_search_start_collision_lift_m=0.10,
+        jimu_force_transport_start_lift=True,
         short_linear_endpoint_ik_first=False,
         strict_short_linear_waypoint_pos_tol_m=0.008,
-        strict_final_contact_waypoint_pos_tol_m=0.006,
-        curobo_approach_metric_locked_axis_tol_m=0.006,
-        force_replan_post_place_clearance=True,
+        strict_final_contact_waypoint_pos_tol_m=0.008,
+        curobo_approach_metric_locked_axis_tol_m=0.008,
+        force_replan_post_place_clearance=False,
         # Jimu blocks are thin and densely staged in the tray.  Use a sparse
         # signed tilt set: positive angles lean toward the robot, negative
         # angles lean away from the robot.  This keeps the first layer in one
@@ -6218,6 +6703,30 @@ def build_arg_parser():
         help="Calibration offset added to the tray tag center along tray local Y after reading the CAD recess center.",
     )
     parser.add_argument(
+        "--jimu-apriltag-base-world-offset-x-m",
+        type=float,
+        default=PORTABLE_DEFAULT_BASE_WORLD_OFFSET_X_M,
+        help="World/robot-base table-plane X offset applied to the localized base assembly after AprilTag pose estimation.",
+    )
+    parser.add_argument(
+        "--jimu-apriltag-base-world-offset-y-m",
+        type=float,
+        default=PORTABLE_DEFAULT_BASE_WORLD_OFFSET_Y_M,
+        help="World/robot-base table-plane Y offset applied to the localized base assembly after AprilTag pose estimation.",
+    )
+    parser.add_argument(
+        "--jimu-apriltag-tray-world-offset-x-m",
+        type=float,
+        default=PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_X_M,
+        help="World/robot-base table-plane X offset applied to the localized tray after AprilTag pose estimation.",
+    )
+    parser.add_argument(
+        "--jimu-apriltag-tray-world-offset-y-m",
+        type=float,
+        default=PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_Y_M,
+        help="World/robot-base table-plane Y offset applied to the localized tray after AprilTag pose estimation.",
+    )
+    parser.add_argument(
         "--grounding-dino-local-files-only",
         dest="grounding_dino_local_files_only",
         action="store_true",
@@ -6277,6 +6786,58 @@ def build_arg_parser():
         type=float,
         default=0.75,
         help="Small score bonus for 180-degree symmetric Jimu release poses paired with tilted grasps.",
+    )
+    parser.add_argument(
+        "--jimu-grasp-tilt-score-penalty-per-deg",
+        type=float,
+        default=0.25,
+        help=(
+            "Score penalty per absolute Jimu grasp tilt degree so feasible pair intersections prefer smaller tilt "
+            "angles. The default makes a 4-degree tilt lose to a direct grasp even when 180-degree symmetry is available."
+        ),
+    )
+    parser.add_argument(
+        "--jimu-grasp-tilt-use-current-tcp-line",
+        dest="jimu_grasp_tilt_use_current_tcp_line",
+        action="store_true",
+        default=True,
+        help="Choose Jimu tilt sign from the current gripper TCP to the block center instead of the robot-base direction.",
+    )
+    parser.add_argument(
+        "--no-jimu-grasp-tilt-use-current-tcp-line",
+        dest="jimu_grasp_tilt_use_current_tcp_line",
+        action="store_false",
+        help="Use the legacy robot-base direction when choosing Jimu tilt sign.",
+    )
+    parser.add_argument(
+        "--jimu-grasp-tilt-pivot-offset-m",
+        type=float,
+        default=0.0035,
+        help="Local TCP -Z offset from gripper_tcp to the fingertip/pad-center pivot kept on the block center during tilted Jimu grasps.",
+    )
+    parser.add_argument(
+        "--jimu-post-grasp-diagnostic",
+        action="store_true",
+        default=False,
+        help="After gripper close and before transport attach-sync, save Jimu grasp diagnostics for checking real held-object offset.",
+    )
+    parser.add_argument(
+        "--jimu-post-grasp-diagnostic-dir",
+        type=str,
+        default=str(SCRIPT_DIR / "post_grasp_diagnostics"),
+        help="Directory for --jimu-post-grasp-diagnostic outputs.",
+    )
+    parser.add_argument(
+        "--jimu-post-grasp-diagnostic-capture-realsense",
+        action="store_true",
+        default=False,
+        help="Also capture a RealSense RGB-D frame at the post-grasp diagnostic point.",
+    )
+    parser.add_argument(
+        "--jimu-post-grasp-diagnostic-pause",
+        action="store_true",
+        default=False,
+        help="Pause after saving post-grasp diagnostics so the real grasp can be inspected before transport.",
     )
     parser.add_argument(
         "--jimu-return-to-start-pair-score-weight",
@@ -6365,6 +6926,19 @@ def build_arg_parser():
         dest="jimu_lift_world_z_only",
         action="store_false",
         help="Allow the inherited TCP-axis lift candidates for Jimu.",
+    )
+    parser.add_argument(
+        "--jimu-force-transport-start-lift",
+        dest="jimu_force_transport_start_lift",
+        action="store_true",
+        default=True,
+        help="Force Jimu transport chains to start with a constrained world-Z lift before MotionGen transport.",
+    )
+    parser.add_argument(
+        "--no-jimu-force-transport-start-lift",
+        dest="jimu_force_transport_start_lift",
+        action="store_false",
+        help="Allow Jimu transport MotionGen to start directly from the grasp pose.",
     )
     parser.add_argument(
         "--jimu-partial-open-during-post-place-clearance",
@@ -6746,8 +7320,9 @@ def parse_args():
         args.curobo_rm75_urdf = PORTABLE_MANISKILL_RM75_PLANNING_URDF
     if not _argv_has_option("--curobo-rm75-robot-cfg"):
         args.curobo_rm75_robot_cfg = PICK_JIAOBANG_DIR / "curobo_rm75_config" / "rm75.yml"
-    if PORTABLE_CAMERA_EXTRINSIC.exists() and not _argv_has_option("--camera-extrinsic-opencv-path"):
-        args.camera_extrinsic_opencv_path = str(PORTABLE_CAMERA_EXTRINSIC)
+    portable_camera_extrinsic = _portable_camera_extrinsic_path()
+    if portable_camera_extrinsic.exists() and not _argv_has_option("--camera-extrinsic-opencv-path"):
+        args.camera_extrinsic_opencv_path = str(portable_camera_extrinsic)
     portable_env_loaded = install_portable_maniskill_env(bool(getattr(args, "jimu_portable_maniskill_env", True)))
     install_jimu_runtime_config(args)
     mesh_file = _jimu_mesh_file_override(args)
@@ -6774,6 +7349,13 @@ def parse_args():
         f"render_tray={bool(args.jimu_render_tray_visual)}, "
         f"render_slot_plates={bool(args.jimu_render_tray_slot_visuals)}, "
         f"save_preview={bool(args.jimu_save_scene_preview)}"
+    )
+    print(
+        "[jimu config] apriltag_world_offsets_m="
+        f"base=({float(getattr(args, 'jimu_apriltag_base_world_offset_x_m', 0.0)):.4f}, "
+        f"{float(getattr(args, 'jimu_apriltag_base_world_offset_y_m', 0.0)):.4f}), "
+        f"tray=({float(getattr(args, 'jimu_apriltag_tray_world_offset_x_m', 0.0)):.4f}, "
+        f"{float(getattr(args, 'jimu_apriltag_tray_world_offset_y_m', 0.0)):.4f})"
     )
     print(
         "[jimu config] logical_plate_extents_mm="
@@ -7269,12 +7851,14 @@ def main():
     original_plan_short_tcp_up_axis_lift_ik = direct._plan_short_tcp_up_axis_lift_ik
     original_build_hover_pose = direct.build_hover_pose
     original_profile_stage = direct._profile_stage
+    original_stabilize_post_grasp_attached_state = direct._stabilize_post_grasp_attached_state
     original_execute_pose_path_stage = direct.targeted.base.execute_pose_path_stage
     original_execute_joint_path_stage = direct.targeted.base.execute_joint_path_stage
     original_plan_joint_path = direct.targeted.base.plan_joint_path
     original_realman_set_gripper = direct.targeted.base.RealmanJointExecutor.set_gripper
     original_sync_demo_gripper_state = direct.targeted.base.sync_demo_gripper_state
     original_settle_released_active_object = direct.targeted.base.settle_released_active_object_for_scene_cache
+    original_force_active_object_to_attached_pose = direct.targeted.base.force_active_object_to_attached_pose
     original_tilt_pose_toward_robot = direct.targeted.base.tilt_pose_toward_robot
     original_select_random_cycle_target = direct.targeted._select_random_cycle_target
     original_make_ik_preselected_grasp_success = direct._make_ik_preselected_grasp_success
@@ -7304,12 +7888,522 @@ def main():
     _ORIGINAL_BUILD_DIRECT_GRASP_CANDIDATES = original_build_direct_grasp_candidates
     _ORIGINAL_CREATE_DEMO = original_create_demo
 
+    def _jimu_current_tcp_position(demo) -> np.ndarray | None:
+        tcp_pose = getattr(getattr(demo, "tcp", None), "pose", None)
+        if tcp_pose is None:
+            try:
+                tcp_pose = demo.base_env.agent.tcp.pose
+            except Exception:
+                tcp_pose = None
+        if tcp_pose is None:
+            return None
+        try:
+            return direct.targeted.base.flatten_np(tcp_pose.p)[:3].astype(np.float32)
+        except Exception:
+            return None
+
+    def _jimu_tilt_pose_from_current_tcp_line(demo, pose, angle_deg: float, *, direction: str = "toward_robot"):
+        args = getattr(demo, "args", None)
+        if not bool(getattr(args, "jimu_grasp_tilt_use_current_tcp_line", True)):
+            return None
+        try:
+            from transforms3d.quaternions import quat2mat
+        except Exception:
+            return None
+        angle = abs(float(angle_deg))
+        if angle <= 1e-6:
+            return None
+        tcp_p = direct.targeted.base.flatten_np(pose.p)[:3].astype(np.float32)
+        tcp_q = direct.targeted.base.flatten_np(pose.q)[:4].astype(np.float32)
+        current_tcp_p = _jimu_current_tcp_position(demo)
+        if current_tcp_p is None:
+            return None
+
+        # Use the actual current gripper tip -> block-center line as the final
+        # approach direction.  The legacy helper used robot-base -> block, which
+        # can choose the wrong tilt side when the arm starts from an offset pose.
+        desired_xy = (tcp_p - current_tcp_p).astype(np.float32)
+        desired_xy[2] = 0.0
+        desired_xy = _normalize_vec(desired_xy, eps=1e-5)
+        if desired_xy is None:
+            return None
+
+        direction_text = str(direction or "toward_robot").strip().lower()
+        prefer_away = direction_text in {"away", "away_robot", "away_from_robot"}
+        if prefer_away:
+            desired_xy = -desired_xy
+
+        R_tcp = quat2mat(tcp_q).astype(np.float32)
+        tilt_axis = _normalize_vec(R_tcp[:, 1])
+        if tilt_axis is None:
+            return None
+
+        best_R = None
+        best_score = -np.inf
+        angle_rad = float(np.deg2rad(angle))
+        for sign in (1.0, -1.0):
+            R_delta = _axis_angle_rotation_matrix(tilt_axis, sign * angle_rad)
+            R_new = (R_delta @ R_tcp).astype(np.float32)
+            approach_xy = R_new[:, 2].astype(np.float32).copy()
+            approach_xy[2] = 0.0
+            approach_xy = _normalize_vec(approach_xy)
+            if approach_xy is None:
+                continue
+            score = float(np.dot(approach_xy, desired_xy))
+            if score > best_score:
+                best_score = score
+                best_R = R_new
+        if best_R is None:
+            return None
+
+        pivot_offset_m = float(getattr(args, "jimu_grasp_tilt_pivot_offset_m", 0.0035) or 0.0)
+        pivot_offset_m = max(pivot_offset_m, 0.0)
+        pivot_local = np.asarray([0.0, 0.0, -pivot_offset_m], dtype=np.float32)
+        pivot_world = (tcp_p + R_tcp @ pivot_local).astype(np.float32)
+        tcp_p_new = (pivot_world - best_R @ pivot_local).astype(np.float32)
+
+        printed_key = "_jimu_current_tcp_line_tilt_printed"
+        if not bool(getattr(demo, printed_key, False)):
+            setattr(demo, printed_key, True)
+            print(
+                "[jimu tilt] using current TCP->block line for grasp tilt sign; "
+                f"pivot_offset={pivot_offset_m * 1000.0:.1f}mm"
+            )
+        return direct.targeted.base.Pose.create_from_pq(
+            p=tcp_p_new,
+            q=direct.targeted.base.bridge_mod_mat2quat(best_R).astype(np.float32),
+        )
+
     def tilt_pose_toward_robot_jimu(demo, pose, angle_deg: float, *, direction: str = "toward_robot"):
         angle = float(angle_deg)
         direction_text = str(direction or "toward_robot").strip().lower()
         if angle < 0.0 and direction_text in {"toward", "toward_robot", "towards_robot"}:
+            custom_pose = _jimu_tilt_pose_from_current_tcp_line(demo, pose, abs(angle), direction="away_robot")
+            if custom_pose is not None:
+                return custom_pose
             return original_tilt_pose_toward_robot(demo, pose, abs(angle), direction="away_robot")
+        custom_pose = _jimu_tilt_pose_from_current_tcp_line(demo, pose, abs(angle), direction=direction)
+        if custom_pose is not None:
+            return custom_pose
         return original_tilt_pose_toward_robot(demo, pose, abs(angle), direction=direction)
+
+    def _jimu_active_object_pose_matrix(demo) -> np.ndarray | None:
+        obj = getattr(getattr(demo, "base_env", None), "obj", None)
+        pose = getattr(obj, "pose", None)
+        if pose is None:
+            return None
+        try:
+            p = direct.targeted.base.flatten_np(pose.p)[:3].astype(np.float32)
+            q = direct.targeted.base.flatten_np(pose.q)[:4].astype(np.float32)
+            return direct.targeted.base.pose_to_matrix(p, q).astype(np.float32)
+        except Exception:
+            return None
+
+    def _jimu_transform_delta(T_a: np.ndarray | None, T_b: np.ndarray | None) -> tuple[float, float] | None:
+        if T_a is None or T_b is None:
+            return None
+        try:
+            A = np.asarray(T_a, dtype=np.float32).reshape(4, 4)
+            B = np.asarray(T_b, dtype=np.float32).reshape(4, 4)
+            pos_delta = float(np.linalg.norm(A[:3, 3] - B[:3, 3]))
+            R_delta = A[:3, :3].T @ B[:3, :3]
+            cos_angle = float((np.trace(R_delta) - 1.0) * 0.5)
+            cos_angle = max(-1.0, min(1.0, cos_angle))
+            rot_delta = float(np.degrees(np.arccos(cos_angle)))
+            return pos_delta, rot_delta
+        except Exception:
+            return None
+
+    def force_active_object_to_attached_pose_jimu(demo) -> bool:
+        args = getattr(demo, "args", None)
+        active = direct.curobo_wrapper.normalize_object_name(getattr(args, "object_name", ""))
+        is_jimu = active in set((*JIMU_PICK_ROLES, *JIMU_BASE_ROLES, *JIMU_SPARE_TRAY_SLOT_ROLES))
+        before = _jimu_active_object_pose_matrix(demo) if is_jimu else None
+        try:
+            expected = direct.targeted.base.compute_world_attached_pose(demo) if is_jimu else None
+        except Exception:
+            expected = None
+        ok = bool(original_force_active_object_to_attached_pose(demo))
+        if is_jimu and before is not None and expected is not None:
+            delta = _jimu_transform_delta(before, expected)
+            if delta is not None:
+                count = int(getattr(demo, "_jimu_attach_diag_count", 0) or 0) + 1
+                demo._jimu_attach_diag_count = count
+                pos_delta, rot_delta = delta
+                should_print = count <= 3 or pos_delta > 0.002 or rot_delta > 1.0
+                if should_print:
+                    print(
+                        "[jimu attach diag] force_active_object_to_attached_pose "
+                        f"#{count} active={active} ok={ok} "
+                        f"pre_sync_delta={pos_delta * 1000.0:.1f}mm/{rot_delta:.2f}deg"
+                    )
+        return ok
+
+    def _jimu_matrix_json(T: np.ndarray | None):
+        if T is None:
+            return None
+        try:
+            return np.asarray(T, dtype=np.float32).reshape(4, 4).tolist()
+        except Exception:
+            return None
+
+    def _jimu_pose_pq_json(pose):
+        if pose is None:
+            return None
+        try:
+            return {
+                "p": direct.targeted.base.flatten_np(pose.p)[:3].astype(float).tolist(),
+                "q_wxyz": direct.targeted.base.flatten_np(pose.q)[:4].astype(float).tolist(),
+            }
+        except Exception:
+            return None
+
+    def _jimu_current_tcp_matrix(demo) -> np.ndarray | None:
+        tcp_pose = getattr(getattr(demo, "tcp", None), "pose", None)
+        if tcp_pose is None:
+            try:
+                tcp_pose = demo.base_env.agent.tcp.pose
+            except Exception:
+                tcp_pose = None
+        if tcp_pose is None:
+            return None
+        try:
+            p = direct.targeted.base.flatten_np(tcp_pose.p)[:3].astype(np.float32)
+            q = direct.targeted.base.flatten_np(tcp_pose.q)[:4].astype(np.float32)
+            return direct.targeted.base.pose_to_matrix(p, q).astype(np.float32)
+        except Exception:
+            return None
+
+    def _jimu_scene_cache_entry(demo, object_name: str | None) -> dict | None:
+        name = direct.curobo_wrapper.normalize_object_name(object_name)
+        if name is None:
+            return None
+        scene_capture_cache = getattr(demo, "scene_capture_cache_ref", None)
+        if not isinstance(scene_capture_cache, dict):
+            return None
+        objects = scene_capture_cache.get("objects")
+        if not isinstance(objects, dict):
+            return None
+        entry = objects.get(name)
+        return entry if isinstance(entry, dict) else None
+
+    def _jimu_world_pose_from_cache_entry(demo, args, entry: dict | None) -> np.ndarray | None:
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("T_world_obj") is not None:
+            try:
+                return np.asarray(entry["T_world_obj"], dtype=np.float32).reshape(4, 4).copy()
+            except Exception:
+                pass
+        if entry.get("jimu_T_base_obj") is None:
+            return None
+        try:
+            T_world_obj = np.asarray(entry["jimu_T_base_obj"], dtype=np.float32).reshape(4, 4).copy()
+        except Exception:
+            return None
+        object_args = entry.get("object_args")
+        map_args = object_args if object_args is not None else args
+        if not bool(getattr(map_args, "no_map_foundationpose_through_robot_base", False)):
+            try:
+                robot_base_T = direct._get_robot_base_world_transform(demo)
+                if robot_base_T is not None:
+                    T_world_obj = (np.asarray(robot_base_T, dtype=np.float32).reshape(4, 4) @ T_world_obj).astype(np.float32)
+            except Exception:
+                pass
+        try:
+            offset = np.asarray(
+                getattr(map_args, "foundationpose_position_offset", getattr(args, "foundationpose_position_offset", [0.0, 0.0, 0.0])),
+                dtype=np.float32,
+            ).reshape(-1)
+            if offset.size >= 3:
+                T_world_obj[:3, 3] += offset[:3]
+        except Exception:
+            pass
+        return T_world_obj.astype(np.float32)
+
+    def _jimu_scene_camera_resources(demo) -> tuple[Path | None, np.ndarray | None]:
+        scene_capture_cache = getattr(demo, "scene_capture_cache_ref", None)
+        if not isinstance(scene_capture_cache, dict):
+            return None, None
+        scene_dir = scene_capture_cache.get("sam6d_scene_dir")
+        if not scene_dir and scene_capture_cache.get("sam6d_summary_path"):
+            scene_dir = str(Path(scene_capture_cache["sam6d_summary_path"]).expanduser().parent)
+        if not scene_dir:
+            return None, None
+        frame_dir = Path(scene_dir).expanduser() / "shared_frame"
+        rgb_path = frame_dir / "rgb.png"
+        camera_path = frame_dir / "camera.json"
+        if not rgb_path.exists() or not camera_path.exists():
+            return None, None
+        try:
+            camera_payload = json.loads(camera_path.read_text(encoding="utf-8"))
+            raw_K = camera_payload.get("cam_K", camera_payload.get("K"))
+            K = np.asarray(raw_K, dtype=np.float32).reshape(3, 3)
+        except Exception:
+            return None, None
+        return rgb_path, K
+
+    def _jimu_world_to_camera_from_cache(demo, args, object_name: str | None) -> np.ndarray | None:
+        entry = _jimu_scene_cache_entry(demo, object_name)
+        if not isinstance(entry, dict) or entry.get("T_cam_obj") is None:
+            return None
+        try:
+            T_cam_obj = np.asarray(entry["T_cam_obj"], dtype=np.float32).reshape(4, 4)
+        except Exception:
+            return None
+        T_world_obj = _jimu_world_pose_from_cache_entry(demo, args, entry)
+        if T_world_obj is None:
+            return None
+        try:
+            return (T_cam_obj @ np.linalg.inv(T_world_obj).astype(np.float32)).astype(np.float32)
+        except Exception:
+            return None
+
+    def _jimu_project_point(K: np.ndarray, T_cam_world: np.ndarray, p_world: np.ndarray) -> tuple[int, int] | None:
+        try:
+            p = np.ones(4, dtype=np.float32)
+            p[:3] = np.asarray(p_world, dtype=np.float32).reshape(3)
+            pc = (np.asarray(T_cam_world, dtype=np.float32).reshape(4, 4) @ p)[:3]
+            z = float(pc[2])
+            if z <= 1.0e-4:
+                return None
+            u = float(K[0, 0]) * float(pc[0]) / z + float(K[0, 2])
+            v = float(K[1, 1]) * float(pc[1]) / z + float(K[1, 2])
+            if not np.isfinite(u) or not np.isfinite(v):
+                return None
+            return int(round(u)), int(round(v))
+        except Exception:
+            return None
+
+    def _jimu_save_planned_grasp_camera_overlay(
+        out_dir: Path,
+        demo,
+        args,
+        object_name: str | None,
+        T_world_tcp: np.ndarray | None,
+        T_world_obj: np.ndarray | None,
+        *,
+        source_rgb_path: Path | None = None,
+        K_override: np.ndarray | None = None,
+        out_name: str = "planned_grasp_axes_on_camera.png",
+    ) -> dict | None:
+        if T_world_tcp is None:
+            return None
+        if source_rgb_path is None or K_override is None:
+            rgb_path, K = _jimu_scene_camera_resources(demo)
+        else:
+            rgb_path = Path(source_rgb_path).expanduser()
+            K = np.asarray(K_override, dtype=np.float32).reshape(3, 3)
+        T_cam_world = _jimu_world_to_camera_from_cache(demo, args, object_name)
+        if rgb_path is None or K is None or T_cam_world is None:
+            return None
+        try:
+            import cv2
+
+            canvas = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+            if canvas is None:
+                return None
+            T_world_tcp = np.asarray(T_world_tcp, dtype=np.float32).reshape(4, 4)
+            origin = T_world_tcp[:3, 3].astype(np.float32)
+            axis_len = 0.045
+            axes = [
+                ("tcp_x", np.asarray([1.0, 0.0, 0.0], dtype=np.float32), (0, 0, 255)),
+                ("tcp_y", np.asarray([0.0, 1.0, 0.0], dtype=np.float32), (0, 255, 0)),
+                ("tcp_z", np.asarray([0.0, 0.0, 1.0], dtype=np.float32), (255, 0, 0)),
+            ]
+            origin_px = _jimu_project_point(K, T_cam_world, origin)
+            projected: dict[str, Any] = {
+                "source_rgb": str(rgb_path),
+                "T_cam_world": _jimu_matrix_json(T_cam_world),
+                "origin_px": None if origin_px is None else [int(origin_px[0]), int(origin_px[1])],
+                "axes": {},
+            }
+            if origin_px is not None:
+                cv2.circle(canvas, origin_px, 5, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.putText(canvas, "selected_tcp", (origin_px[0] + 6, origin_px[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            R = T_world_tcp[:3, :3].astype(np.float32)
+            for name, local_axis, color in axes:
+                endpoint = origin + (R @ local_axis) * axis_len
+                endpoint_px = _jimu_project_point(K, T_cam_world, endpoint)
+                projected["axes"][name] = None if endpoint_px is None else [int(endpoint_px[0]), int(endpoint_px[1])]
+                if origin_px is not None and endpoint_px is not None:
+                    cv2.arrowedLine(canvas, origin_px, endpoint_px, color, 2, cv2.LINE_AA, tipLength=0.18)
+                    cv2.putText(canvas, name, (endpoint_px[0] + 4, endpoint_px[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+            if T_world_obj is not None:
+                try:
+                    T_world_obj = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4)
+                    obj_px = _jimu_project_point(K, T_cam_world, T_world_obj[:3, 3])
+                    projected["planned_object_center_px"] = None if obj_px is None else [int(obj_px[0]), int(obj_px[1])]
+                    if obj_px is not None:
+                        cv2.circle(canvas, obj_px, 4, (255, 255, 0), -1, cv2.LINE_AA)
+                        cv2.putText(canvas, "planned_obj", (obj_px[0] + 6, obj_px[1] + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1, cv2.LINE_AA)
+                except Exception:
+                    pass
+            cv2.putText(
+                canvas,
+                "selected grasp axes: red=tcp_x green=tcp_y blue=tcp_z",
+                (12, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            out_path = out_dir / str(out_name)
+            cv2.imwrite(str(out_path), canvas)
+            projected["overlay_path"] = str(out_path)
+            return projected
+        except Exception as exc:
+            print(f"[jimu post-grasp diag] failed to save planned grasp camera overlay: {exc}")
+            return None
+
+    def _jimu_save_post_grasp_diagnostic(demo, args, grasp_choice: dict) -> Path | None:
+        if not bool(getattr(args, "jimu_post_grasp_diagnostic", False)):
+            return None
+        active = direct.curobo_wrapper.normalize_object_name(getattr(args, "object_name", ""))
+        if active not in set((*JIMU_PICK_ROLES, *JIMU_SPARE_TRAY_SLOT_ROLES)):
+            return None
+        root = Path(getattr(args, "jimu_post_grasp_diagnostic_dir", SCRIPT_DIR / "post_grasp_diagnostics")).expanduser()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_dir = root / f"{timestamp}_{active}_pid{os.getpid()}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        T_world_tcp = _jimu_current_tcp_matrix(demo)
+        T_tcp_obj = None
+        try:
+            raw = grasp_choice.get("T_tcp_obj") if isinstance(grasp_choice, dict) else None
+            if raw is not None:
+                T_tcp_obj = np.asarray(raw, dtype=np.float32).reshape(4, 4)
+        except Exception:
+            T_tcp_obj = None
+        T_expected_obj = None
+        if T_world_tcp is not None and T_tcp_obj is not None:
+            T_expected_obj = (T_world_tcp @ T_tcp_obj).astype(np.float32)
+        T_current_obj = _jimu_active_object_pose_matrix(demo)
+        pre_sync_delta = _jimu_transform_delta(T_current_obj, T_expected_obj)
+        camera_overlay = _jimu_save_planned_grasp_camera_overlay(
+            out_dir,
+            demo,
+            args,
+            active,
+            T_world_tcp,
+            T_expected_obj,
+        )
+
+        q_current = None
+        try:
+            q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7].tolist()
+        except Exception:
+            q_current = None
+
+        payload = {
+            "note": (
+                "Captured after gripper close and before the simulated object is force-synchronized "
+                "to the planned TCP->object transform. If the real held block is visibly offset here "
+                "but planned_T_world_obj looks centered, the transport simulation is hiding real grasp slip."
+            ),
+            "object_name": active,
+            "grasp_label": str(grasp_choice.get("label", "") if isinstance(grasp_choice, dict) else ""),
+            "place_label": str(grasp_choice.get("place_label", "") if isinstance(grasp_choice, dict) else ""),
+            "pregrasp_pose": _jimu_pose_pq_json(grasp_choice.get("pregrasp_pose") if isinstance(grasp_choice, dict) else None),
+            "grasp_pose": _jimu_pose_pq_json(grasp_choice.get("pose") if isinstance(grasp_choice, dict) else None),
+            "current_arm_q": q_current,
+            "T_world_tcp_after_close": _jimu_matrix_json(T_world_tcp),
+            "planned_T_tcp_obj": _jimu_matrix_json(T_tcp_obj),
+            "planned_T_world_obj_from_tcp": _jimu_matrix_json(T_expected_obj),
+            "sim_T_world_obj_before_attach_sync": _jimu_matrix_json(T_current_obj),
+            "planned_grasp_camera_overlay": camera_overlay,
+            "sim_before_attach_sync_delta_m_deg": None
+            if pre_sync_delta is None
+            else {"position_m": float(pre_sync_delta[0]), "rotation_deg": float(pre_sync_delta[1])},
+        }
+
+        diag_path = out_dir / "post_grasp_diagnostic.json"
+        try:
+            diag_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            print(f"[jimu post-grasp diag] failed to write diagnostic json: {exc}")
+
+        try:
+            image = direct.targeted.base.capture_failure_render_image(demo, args)
+            if image is not None:
+                from PIL import Image
+
+                Image.fromarray(image).save(out_dir / "sim_before_attach_sync.png")
+        except Exception as exc:
+            print(f"[jimu post-grasp diag] failed to save sim render: {exc}")
+
+        if bool(getattr(args, "jimu_post_grasp_diagnostic_capture_realsense", False)):
+            try:
+                provider = importlib.import_module("sam6d_groundingdino_pose_provider")
+                cap_args = types.SimpleNamespace(
+                    camera_width=int(getattr(args, "camera_width", 640)),
+                    camera_height=int(getattr(args, "camera_height", 480)),
+                    camera_fps=int(getattr(args, "camera_fps", 30)),
+                    camera_serial=getattr(args, "camera_serial", None),
+                    camera_frame_timeout_retries=int(getattr(args, "camera_frame_timeout_retries", 3)),
+                )
+                frame = provider.capture_realsense_frame(cap_args)
+                rgb_path, _depth_path, _cam_path = provider.save_sam6d_input_frame(frame, out_dir / "realsense_after_close")
+                realsense_overlay = _jimu_save_planned_grasp_camera_overlay(
+                    out_dir / "realsense_after_close",
+                    demo,
+                    args,
+                    active,
+                    T_world_tcp,
+                    T_expected_obj,
+                    source_rgb_path=rgb_path,
+                    K_override=np.asarray(frame["K"], dtype=np.float32).reshape(3, 3),
+                    out_name="planned_grasp_axes_on_realsense_after_close.png",
+                )
+                if realsense_overlay is not None:
+                    payload["realsense_after_close_overlay"] = realsense_overlay
+            except Exception as exc:
+                print(f"[jimu post-grasp diag] failed to capture RealSense frame: {exc}")
+
+        try:
+            diag_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            print(f"[jimu post-grasp diag] failed to update diagnostic json: {exc}")
+
+        print(f"[jimu post-grasp diag] saved: {out_dir}")
+        if bool(getattr(args, "jimu_post_grasp_diagnostic_pause", False)):
+            try:
+                input("[jimu post-grasp diag] inspect the real grasp now. Press Enter to continue transport...")
+            except EOFError:
+                pass
+        return diag_path
+
+    def _jimu_update_post_grasp_diagnostic_after_sync(diag_path: Path | None, demo) -> None:
+        if diag_path is None:
+            return
+        try:
+            payload = json.loads(Path(diag_path).read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        T_after = _jimu_active_object_pose_matrix(demo)
+        T_expected = None
+        try:
+            raw = payload.get("planned_T_world_obj_from_tcp")
+            if raw is not None:
+                T_expected = np.asarray(raw, dtype=np.float32).reshape(4, 4)
+        except Exception:
+            T_expected = None
+        delta = _jimu_transform_delta(T_after, T_expected)
+        payload["sim_T_world_obj_after_attach_sync"] = _jimu_matrix_json(T_after)
+        payload["sim_after_attach_sync_delta_m_deg"] = None if delta is None else {
+            "position_m": float(delta[0]),
+            "rotation_deg": float(delta[1]),
+        }
+        try:
+            Path(diag_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def stabilize_post_grasp_attached_state_jimu(demo, args, grasp_choice) -> None:
+        diag_path = _jimu_save_post_grasp_diagnostic(demo, args, grasp_choice if isinstance(grasp_choice, dict) else {})
+        original_stabilize_post_grasp_attached_state(demo, args, grasp_choice)
+        _jimu_update_post_grasp_diagnostic_after_sync(diag_path, demo)
 
     def _single_scene_activate_object_jimu(
         demo,
@@ -7443,6 +8537,22 @@ def main():
                 "--jimu-apriltag-tray-center-offset-y-m",
                 float(getattr(args, "jimu_apriltag_tray_center_offset_y_m", PORTABLE_DEFAULT_TRAY_APRILTAG_CENTER_OFFSET_Y_M)),
             )
+            set_option(
+                "--jimu-apriltag-base-world-offset-x-m",
+                float(getattr(args, "jimu_apriltag_base_world_offset_x_m", PORTABLE_DEFAULT_BASE_WORLD_OFFSET_X_M)),
+            )
+            set_option(
+                "--jimu-apriltag-base-world-offset-y-m",
+                float(getattr(args, "jimu_apriltag_base_world_offset_y_m", PORTABLE_DEFAULT_BASE_WORLD_OFFSET_Y_M)),
+            )
+            set_option(
+                "--jimu-apriltag-tray-world-offset-x-m",
+                float(getattr(args, "jimu_apriltag_tray_world_offset_x_m", PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_X_M)),
+            )
+            set_option(
+                "--jimu-apriltag-tray-world-offset-y-m",
+                float(getattr(args, "jimu_apriltag_tray_world_offset_y_m", PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_Y_M)),
+            )
         if bool(getattr(args, "jimu_tabletop_anchor_localization", False)) and "--jimu-tabletop-anchors" not in cmd:
             cmd.append("--jimu-tabletop-anchors")
         if bool(getattr(args, "jimu_manual_sam6d_bboxes", False)) and "--jimu-manual-bboxes" not in cmd:
@@ -7522,6 +8632,7 @@ def main():
         direct._plan_short_tcp_up_axis_lift_ik = plan_short_tcp_up_axis_lift_ik_jimu
         direct.build_hover_pose = build_hover_pose_jimu
         direct._profile_stage = profile_stage_jimu
+        direct._stabilize_post_grasp_attached_state = stabilize_post_grasp_attached_state_jimu
         if callable(original_install_dry_run_motion_window_wrappers):
             direct._install_dry_run_motion_window_wrappers = _install_dry_run_motion_window_wrappers_jimu
         direct.targeted.base.execute_pose_path_stage = execute_pose_path_stage_jimu
@@ -7532,6 +8643,7 @@ def main():
         direct.targeted.base.settle_released_active_object_for_scene_cache = (
             settle_released_active_object_for_scene_cache_jimu
         )
+        direct.targeted.base.force_active_object_to_attached_pose = force_active_object_to_attached_pose_jimu
         direct.targeted.base.tilt_pose_toward_robot = tilt_pose_toward_robot_jimu
         direct.targeted._select_random_cycle_target = select_random_cycle_target_jimu_layered
         direct_sam6d._provider_command = _provider_command_jimu
@@ -7566,6 +8678,7 @@ def main():
         direct._plan_short_tcp_up_axis_lift_ik = original_plan_short_tcp_up_axis_lift_ik
         direct.build_hover_pose = original_build_hover_pose
         direct._profile_stage = original_profile_stage
+        direct._stabilize_post_grasp_attached_state = original_stabilize_post_grasp_attached_state
         if callable(original_install_dry_run_motion_window_wrappers):
             direct._install_dry_run_motion_window_wrappers = original_install_dry_run_motion_window_wrappers
         direct.targeted.base.execute_pose_path_stage = original_execute_pose_path_stage
@@ -7574,6 +8687,7 @@ def main():
         direct.targeted.base.RealmanJointExecutor.set_gripper = original_realman_set_gripper
         direct.targeted.base.sync_demo_gripper_state = original_sync_demo_gripper_state
         direct.targeted.base.settle_released_active_object_for_scene_cache = original_settle_released_active_object
+        direct.targeted.base.force_active_object_to_attached_pose = original_force_active_object_to_attached_pose
         direct.targeted.base.tilt_pose_toward_robot = original_tilt_pose_toward_robot
         direct.targeted._select_random_cycle_target = original_select_random_cycle_target
         direct_sam6d._provider_command = original_provider_command

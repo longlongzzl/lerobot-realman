@@ -51,18 +51,19 @@ DEFAULT_PREGRASP_EXTRA_WORLD_Z_M = 0.18
 DEFAULT_PREGRASP_FALLBACK_WORLD_Z_M = 0.12
 DEFAULT_PREGRASP_EMERGENCY_WORLD_Z_M = 0.10
 DEFAULT_PREGRASP_LEGACY_LOW_WORLD_Z_M = 0.08
-DEFAULT_ROOF_PREGRASP_EXTRA_WORLD_Z_M = 0.26
-DEFAULT_ROOF_PREGRASP_FALLBACK_WORLD_Z_M = 0.18
-DEFAULT_ROOF_PREGRASP_EMERGENCY_WORLD_Z_M = 0.14
-DEFAULT_ROOF_PREGRASP_LEGACY_LOW_WORLD_Z_M = 0.12
-DEFAULT_ROOF_PREGRASP_SAFETY_LOW_WORLD_Z_M = 0.02
+DEFAULT_ROOF_PREGRASP_EXTRA_WORLD_Z_M = 0.12
+DEFAULT_ROOF_PREGRASP_FALLBACK_WORLD_Z_M = 0.0
+DEFAULT_ROOF_PREGRASP_EMERGENCY_WORLD_Z_M = 0.0
+DEFAULT_ROOF_PREGRASP_LEGACY_LOW_WORLD_Z_M = 0.0
+DEFAULT_ROOF_PREGRASP_SAFETY_LOW_WORLD_Z_M = 0.0
 DEFAULT_POST_GRASP_START_LIFT_M = 0.10
 DEFAULT_INDEPENDENT_POST_GRASP_LIFT_M = 0.10
 DEFAULT_ROOF_POST_PLACE_RETREAT_UP_RATIO = 1.0
 DEFAULT_ROOF_POST_PLACE_FOLLOWUP_UP_M = 0.0
 DEFAULT_ROOF_POST_PLACE_FOLLOWUP_SIDE_M = 0.02
 DEFAULT_ROOF_SCENE_OBSTACLE_BOX_SCALE = 0.62
-DEFAULT_ROOF_CUROBO_MESH_OBSTACLES = False
+DEFAULT_ROOF_CUROBO_MESH_OBSTACLES = True
+DEFAULT_ROOF_UNIFORM_PREPLACE_HEIGHT_M = 0.03
 DEFAULT_DRY_RUN_RETURN_LINEAR_FALLBACK = False
 # Keep the triangle panel thickness axis aligned with the tray slot narrow axis.
 # The tip-up local rotation already fixes the mesh's vertical direction; an
@@ -310,6 +311,17 @@ def _raise_pregrasp_candidates_by_world_z(
                     item["jimu_roof_pregrasp_extra_world_z_m"] = extra_z
                     if variant_label:
                         item["jimu_roof_pregrasp_height_variant"] = str(variant_label)
+                        base_label = str(item.get("label", "") or "")
+                        variant_order = {
+                            "primary": 0,
+                            "fallback": 1,
+                            "emergency": 2,
+                            "legacy_low": 3,
+                            "safety_low": 4,
+                        }.get(str(variant_label), 9)
+                        height_mm = int(round(float(extra_z) * 1000.0))
+                        item["jimu_roof_base_grasp_label"] = base_label
+                        item["label"] = f"{base_label}_prez_{variant_order:02d}_{height_mm:03d}mm"
                 changed += 1
             except Exception as exc:
                 item["jimu_pregrasp_extra_world_z_error"] = str(exc)
@@ -1117,6 +1129,26 @@ def _roof_world_z_hover_from_release(release_pose, args, rule):
     )
 
 
+def _roof_uniform_preplace_height_enabled(args) -> bool:
+    return bool(getattr(args, "jimu_roof_uniform_preplace_height", True))
+
+
+def _roof_uniform_preplace_height_m(args, rule) -> float:
+    try:
+        height = float(
+            getattr(
+                args,
+                "jimu_roof_uniform_preplace_height_m",
+                DEFAULT_ROOF_UNIFORM_PREPLACE_HEIGHT_M,
+            )
+        )
+    except Exception:
+        height = DEFAULT_ROOF_UNIFORM_PREPLACE_HEIGHT_M
+    if height < 0.0:
+        return 0.0
+    return height
+
+
 def _roof_pose_position(pose) -> np.ndarray:
     return portable.direct.targeted.base.flatten_np(pose.p)[:3].astype(np.float32)
 
@@ -1126,6 +1158,18 @@ def _roof_make_pose_with_position(pose, position: np.ndarray):
         pose,
         np.asarray(position, dtype=np.float32).reshape(3),
     )
+
+
+def _roof_force_uniform_preplace_height(hover_pose, release_pose, args, rule):
+    if not _roof_uniform_preplace_height_enabled(args):
+        return hover_pose
+    hover_height = _roof_uniform_preplace_height_m(args, rule)
+    if hover_height <= 1e-8:
+        return hover_pose
+    p = _roof_pose_position(hover_pose)
+    release_p = _roof_pose_position(release_pose)
+    p[2] = np.float32(release_p[2] + hover_height)
+    return _roof_make_pose_with_position(hover_pose, p)
 
 
 def _roof_normalize_vec(vec) -> np.ndarray | None:
@@ -1148,6 +1192,8 @@ def _roof_hover_variant_specs(args) -> list[dict]:
     outward_distance = float(max(getattr(args, "jimu_roof_hover_outward_distance", 0.035), 0.0))
     outward_up = float(max(getattr(args, "jimu_roof_hover_outward_up_m", 0.02), 0.0))
     original_extra = float(max(getattr(args, "jimu_roof_hover_original_extra_m", 0.03), 0.0))
+    if _roof_uniform_preplace_height_enabled(args):
+        return [{"kind": "world_z", "label": "roof_world_z"}]
     specs = [
         {"kind": "world_z", "label": "roof_world_z"},
         {"kind": "release_direct", "label": "roof_release_direct"},
@@ -1197,25 +1243,38 @@ def _roof_hover_pose_for_variant(
     kind = str(variant.get("kind", "world_z") or "world_z")
     release_p = _roof_pose_position(release_pose)
     if kind == "release_direct":
+        if _roof_uniform_preplace_height_enabled(args):
+            return _roof_force_uniform_preplace_height(release_pose, release_pose, args, rule)
         return release_pose
     if kind == "world_z":
-        return _roof_world_z_hover_from_release(release_pose, args, rule)
+        return _roof_force_uniform_preplace_height(
+            _roof_world_z_hover_from_release(release_pose, args, rule),
+            release_pose,
+            args,
+            rule,
+        )
     if kind == "world_z_height":
         height = float(max(variant.get("height", 0.0) or 0.0, 0.0))
         if height <= 1e-8:
             return release_pose
-        return _roof_make_pose_with_position(release_pose, release_p + np.asarray([0.0, 0.0, height], dtype=np.float32))
+        return _roof_force_uniform_preplace_height(
+            _roof_make_pose_with_position(release_pose, release_p + np.asarray([0.0, 0.0, height], dtype=np.float32)),
+            release_pose,
+            args,
+            rule,
+        )
     if kind == "original" and original_hover_pose is not None:
-        return original_hover_pose
+        return _roof_force_uniform_preplace_height(original_hover_pose, release_pose, args, rule)
     if kind == "original_extend" and original_hover_pose is not None:
         try:
-            return portable.direct._extend_hover_pose_along_release_approach(
+            hover_pose = portable.direct._extend_hover_pose_along_release_approach(
                 release_pose,
                 original_hover_pose,
                 float(max(variant.get("extra", 0.0) or 0.0, 0.0)),
             )
+            return _roof_force_uniform_preplace_height(hover_pose, release_pose, args, rule)
         except Exception:
-            return original_hover_pose
+            return _roof_force_uniform_preplace_height(original_hover_pose, release_pose, args, rule)
     if kind == "object_y":
         try:
             T_world_obj = np.asarray(item.get("T_world_obj_desired"), dtype=np.float32).reshape(4, 4)
@@ -1226,11 +1285,21 @@ def _roof_hover_pose_for_variant(
             sign = 1.0 if float(variant.get("sign", 1.0) or 1.0) >= 0.0 else -1.0
             distance = float(max(variant.get("distance", 0.0) or 0.0, 0.0))
             up = float(max(variant.get("up", 0.0) or 0.0, 0.0))
-            return _roof_make_pose_with_position(
+            return _roof_force_uniform_preplace_height(
+                _roof_make_pose_with_position(
+                    release_pose,
+                    release_p + axis * sign * distance + np.asarray([0.0, 0.0, up], dtype=np.float32),
+                ),
                 release_pose,
-                release_p + axis * sign * distance + np.asarray([0.0, 0.0, up], dtype=np.float32),
+                args,
+                rule,
             )
-    return _roof_world_z_hover_from_release(release_pose, args, rule)
+    return _roof_force_uniform_preplace_height(
+        _roof_world_z_hover_from_release(release_pose, args, rule),
+        release_pose,
+        args,
+        rule,
+    )
 
 
 def _roof_post_place_retreat_m(args) -> float:
@@ -1393,6 +1462,7 @@ def _roof_post_place_translation_retreat_candidates(item: dict, release_pose, ho
             "retreat_delta_norm_m": float(np.linalg.norm(delta)),
             "plane_normal_error_m": plane_normal_error,
             "allow_post_place_free_motiongen": allow_free_motiongen,
+            "post_place_endpoint_ik_first": True,
         }
         if followup_up_m > 1e-6:
             candidate_p = release_p + delta
@@ -1423,6 +1493,7 @@ def _roof_post_place_translation_retreat_candidates(item: dict, release_pose, ho
                         "followup_world_z_m": float(follow_up),
                         "followup_delta_norm_m": float(np.linalg.norm(follow_delta)),
                         "allow_post_place_free_motiongen": allow_free_motiongen,
+                        "post_place_endpoint_ik_first": True,
                     }
                 )
             candidate["followup_retreat_pose_candidates"] = followups
@@ -1627,6 +1698,20 @@ def build_arg_parser_triangle() -> argparse.ArgumentParser:
     _add_arg_if_missing(parser, "--jimu-roof-release-retreat-height", type=float, default=0.05)
     _add_arg_if_missing(parser, "--jimu-roof-parallel-sources-per-grasp", type=int, default=4)
     _add_arg_if_missing(parser, "--jimu-roof-hover-variants-per-source", type=int, default=6)
+    _add_arg_if_missing(
+        parser,
+        "--jimu-roof-uniform-preplace-height",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep every roof pre-place/hover candidate at the same world-Z height above release.",
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-roof-uniform-preplace-height-m",
+        type=float,
+        default=DEFAULT_ROOF_UNIFORM_PREPLACE_HEIGHT_M,
+        help="World-Z height above the roof release pose when uniform roof pre-place height is enabled.",
+    )
     _add_arg_if_missing(
         parser,
         "--jimu-roof-max-hover-candidates-per-grasp",
@@ -1930,6 +2015,8 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
     args.transport_prefilter_q_goal_max_trials = 1
     args.transport_prefilter_q_goal_timeout = 2.0
     args.transport_prefilter_q_goal_num_trajopt_seeds = 1
+    if hasattr(args, "transport_hover_extra_heights_m") and not _argv_has_option("--transport-hover-extra-heights-m"):
+        args.transport_hover_extra_heights_m = [0.0]
     if (
         hasattr(args, "jimu_partial_open_before_grasp")
         and not _argv_has_option("--jimu-partial-open-before-grasp")
@@ -1952,6 +2039,12 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
         and not _argv_has_option("--jimu-pair-first-pregrasp-motiongen")
     ):
         args.jimu_pair_first_pregrasp_motiongen = False
+    if (
+        hasattr(args, "fuse_grasp_approach_stages")
+        and not _argv_has_option("--fuse-grasp-approach-stages")
+        and not _argv_has_option("--no-fuse-grasp-approach-stages")
+    ):
+        args.fuse_grasp_approach_stages = False
     if hasattr(args, "jimu_pregrasp_extra_world_z_m") and not _argv_has_option("--jimu-pregrasp-extra-world-z-m"):
         args.jimu_pregrasp_extra_world_z_m = max(
             float(getattr(args, "jimu_pregrasp_extra_world_z_m", 0.0) or 0.0),
@@ -2018,12 +2111,12 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
         hasattr(args, "strict_final_contact_waypoint_pos_tol_m")
         and not _argv_has_option("--strict-final-contact-waypoint-pos-tol-m")
     ):
-        args.strict_final_contact_waypoint_pos_tol_m = 0.006
+        args.strict_final_contact_waypoint_pos_tol_m = 0.008
     if (
         hasattr(args, "curobo_approach_metric_locked_axis_tol_m")
         and not _argv_has_option("--curobo-approach-metric-locked-axis-tol-m")
     ):
-        args.curobo_approach_metric_locked_axis_tol_m = 0.006
+        args.curobo_approach_metric_locked_axis_tol_m = 0.008
     if (
         hasattr(args, "short_linear_endpoint_ik_first")
         and not _argv_has_option("--short-linear-endpoint-ik-first")
@@ -2031,7 +2124,11 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
     ):
         args.short_linear_endpoint_ik_first = False
     if not _argv_has_option("--skip-post-place-clearance"):
-        args.force_replan_post_place_clearance = True
+        # Wall panels should retreat along the validated final-contact path
+        # instead of replanning a new clearance motion that can rotate the wrist.
+        # Roof candidates still set force_replan_post_place_clearance per item
+        # because they need the roof-specific diagonal retreat set.
+        args.force_replan_post_place_clearance = False
     if hasattr(args, "real_control_hz") and not _argv_has_option("--real-control-hz"):
         args.real_control_hz = 30.0
     if hasattr(args, "real_max_delta_per_step") and not _argv_has_option("--real-max-delta-per-step"):
@@ -2167,6 +2264,8 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
         f"roof_relation_slots={int(getattr(args, 'jimu_roof_relation_slots', DEFAULT_ROOF_RELATION_SLOTS) or DEFAULT_ROOF_RELATION_SLOTS)}, "
         f"roof_fixed_batch={int(getattr(args, 'jimu_roof_fixed_batch_size', DEFAULT_ROOF_FIXED_BATCH_SIZE) or DEFAULT_ROOF_FIXED_BATCH_SIZE)}, "
         f"roof_hover_max={int(getattr(args, 'jimu_roof_max_hover_candidates_per_grasp', DEFAULT_ROOF_MAX_HOVER_CANDIDATES_PER_GRASP))}, "
+        f"roof_uniform_preplace_z={_roof_uniform_preplace_height_enabled(args)}"
+        f"/{_roof_uniform_preplace_height_m(args, None):.3f}m, "
         f"roof_post_retreat={_roof_post_place_retreat_m(args):.3f}m/"
         f"{int(getattr(args, 'jimu_roof_post_place_retreat_candidate_count', 16) or 16)}pts, "
         f"roof_box_scale={_roof_scene_obstacle_box_scale(args):.2f}, "
@@ -2179,6 +2278,8 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
         "roof_grasp_tilt_only=True, "
         f"triangle_tray_yaw_offset={float(getattr(args, 'jimu_triangle_tray_slot_yaw_offset_deg', DEFAULT_TRIANGLE_TRAY_SLOT_YAW_OFFSET_DEG) or 0.0):.1f}deg, "
         f"pregrasp_motiongen={bool(getattr(args, 'jimu_pair_first_pregrasp_motiongen', True))}, "
+        f"fuse_grasp_approach={bool(getattr(args, 'fuse_grasp_approach_stages', True))}, "
+        f"transport_hover_extra={list(getattr(args, 'transport_hover_extra_heights_m', []))}, "
         f"pregrasp_extra_z={float(getattr(args, 'jimu_pregrasp_extra_world_z_m', 0.0) or 0.0):.3f}m/"
         f"fallback={float(getattr(args, 'jimu_pregrasp_fallback_world_z_m', 0.0) or 0.0):.3f}m/"
         f"emergency={float(getattr(args, 'jimu_pregrasp_emergency_world_z_m', 0.0) or 0.0):.3f}m/"
@@ -2204,7 +2305,7 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
     )
     print(
         "[triangle-roof] first/second layers use square plates; roof roles use red_triangle specs; "
-        "roof grasp is tilt-only by default, roof hover expands world-Z/TCP/outward retreats, "
+        "roof grasp is tilt-only by default, roof pre-place uses a single world-Z hover, "
         "and post-place retreat keeps release orientation while trying side+world-Z diagonal endpoints; "
         "planner/execution still delegates to rm75_jimu_four_wall_portable.py"
     )

@@ -1,8 +1,14 @@
 import json
 import os
+from pathlib import Path
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
+
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+if str(_WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_WORKSPACE_ROOT))
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -220,10 +226,25 @@ def to_numpy_image(image):
 class Args:
     env_id: str = f"RM75GraspCube_two_cameras-v1"
     """The environment id to train on"""
-    env_kwargs_json_path: Optional[str] = "../../so101_env_config.json"
+    env_kwargs_json_path: str = str(
+        (Path(__file__).resolve().parents[2] / "so101_env_config_box.json").resolve()
+    )
     """Path to a json file containing additional environment kwargs to use."""
+    camera_extrinsic_opencv_path: Optional[str] = None
+    # camera_extrinsic_opencv_path: Optional[str] = "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/calibration/camera_extrinsic_opencv.npy"
+    """Optional 4x4 camera extrinsic (usually camera_extrinsic_opencv.npy) used to init base_camera pos/target."""
+    camera_extrinsic_use_direct: bool = False
+    """Treat --camera-extrinsic-opencv-path as base_T_camera; otherwise invert (legacy default)."""
+    camera_robot_base_yaw_deg: float = 90.0
+    """Yaw from calibrated robot-base frame to the RM75 sim world frame."""
+    camera_look_distance_m: float = 0.35
+    """Distance from camera position to target used when deriving target from rotation."""
     auto_sync_on_start: bool = True
     """Whether to automatically sync real qpos into sim once at startup."""
+    mirror_real_to_sim: bool = False
+    """Continuously read the real arm pose into sim and do not command the real robot."""
+    real_to_sim_qpos_offset_deg: str = "0,0,0,0,0,0,0"
+    """Comma-separated per-joint offsets applied as sim_qpos = real_qpos + offset."""
     max_step_deg: float = 30.0
     """Max joint delta (degrees) applied per control tick when chasing slider targets."""
     sync_tol_deg: float = 0.25
@@ -257,6 +278,123 @@ def overlay_envs(sim_env, real_env):
         # print("current loss", loss)
 
     return tile_images(overlaid_imgs), tile_images(sim_imgs_list), tile_images(real_imgs_list)
+
+
+def _load_extrinsic_matrix(path: str) -> np.ndarray:
+    """Load a 4x4 transform from .npy or .json."""
+    file_path = Path(path).expanduser()
+    if not file_path.exists():
+        raise FileNotFoundError(f"camera extrinsic file not found: {file_path}")
+    if file_path.suffix == ".npy":
+        arr = np.load(file_path)
+        if arr.shape != (4, 4):
+            raise ValueError(f"npy matrix shape must be (4, 4), got {arr.shape}")
+        return np.asarray(arr, dtype=np.float32)
+
+    import json as _json
+
+    data = _json.loads(file_path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "matrix" in data:
+        data = data["matrix"]
+    mat = np.asarray(data, dtype=np.float32)
+    if mat.shape != (4, 4):
+        raise ValueError(f"json matrix shape must be (4, 4), got {mat.shape}")
+    return mat
+
+
+def _pose_from_base_T_camera(base_T_camera: np.ndarray, *, look_distance_m: float) -> tuple[list[float], list[float], list[float]]:
+    """Convert an OpenCV base_T_camera pose to SAPIEN look_at settings."""
+    mat = np.asarray(base_T_camera, dtype=np.float64).reshape(4, 4)
+    pos = mat[:3, 3].astype(np.float64)
+    rot = mat[:3, :3]
+    forward_base = rot @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    up_base = rot @ np.array([0.0, -1.0, 0.0], dtype=np.float64)
+    norm = float(np.linalg.norm(forward_base))
+    if norm < 1e-9:
+        forward_base = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        norm = 1.0
+    forward_base /= norm
+    up_norm = float(np.linalg.norm(up_base))
+    if up_norm < 1e-9:
+        up_base = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        up_base /= up_norm
+    target = pos + float(look_distance_m) * forward_base
+    return pos.tolist(), target.tolist(), up_base.tolist()
+
+
+def _yaw_transform(deg: float) -> np.ndarray:
+    rad = np.deg2rad(float(deg))
+    c, s = np.cos(rad), np.sin(rad)
+    mat = np.eye(4, dtype=np.float64)
+    mat[:3, :3] = np.asarray(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return mat
+
+
+def _apply_camera_extrinsic(
+    env_kwargs: dict,
+    path: Optional[str],
+    use_direct: bool,
+    look_distance_m: float,
+    robot_base_yaw_deg: float,
+) -> None:
+    """Inject base_camera_settings from an external 4x4 extrinsic."""
+    if not path:
+        return
+    mat = _load_extrinsic_matrix(path)
+    robot_base_T_camera = mat if use_direct else np.linalg.inv(mat)
+    sim_world_T_camera = _yaw_transform(robot_base_yaw_deg) @ robot_base_T_camera
+    pos, target, up = _pose_from_base_T_camera(sim_world_T_camera, look_distance_m=look_distance_m)
+
+    base_camera_settings = dict(env_kwargs.get("base_camera_settings") or {})
+    if not isinstance(base_camera_settings, dict):
+        base_camera_settings = {}
+    base_camera_settings["pos"] = [float(x) for x in pos]
+    base_camera_settings["target"] = [float(x) for x in target]
+    base_camera_settings["up"] = [float(x) for x in up]
+    # Keep fov from existing cfg / default only.
+    if "fov" not in base_camera_settings:
+        base_camera_settings["fov"] = 0.7557
+    env_kwargs["base_camera_settings"] = base_camera_settings
+    print(
+        "[extrinsic] loaded base_T_camera from",
+        Path(path).expanduser(),
+        f"robot_base_yaw_deg={float(robot_base_yaw_deg):.3f}",
+        "-> base_camera_settings pos=",
+        base_camera_settings["pos"],
+        "target=",
+        base_camera_settings["target"],
+        "up=",
+        base_camera_settings["up"],
+    )
+
+
+def _force_exact_base_camera_pose(sim_env, env_kwargs: dict) -> None:
+    settings = dict(env_kwargs.get("base_camera_settings") or {})
+    if "up" not in settings:
+        return
+    target_env = getattr(sim_env, "unwrapped", sim_env)
+    if not hasattr(target_env, "camera_mount"):
+        return
+    from mani_skill.utils import sapien_utils
+
+    pose = sapien_utils.look_at(
+        eye=np.asarray(settings["pos"], dtype=np.float32),
+        target=np.asarray(settings["target"], dtype=np.float32),
+        up=np.asarray(settings["up"], dtype=np.float32),
+    )
+    target_env.camera_mount.set_pose(pose)
+    if bool(getattr(target_env, "gpu_sim_enabled", False)):
+        target_env.scene._gpu_apply_all()
+
+
 def pad_qpos(values, dim):
     """Pad/trim a 1D arraylike to the desired dim."""
     arr = np.zeros(dim, dtype=np.float32)
@@ -266,6 +404,27 @@ def pad_qpos(values, dim):
     length = min(dim, flat.shape[0])
     arr[:length] = flat[:length]
     return arr
+
+
+def parse_qpos_offset_rad(offset_deg: str, dim: int) -> np.ndarray:
+    vals = []
+    for part in str(offset_deg or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        vals.append(float(part))
+    out = np.zeros((dim,), dtype=np.float32)
+    n = min(dim, len(vals))
+    if n:
+        out[:n] = np.deg2rad(np.asarray(vals[:n], dtype=np.float32))
+    return out
+
+
+def real_qpos_to_sim_qpos(real_qpos, slider_dim: int, offset_rad=None) -> np.ndarray:
+    mapped = pad_qpos(real_qpos, slider_dim)
+    if offset_rad is not None:
+        mapped += pad_qpos(offset_rad, slider_dim)
+    return mapped.astype(np.float32)
 
 
 
@@ -444,14 +603,17 @@ def set_sim_qpos_from_values(base_sim_env, values):
     # base_sim_env.step(action)
 
 
-def sync_real_pose_into_sim(real_env, slider_dim):
+def sync_real_pose_into_sim(real_env, slider_dim, real_to_sim_offset_rad=None):
     """Read the real robot pose, mirror it into sim, and return padded values for sliders."""
     real_qpos = get_real_qpos_safe(real_env)
     if real_qpos is None:
         raise RuntimeError("Failed to read real robot qpos while syncing.")
     real_qpos = real_qpos.detach().cpu().reshape(-1)
-    padded = pad_qpos(real_qpos.numpy(), slider_dim)
+    real_padded = pad_qpos(real_qpos.numpy(), slider_dim)
+    padded = real_qpos_to_sim_qpos(real_qpos.numpy(), slider_dim, real_to_sim_offset_rad)
     set_sim_qpos_from_values(real_env.base_sim_env, padded)
+    print("[sync] real_qpos_deg =", np.round(np.rad2deg(real_padded), 3).tolist())
+    print("[sync] sim_qpos_deg  =", np.round(np.rad2deg(padded), 3).tolist())
     return padded
 
 
@@ -689,6 +851,15 @@ def main(args: Args):
         with open(args.env_kwargs_json_path, "r", encoding="utf-8") as f:
             env_kwargs.update(json.load(f))
         print("Loaded env_kwargs from JSON:", env_kwargs)
+
+    _apply_camera_extrinsic(
+        env_kwargs,
+        args.camera_extrinsic_opencv_path,
+        args.camera_extrinsic_use_direct,
+        args.camera_look_distance_m,
+        args.camera_robot_base_yaw_deg,
+    )
+
     # JSON 里如果带 domain_randomization_config，会覆盖我们在此脚本中用于固定相机的配置。
     # 这里再强制写回一次，避免摄像头继续抖动。
     env_kwargs.setdefault("domain_randomization_config", {})
@@ -698,6 +869,7 @@ def main(args: Args):
         camera_view_rot_noise=0.0,
         camera_fov_noise=0.0,
     )
+    env_kwargs["domain_randomization"] = False
     print(
         "Forced domain_randomization_config for alignment:",
         env_kwargs["domain_randomization_config"],
@@ -713,6 +885,7 @@ def main(args: Args):
     )
     setup_safe_exit(sim_env, real_env, real_agent)
     real_env.reset()
+    _force_exact_base_camera_pose(real_env.base_sim_env, env_kwargs)
 
     sim_robot = real_env.base_sim_env.agent.robot
     finger_joint_indices = []
@@ -740,10 +913,13 @@ def main(args: Args):
     include_gripper = args.enable_gripper_control and has_gripper_action
     slider_dim = arm_dof + (1 if include_gripper else 0)
     gripper_index = arm_dof if include_gripper else None
+    real_to_sim_offset_rad = parse_qpos_offset_rad(args.real_to_sim_qpos_offset_deg, slider_dim)
+    if S2R_DEBUG:
+        print("[DEBUG] real_to_sim_qpos_offset_deg =", np.round(np.rad2deg(real_to_sim_offset_rad), 3).tolist())
 
     if args.auto_sync_on_start:
         try:
-            initial_pose = sync_real_pose_into_sim(real_env, slider_dim)
+            initial_pose = sync_real_pose_into_sim(real_env, slider_dim, real_to_sim_offset_rad)
         except RuntimeError:
             print("无法读取真实机械臂姿态，退出。")
             return
@@ -906,6 +1082,19 @@ def main(args: Args):
         if not actiontuner.pump_events():
             print("Action tuner window closed, exiting control loop.")
             break
+
+        if args.mirror_real_to_sim:
+            real_state_tensor = get_real_qpos_safe(real_env)
+            if real_state_tensor is not None:
+                real_state = real_state_tensor.detach().cpu().flatten().numpy()
+                mapped = real_qpos_to_sim_qpos(real_state, slider_dim, real_to_sim_offset_rad)
+                set_sim_qpos_from_values(real_env.base_sim_env, mapped)
+                actiontuner.app.update_readback(pad_qpos(real_state, slider_dim))
+            if now - last_vis_t >= 1.0 / VIS_HZ:
+                last_vis_t = now
+                sim_env.render()
+                refresh_overlay()
+            continue
 
         # 1) 读取滑块目标（pending_target 是“希望 sim 达到的 qpos”）
         action = np.array(actiontuner.app.v[:slider_dim], dtype=np.float32)

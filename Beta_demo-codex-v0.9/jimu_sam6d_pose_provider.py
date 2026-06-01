@@ -29,6 +29,10 @@ BASE_APRILTAG_TOP_Y_M = 0.0075
 TRAY_APRILTAG_TOP_Z_M = 0.005
 TRAY_APRILTAG_CENTER_OFFSET_X_M = 0.0
 TRAY_APRILTAG_CENTER_OFFSET_Y_M = 0.0
+BASE_WORLD_OFFSET_X_M = 0.0
+BASE_WORLD_OFFSET_Y_M = 0.0
+TRAY_WORLD_OFFSET_X_M = 0.0
+TRAY_WORLD_OFFSET_Y_M = 0.0
 PLATE_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "red_jimu_plate_74x6x74.glb"
 BASE_ASSEMBLY_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "jimu_base_assembly_5plates.glb"
 
@@ -255,6 +259,10 @@ def _pop_apriltag_config() -> dict:
             TRAY_APRILTAG_CENTER_OFFSET_Y_M,
             float,
         ),
+        "base_world_offset_x_m": _pop_custom_arg("--jimu-apriltag-base-world-offset-x-m", BASE_WORLD_OFFSET_X_M, float),
+        "base_world_offset_y_m": _pop_custom_arg("--jimu-apriltag-base-world-offset-y-m", BASE_WORLD_OFFSET_Y_M, float),
+        "tray_world_offset_x_m": _pop_custom_arg("--jimu-apriltag-tray-world-offset-x-m", TRAY_WORLD_OFFSET_X_M, float),
+        "tray_world_offset_y_m": _pop_custom_arg("--jimu-apriltag-tray-world-offset-y-m", TRAY_WORLD_OFFSET_Y_M, float),
     }
 
 
@@ -767,6 +775,38 @@ def _solve_anchor_from_tag(
     return T_cam_obj, debug
 
 
+def _camera_to_base_transform_from_args(args) -> np.ndarray:
+    T_raw = _load_matrix4(args.camera_extrinsic_opencv_path)
+    if bool(getattr(args, "use_direct_camera_extrinsic", False)):
+        return T_raw.astype(np.float32)
+    return np.linalg.inv(T_raw).astype(np.float32)
+
+
+def _apply_world_xy_offset_to_cam_pose(args, T_cam_obj: np.ndarray, offset_xy_m: tuple[float, float]) -> tuple[np.ndarray, dict]:
+    offset_xy = np.asarray(offset_xy_m, dtype=np.float32).reshape(2)
+    T_cam_obj = np.asarray(T_cam_obj, dtype=np.float32).reshape(4, 4).copy()
+    if float(np.linalg.norm(offset_xy)) <= 1.0e-9:
+        return T_cam_obj, {
+            "world_xy_offset_m": [float(offset_xy[0]), float(offset_xy[1])],
+            "applied": False,
+        }
+
+    T_cam_to_base = _camera_to_base_transform_from_args(args)
+    T_base_obj_before = (T_cam_to_base @ T_cam_obj).astype(np.float32)
+    T_base_obj_after = T_base_obj_before.copy()
+    # This is a robot-base/world-table XY nudge, not a tag-local/CAD-local offset.
+    T_base_obj_after[0, 3] += float(offset_xy[0])
+    T_base_obj_after[1, 3] += float(offset_xy[1])
+    T_base_to_cam = np.linalg.inv(T_cam_to_base).astype(np.float32)
+    T_cam_obj_after = (T_base_to_cam @ T_base_obj_after).astype(np.float32)
+    return T_cam_obj_after, {
+        "world_xy_offset_m": [float(offset_xy[0]), float(offset_xy[1])],
+        "applied": True,
+        "base_translation_before_m": T_base_obj_before[:3, 3].astype(float).tolist(),
+        "base_translation_after_m": T_base_obj_after[:3, 3].astype(float).tolist(),
+    }
+
+
 def _save_apriltag_overlay(frame: dict, detections: list[dict], out_path: Path) -> None:
     cv2 = provider.cv2
     canvas = np.asarray(frame["bgr"], dtype=np.uint8).copy()
@@ -900,6 +940,10 @@ def _run_apriltag_anchor_provider(config: dict) -> None:
             "tag_id": int(config["base_id"]),
             "tag_size_m": float(config["base_size_m"]),
             "tag_yaw_deg": float(config["base_yaw_deg"]),
+            "world_offset_xy_m": (
+                float(config.get("base_world_offset_x_m", 0.0)),
+                float(config.get("base_world_offset_y_m", 0.0)),
+            ),
         },
         "jimu_liaoban": {
             "tag_id": int(config["tray_id"]),
@@ -908,6 +952,10 @@ def _run_apriltag_anchor_provider(config: dict) -> None:
             "tray_center_offset_xy_m": (
                 float(config.get("tray_center_offset_x_m", 0.0)),
                 float(config.get("tray_center_offset_y_m", 0.0)),
+            ),
+            "world_offset_xy_m": (
+                float(config.get("tray_world_offset_x_m", 0.0)),
+                float(config.get("tray_world_offset_y_m", 0.0)),
             ),
         },
     }
@@ -947,6 +995,13 @@ def _run_apriltag_anchor_provider(config: dict) -> None:
                 float(spec["tag_yaw_deg"]),
                 tray_center_offset_xy_m=tuple(spec.get("tray_center_offset_xy_m", (0.0, 0.0))),
             )
+            T_cam_obj, world_offset_debug = _apply_world_xy_offset_to_cam_pose(
+                args,
+                T_cam_obj,
+                tuple(spec.get("world_offset_xy_m", (0.0, 0.0))),
+            )
+            debug["world_xy_offset"] = world_offset_debug
+            debug["translation_m_after_world_xy_offset"] = T_cam_obj[:3, 3].astype(float).tolist()
             result = {
                 "object_name": object_name,
                 "prompt": "apriltag geometric anchor",

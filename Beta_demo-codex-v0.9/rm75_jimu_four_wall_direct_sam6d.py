@@ -1642,34 +1642,30 @@ def _jimu_start_collision_diagnosis(planner, args_ns, candidates, label: str, di
         ],
         "all_scene_obstacles": list(obstacle_names),
     }
-    original_world = getattr(planner, "_world", None)
-    if original_world is not None and hasattr(planner, "_world_without_obstacles"):
+    if hasattr(planner, "set_world_obstacles_enabled"):
         try:
             for group_name, removed_names in group_specs.items():
                 removed_names = [name for name in removed_names if name]
                 if not removed_names:
                     continue
-                ablated_world = planner._world_without_obstacles(original_world, excluded_names=set(removed_names))
-                planner.motion_gen.update_world(ablated_world)
-                planner.ik_solver.update_world(ablated_world)
-                group_valid, group_status = planner.check_start_state(start_q)
-                group_ablation.append(
-                    {
-                        "removed_group": group_name,
-                        "removed": removed_names[:32],
-                        "valid": bool(group_valid),
-                        "status": str(group_status),
-                    }
-                )
+                disabled_group = []
+                try:
+                    disabled_group = planner.set_world_obstacles_enabled(removed_names, enabled=False)
+                    group_valid, group_status = planner.check_start_state(start_q)
+                    group_ablation.append(
+                        {
+                            "removed_group": group_name,
+                            "removed": removed_names[:32],
+                            "disabled": list(disabled_group[:32]),
+                            "valid": bool(group_valid),
+                            "status": str(group_status),
+                        }
+                    )
+                finally:
+                    if disabled_group:
+                        planner.set_world_obstacles_enabled(disabled_group, enabled=True)
         except Exception as exc:
             group_ablation.append({"error": f"{type(exc).__name__}: {exc}"})
-        finally:
-            try:
-                planner.motion_gen.update_world(original_world)
-                planner.ik_solver.update_world(original_world)
-                planner._world = original_world
-            except Exception:
-                pass
     attached_disabled_diag = None
     try:
         disabled_attached = direct._set_world_collision_for_links(
