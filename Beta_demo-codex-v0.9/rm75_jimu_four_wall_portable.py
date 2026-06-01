@@ -1175,8 +1175,9 @@ def _jimu_wall_local_pose_specs(args: argparse.Namespace | None = None) -> dict[
     half_z = float(extents[2] * 0.5)
 
     wall_center_y = half_z
-    x_offset = half_x + half_thick
-    z_offset = half_z + half_thick
+    outward_margin = float(getattr(args, "jimu_first_layer_outward_margin_m", 0.001) if args is not None else 0.001)
+    x_offset = half_x + half_thick + outward_margin
+    z_offset = half_z + half_thick + outward_margin
 
     rotations = {
         "right_wall": np.column_stack(
@@ -6413,7 +6414,7 @@ def build_arg_parser():
         fast_chain_ik_seeds=32,
         fast_chain_cuda_graph_ik=True,
         fast_chain_cuda_graph_ik_fixed_batch_size=16,
-        fast_chain_cuda_graph_ik_max_batch_size=128,
+        fast_chain_cuda_graph_ik_max_batch_size=16,
         fast_chain_top_pairs=16,
         fast_chain_place_rank_grasp_limit=16,
         fixed_tabletop_fast_chain_place_rank_grasp_limit=16,
@@ -6767,6 +6768,12 @@ def build_arg_parser():
         type=float,
         default=0.006,
         help="Bottom clearance above the base/support top surface for first-layer vertical wall targets; second layer inherits this height through its parent target.",
+    )
+    parser.add_argument(
+        "--jimu-first-layer-outward-margin-m",
+        type=float,
+        default=0.001,
+        help="Move first-layer wall targets outward from the floor inner-corner contact by this margin; 0 restores exact inner-corner contact.",
     )
     parser.add_argument(
         "--jimu-place-symmetry-deg",
@@ -7434,6 +7441,7 @@ def parse_args():
         f"vertical_place_hover_height_m={float(args.vertical_place_hover_height_m):.3f}, "
         f"final_contact_clearance_m={float(args.final_contact_clearance_m):.3f}, "
         f"first_layer_bottom_clearance_m={float(args.jimu_first_layer_bottom_clearance_m):.4f}, "
+        f"first_layer_outward_margin_m={float(getattr(args, 'jimu_first_layer_outward_margin_m', 0.0)):.4f}, "
         f"start_collision_lift_m={float(args.joint_search_start_collision_lift_m):.3f}, "
         f"virtual_top_wall_z={float(args.planner_virtual_top_wall_z):.3f}"
     )

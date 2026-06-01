@@ -199,7 +199,7 @@ def _profile_fast_chain_solve_batch_start_goal_ik(args, planner, start_qs, goal_
         goal_poses,
         num_seeds=int(num_seeds),
         use_cuda_graph_batch=bool(getattr(args, "fast_chain_cuda_graph_ik", False)),
-        cuda_graph_batch_size=int(getattr(args, "fast_chain_cuda_graph_ik_max_batch_size", 128) or 0),
+        cuda_graph_batch_size=int(getattr(args, "fast_chain_cuda_graph_ik_max_batch_size", 16) or 0),
         cuda_graph_fixed_batch_size=int(getattr(args, "fast_chain_cuda_graph_ik_fixed_batch_size", 16) or 0),
     )
 
@@ -1372,7 +1372,7 @@ def build_arg_parser():
     parser.add_argument(
         "--fast-chain-cuda-graph-ik-max-batch-size",
         type=int,
-        default=128,
+        default=16,
         help="Maximum fixed CUDA graph IK batch bucket used by fast-chain screening.",
     )
     parser.add_argument(
@@ -3593,6 +3593,71 @@ def _prevalidate_post_place_clearance_before_release(
             clearance_backtrack_tol_m = float(
                 max(getattr(args, "strict_short_linear_waypoint_backtrack_tol_m", 0.008), 0.0)
             )
+            batch_endpoint_q_paths: dict[int, list[np.ndarray]] = {}
+            batch_endpoint_records: list[dict] = []
+            batch_endpoint_attempted: set[int] = set()
+            batch_endpoint_records_by_idx: dict[int, dict] = {}
+            if (
+                bool(getattr(args, "batch_post_place_clearance_retreat_candidates", True))
+                and len(clearance_candidates) > 1
+            ):
+                batch_items = [
+                    (idx, candidate)
+                    for idx, candidate in enumerate(clearance_candidates)
+                    if bool(candidate.get("post_place_endpoint_ik_first", False))
+                    and candidate.get("pose") is not None
+                ]
+                if batch_items:
+                    relaxed_disabled = []
+                    if contact_relaxed_links:
+                        relaxed_disabled = _set_world_collision_for_links(
+                            planner,
+                            contact_relaxed_links,
+                            enabled=False,
+                            label="pre_release_post_place_clearance_batch_endpoint_contact_relaxed",
+                        )
+                    try:
+                        batch_endpoint_q_paths, batch_endpoint_records = _plan_short_linear_segments_via_goal_ik_batch(
+                            planner,
+                            demo,
+                            args,
+                            release_q,
+                            release_pose,
+                            batch_items,
+                            label_prefix="pre_release_post_place_clearance",
+                            use_attach=False,
+                            validation_pos_tol_m=float(
+                                max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)
+                            ),
+                            max_backtrack_m=clearance_backtrack_tol_m,
+                            cuda_batch_size=16,
+                        )
+                    finally:
+                        if relaxed_disabled:
+                            _set_world_collision_for_links(
+                                planner,
+                                relaxed_disabled,
+                                enabled=True,
+                                label="pre_release_post_place_clearance_batch_endpoint_contact_relaxed",
+                            )
+                    batch_endpoint_attempted = {
+                        int(record.get("candidate_index", -1))
+                        for record in batch_endpoint_records
+                        if int(record.get("candidate_index", -1)) >= 0
+                    }
+                    batch_endpoint_records_by_idx = {
+                        int(record["candidate_index"]): record
+                        for record in batch_endpoint_records
+                        if "candidate_index" in record
+                    }
+                    prof["batch_endpoint_ik_enabled"] = True
+                    prof["batch_endpoint_ik_candidate_count"] = int(len(batch_items))
+                    prof["batch_endpoint_ik_success_count"] = int(
+                        sum(1 for record in batch_endpoint_records if bool(record.get("ik_success", False)))
+                    )
+                    prof["batch_endpoint_ik_validated_count"] = int(len(batch_endpoint_q_paths))
+                    prof["batch_endpoint_ik_fixed_cuda_batch"] = 16
+                    prof["batch_endpoint_ik_records"] = batch_endpoint_records
             for candidate_idx, candidate in enumerate(clearance_candidates):
                 candidate_pose = candidate.get("pose")
                 if candidate_pose is None:
@@ -3600,7 +3665,11 @@ def _prevalidate_post_place_clearance_before_release(
                 candidate_label = str(candidate.get("label", f"candidate_{candidate_idx:02d}") or f"candidate_{candidate_idx:02d}")
                 safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", candidate_label)[:48] or f"candidate_{candidate_idx:02d}"
                 relaxed_disabled = []
-                if contact_relaxed_links:
+                needs_candidate_curobo_call = not (
+                    candidate_idx in batch_endpoint_attempted
+                    and bool(batch_endpoint_q_paths)
+                )
+                if contact_relaxed_links and needs_candidate_curobo_call:
                     relaxed_disabled = _set_world_collision_for_links(
                         planner,
                         contact_relaxed_links,
@@ -3609,7 +3678,19 @@ def _prevalidate_post_place_clearance_before_release(
                     )
                 try:
                     segment_label = f"pre_release_post_place_clearance_{candidate_idx:02d}_{safe_label}"
-                    if bool(candidate.get("post_place_endpoint_ik_first", False)):
+                    clearance_source = ""
+                    skip_secondary_clearance_planners = False
+                    if candidate_idx in batch_endpoint_q_paths:
+                        q_clearance_path = batch_endpoint_q_paths[candidate_idx]
+                        clearance_source = "batch_endpoint_ik"
+                    elif candidate_idx in batch_endpoint_attempted and batch_endpoint_q_paths:
+                        q_clearance_path = None
+                        clearance_source = "batch_endpoint_ik_rejected"
+                        skip_secondary_clearance_planners = True
+                    elif (
+                        bool(candidate.get("post_place_endpoint_ik_first", False))
+                        and candidate_idx not in batch_endpoint_attempted
+                    ):
                         q_clearance_path = _plan_short_linear_segment_via_goal_ik(
                             planner,
                             demo,
@@ -3622,9 +3703,11 @@ def _prevalidate_post_place_clearance_before_release(
                             validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
                             max_backtrack_m=clearance_backtrack_tol_m,
                         )
+                        if q_clearance_path is not None:
+                            clearance_source = "serial_endpoint_ik"
                     else:
                         q_clearance_path = None
-                    if q_clearance_path is None:
+                    if q_clearance_path is None and not skip_secondary_clearance_planners:
                         q_clearance_path = _plan_constrained_linear_segment(
                             planner,
                             demo,
@@ -3636,7 +3719,13 @@ def _prevalidate_post_place_clearance_before_release(
                             validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
                             validation_backtrack_tol_m=clearance_backtrack_tol_m,
                         )
-                    if q_clearance_path is None and bool(candidate.get("allow_post_place_free_motiongen", False)):
+                        if q_clearance_path is not None:
+                            clearance_source = "constrained_linear"
+                    if (
+                        q_clearance_path is None
+                        and not skip_secondary_clearance_planners
+                        and bool(candidate.get("allow_post_place_free_motiongen", False))
+                    ):
                         planner_pose = _convert_demo_tcp_pose_to_curobo_ee_pose(
                             demo,
                             candidate_pose,
@@ -3661,6 +3750,7 @@ def _prevalidate_post_place_clearance_before_release(
                             final_diag = _measure_realized_tcp_error(demo, candidate_path[-1], candidate_pose)
                             if _terminal_error_within_limits(final_diag, args):
                                 q_clearance_path = candidate_path
+                                clearance_source = "free_motiongen"
                 finally:
                     if relaxed_disabled:
                         _set_world_collision_for_links(
@@ -3676,12 +3766,15 @@ def _prevalidate_post_place_clearance_before_release(
                     "return_success": False,
                     "status": "CLEARANCE_PLAN_FAIL",
                     "clearance_waypoints": int(len(q_clearance_path or [])),
+                    "clearance_source": clearance_source,
                 }
+                if candidate_idx in batch_endpoint_records_by_idx:
+                    record["batch_endpoint_ik"] = batch_endpoint_records_by_idx[candidate_idx]
                 if q_clearance_path:
                     print(
                         "[pre_release] post-place retreat candidate "
                         f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}: "
-                        f"clearance path ok, checking return_to_start"
+                        f"clearance path ok ({clearance_source or 'unknown'}), checking return_to_start"
                     )
                     if bool(prof["return_check_required"]):
                         check_start_t = time.perf_counter()
@@ -6414,6 +6507,104 @@ def _plan_short_linear_segment_via_goal_ik(
         validation_rot_tol_deg=validation_rot_tol_deg,
         max_backtrack_m=max_backtrack_m,
     )
+
+
+def _plan_short_linear_segments_via_goal_ik_batch(
+    planner,
+    demo,
+    args,
+    start_q,
+    pose_start,
+    indexed_candidates,
+    *,
+    label_prefix: str,
+    use_attach: bool,
+    validation_pos_tol_m: float | None = None,
+    validation_rot_tol_deg: float | None = None,
+    max_backtrack_m: float | None = None,
+    cuda_batch_size: int = 16,
+) -> tuple[dict[int, list[np.ndarray]], list[dict]]:
+    start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7]
+    ee_link_name = str(getattr(planner.config, "ee_link", "gripper_tcp"))
+    items = []
+    for candidate_idx, candidate in list(indexed_candidates or []):
+        if not bool(candidate.get("post_place_endpoint_ik_first", False)):
+            continue
+        pose_goal = candidate.get("pose")
+        if pose_goal is None:
+            continue
+        candidate_label = str(candidate.get("label", f"candidate_{candidate_idx:02d}") or f"candidate_{candidate_idx:02d}")
+        items.append((int(candidate_idx), candidate_label, pose_goal))
+    if not items:
+        return {}, []
+
+    fixed_batch = max(1, int(cuda_batch_size or 16))
+    q_paths: dict[int, list[np.ndarray]] = {}
+    records: list[dict] = []
+    for chunk_start in range(0, len(items), fixed_batch):
+        chunk = items[chunk_start : chunk_start + fixed_batch]
+        planner_poses = [
+            _convert_demo_tcp_pose_to_curobo_ee_pose(
+                demo,
+                pose_goal,
+                ee_link_name=ee_link_name,
+            )
+            for _, _, pose_goal in chunk
+        ]
+        start_qs = [start_q for _ in chunk]
+        print(
+            f"[curobo] {label_prefix} batch endpoint IK chunk "
+            f"{chunk_start // fixed_batch + 1}/{(len(items) + fixed_batch - 1) // fixed_batch}: "
+            f"goals={len(chunk)}, fixed_cuda_batch={fixed_batch}"
+        )
+        ik_results = _profile_solve_batch_start_goal_ik(
+            planner,
+            start_qs,
+            planner_poses,
+            num_seeds=int(getattr(args, "short_linear_ik_seeds", getattr(args, "curobo_num_ik_seeds", 64))),
+            use_cuda_graph_batch=True,
+            cuda_graph_batch_size=fixed_batch,
+            cuda_graph_fixed_batch_size=fixed_batch,
+        )
+        for (candidate_idx, candidate_label, pose_goal), ik_result in zip(chunk, ik_results):
+            pos_err, rot_err = _ik_debug_errors(ik_result)
+            record = {
+                "candidate_index": int(candidate_idx),
+                "candidate_label": candidate_label,
+                "ik_success": bool(getattr(ik_result, "success", False)),
+                "status": str(getattr(ik_result, "status", "UNKNOWN")),
+                "position_error": pos_err,
+                "rotation_error": rot_err,
+                "validated": False,
+                "waypoints": 0,
+            }
+            if bool(getattr(ik_result, "success", False)) and getattr(ik_result, "goal_joint", None) is not None:
+                safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", candidate_label)[:48] or f"candidate_{candidate_idx:02d}"
+                q_path = _build_validated_linear_path_to_q(
+                    demo,
+                    args,
+                    start_q,
+                    ik_result.goal_joint,
+                    pose_start,
+                    pose_goal,
+                    label=f"{label_prefix}_{candidate_idx:02d}_{safe_label}_batch_endpoint_ik",
+                    use_attach=use_attach,
+                    validation_pos_tol_m=validation_pos_tol_m,
+                    validation_rot_tol_deg=validation_rot_tol_deg,
+                    max_backtrack_m=max_backtrack_m,
+                )
+                if q_path is not None:
+                    q_paths[int(candidate_idx)] = q_path
+                    record["validated"] = True
+                    record["waypoints"] = int(len(q_path))
+                    print(
+                        f"[curobo] {label_prefix} batch endpoint IK candidate "
+                        f"{candidate_idx + 1}/{len(items)} {candidate_label}: validated"
+                    )
+                else:
+                    record["status"] = "IK_OK_LINEAR_VALIDATION_FAIL"
+            records.append(record)
+    return q_paths, records
 
 
 def _plan_short_curobo_cartesian_descent(

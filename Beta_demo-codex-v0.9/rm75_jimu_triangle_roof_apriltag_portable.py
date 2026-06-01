@@ -670,7 +670,7 @@ def _fast_chain_preselect_grasp_place_pair_triangle(*call_args, **call_kwargs):
     if args is not None and _current_cycle_is_roof(args):
         roof_args = argparse.Namespace(**vars(args).copy())
         roof_slots = max(1, int(getattr(args, "jimu_roof_relation_slots", DEFAULT_ROOF_RELATION_SLOTS) or DEFAULT_ROOF_RELATION_SLOTS))
-        roof_fixed = max(1, int(getattr(args, "jimu_roof_fixed_batch_size", DEFAULT_ROOF_FIXED_BATCH_SIZE) or DEFAULT_ROOF_FIXED_BATCH_SIZE))
+        roof_fixed = 16
         roof_args.fast_chain_relation_ik_slots = roof_slots
         roof_args.fast_chain_cuda_graph_ik_fixed_batch_size = roof_fixed
         roof_args.fast_chain_cuda_graph_ik_max_batch_size = roof_fixed
@@ -706,17 +706,7 @@ def _fast_chain_preselect_grasp_place_pair_triangle(*call_args, **call_kwargs):
                 or DEFAULT_SECOND_LAYER_RELATION_SLOTS
             ),
         )
-        second_fixed = max(
-            1,
-            int(
-                getattr(
-                    args,
-                    "jimu_second_layer_fixed_batch_size",
-                    DEFAULT_SECOND_LAYER_FIXED_BATCH_SIZE,
-                )
-                or DEFAULT_SECOND_LAYER_FIXED_BATCH_SIZE
-            ),
-        )
+        second_fixed = 16
         second_args.fast_chain_relation_ik_slots = second_slots
         second_args.fast_chain_cuda_graph_ik_fixed_batch_size = second_fixed
         second_args.fast_chain_cuda_graph_ik_max_batch_size = second_fixed
@@ -1421,25 +1411,27 @@ def _roof_post_place_translation_retreat_candidates(item: dict, release_pose, ho
 
     specs = [
         ("world_z_only", 0.0, 0.0, up_m),
-        ("world_z_extra", 0.0, 0.0, up_m + forward_extra),
+        ("world_z_high", 0.0, 0.0, 1.5 * up_m),
+        ("world_z_xhigh", 0.0, 0.0, 2.0 * up_m),
+        ("plane_main_up45", retreat_m, 0.0, up_m),
+        ("plane_main_extra_up45", retreat_m + forward_extra, 0.0, up_m),
+        ("plane_main_long_up45", 1.5 * retreat_m, 0.0, up_m),
+        ("plane_main_high", retreat_m, 0.0, 1.5 * up_m),
+        ("plane_main_extra_high", retreat_m + forward_extra, 0.0, 1.5 * up_m),
+        ("plane_main_long_high", 1.5 * retreat_m, 0.0, 1.5 * up_m),
+        ("plane_main_xhigh", retreat_m, 0.0, 2.0 * up_m),
         ("plane_perp_p1_up45", 0.0, retreat_m, up_m),
         ("plane_perp_m1_up45", 0.0, -retreat_m, up_m),
+        ("plane_perp_p2_high", 0.0, retreat_m + forward_extra, 1.5 * up_m),
+        ("plane_perp_m2_high", 0.0, -(retreat_m + forward_extra), 1.5 * up_m),
+        ("plane_diag_p1_high", retreat_m, lateral, 1.5 * up_m),
+        ("plane_diag_m1_high", retreat_m, -lateral, 1.5 * up_m),
+        ("plane_diag_p2_high", retreat_m, 2.0 * lateral, 1.5 * up_m),
+        ("plane_diag_m2_high", retreat_m, -2.0 * lateral, 1.5 * up_m),
         ("plane_perp_p_0p8_up45", 0.0, 0.8 * retreat_m, 0.8 * up_m),
         ("plane_perp_m_0p8_up45", 0.0, -0.8 * retreat_m, 0.8 * up_m),
         ("plane_perp_p_0p7_up45", 0.0, 0.7 * retreat_m, 0.7 * up_m),
         ("plane_perp_m_0p7_up45", 0.0, -0.7 * retreat_m, 0.7 * up_m),
-        ("plane_perp_p_half_up45", 0.0, 0.5 * retreat_m, 0.5 * up_m),
-        ("plane_perp_m_half_up45", 0.0, -0.5 * retreat_m, 0.5 * up_m),
-        ("plane_perp_p1_extra_up45", forward_extra, retreat_m, up_m),
-        ("plane_perp_m1_extra_up45", forward_extra, -retreat_m, up_m),
-        ("plane_perp_p2_up45", 0.0, retreat_m + forward_extra, up_m),
-        ("plane_perp_m2_up45", 0.0, -(retreat_m + forward_extra), up_m),
-        ("plane_diag_p1_up45", retreat_m, lateral, up_m),
-        ("plane_diag_m1_up45", retreat_m, -lateral, up_m),
-        ("plane_diag_p2_up45", retreat_m, 2.0 * lateral, up_m),
-        ("plane_diag_m2_up45", retreat_m, -2.0 * lateral, up_m),
-        ("plane_main_up45", retreat_m, 0.0, up_m),
-        ("plane_main_extra_up45", retreat_m + forward_extra, 0.0, up_m),
     ]
     candidates = []
     for label, main_offset, perp_offset, up_offset in specs[:max_count]:
@@ -1954,10 +1946,7 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
     args.sam3_max_masks_per_item = max(int(getattr(args, "sam3_max_masks_per_item", 1) or 1), len(args.jimu_scene_roles))
 
     relation_slots = max(1, int(getattr(args, "jimu_demo_triangle_relation_slots", DEFAULT_RELATION_SLOTS) or DEFAULT_RELATION_SLOTS))
-    fixed_batch_size = max(
-        1,
-        int(getattr(args, "jimu_demo_triangle_fixed_batch_size", DEFAULT_FIXED_BATCH_SIZE) or DEFAULT_FIXED_BATCH_SIZE),
-    )
+    fixed_batch_size = 16
     fast_top_pairs = max(
         1,
         int(getattr(args, "jimu_demo_triangle_fast_top_pairs", DEFAULT_FAST_TOP_PAIRS) or DEFAULT_FAST_TOP_PAIRS),
@@ -1967,7 +1956,10 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
     args.fast_chain_ik_seeds = 32
     args.fast_chain_cuda_graph_ik = True
     args.fast_chain_cuda_graph_ik_fixed_batch_size = fixed_batch_size
-    args.fast_chain_cuda_graph_ik_max_batch_size = max(int(getattr(args, "fast_chain_cuda_graph_ik_max_batch_size", 128) or 128), fixed_batch_size)
+    args.fast_chain_cuda_graph_ik_max_batch_size = fixed_batch_size
+    args.jimu_demo_triangle_fixed_batch_size = fixed_batch_size
+    args.jimu_second_layer_fixed_batch_size = 16
+    args.jimu_roof_fixed_batch_size = 16
     args.fast_chain_top_pairs = fast_top_pairs
     args.fast_chain_place_rank_grasp_limit = min(relation_slots, 16)
     args.fixed_tabletop_fast_chain_place_rank_grasp_limit = min(relation_slots, 16)
