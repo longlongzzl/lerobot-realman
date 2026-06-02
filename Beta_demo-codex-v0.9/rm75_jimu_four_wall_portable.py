@@ -191,6 +191,7 @@ _ORIGINAL_MPLIB_COLLISION_DETECTION = None
 _ORIGINAL_CUROBO_SOLVE_IK = None
 _ORIGINAL_CUROBO_SOLVE_BATCH_START_GOAL_IK = None
 _ORIGINAL_CUROBO_SOLVE_BATCH_START_GOAL_IK_CUDA_GRAPH = None
+_JIMU_ACTIVE_ARGS = None
 
 
 def _jimu_to_numpy(value) -> np.ndarray | None:
@@ -5750,6 +5751,17 @@ def _jimu_should_keep_partial_open_after_release(label: str, gripper_pos: float,
     return "return_to_cycle_start" in label_l or "return_to_start" in label_l
 
 
+def _jimu_should_keep_partial_open_between_cycles(args: argparse.Namespace | None) -> bool:
+    return bool(args is not None and getattr(args, "jimu_keep_partial_open_between_cycles", True))
+
+
+def _jimu_is_full_open_request(gripper_pos: float, args: argparse.Namespace | None) -> bool:
+    if args is None:
+        return False
+    full_open = float(getattr(args, "real_gripper_open", 0.0))
+    return abs(float(gripper_pos) - full_open) <= 1e-6
+
+
 def _jimu_refresh_after_no_step_gripper_sync(demo) -> None:
     try:
         direct.targeted.base.refresh_frozen_active_object_pose(demo)
@@ -5864,7 +5876,7 @@ def realman_set_gripper_jimu(self, gripper_pos: float, repeats: int | None = Non
     if _ORIGINAL_REALMAN_SET_GRIPPER is None:
         raise RuntimeError("Jimu Realman set_gripper wrapper was installed before original method was captured")
     stage = str(getattr(_JIMU_RUNTIME_CONTEXT, "profile_stage", "") or "")
-    args = getattr(_JIMU_RUNTIME_CONTEXT, "profile_args", None)
+    args = getattr(_JIMU_RUNTIME_CONTEXT, "profile_args", None) or _JIMU_ACTIVE_ARGS
     if _jimu_should_use_partial_open_for_grasp(stage, gripper_pos, args):
         partial = _jimu_pregrasp_partial_open_value(args)
         print(
@@ -5882,6 +5894,18 @@ def realman_set_gripper_jimu(self, gripper_pos: float, repeats: int | None = Non
             )
             setattr(args, "_jimu_release_partial_open_used", True)
             return _ORIGINAL_REALMAN_SET_GRIPPER(self, partial, repeats=repeats, hz=hz)
+    if (
+        not stage
+        and _jimu_should_keep_partial_open_between_cycles(args)
+        and _jimu_pregrasp_partial_open_enabled(args)
+        and _jimu_is_full_open_request(gripper_pos, args)
+    ):
+        partial = _jimu_pregrasp_partial_open_value(args)
+        print(
+            "[jimu gripper] cycle/reset idle full-open request replaced with pregrasp partial open: "
+            f"{float(gripper_pos):.3f} -> {partial:.3f}"
+        )
+        return _ORIGINAL_REALMAN_SET_GRIPPER(self, partial, repeats=repeats, hz=hz)
     return _ORIGINAL_REALMAN_SET_GRIPPER(self, gripper_pos, repeats=repeats, hz=hz)
 
 
@@ -6078,6 +6102,58 @@ def _jimu_play_rendered_dry_run_motion(demo, bridge_mod, label: str, q_start, q_
     _jimu_render_motion_frame(demo, bridge_mod, args, points[-1], use_attach=use_attach)
 
 
+def _jimu_dry_run_motion_window_enabled(args, real_exec) -> bool:
+    if real_exec is not None:
+        return False
+    if bool(getattr(args, "execute_real", False)):
+        return False
+    if bool(getattr(args, "_planning_prefetch_capture_only", False)):
+        return False
+    if str(getattr(args, "render_mode", "") or "") == "human":
+        return False
+    return float(max(getattr(args, "dry_run_motion_window_scale", 0.0), 0.0)) > 1e-9
+
+
+def _jimu_play_dry_run_motion_window(demo, label: str, q_start, q_path, args, *, use_attach: bool) -> None:
+    q_points = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    if not q_points:
+        return
+    q0 = np.asarray(q_start, dtype=np.float32).reshape(-1)[:7]
+    duration_s = 0.0
+    duration_fn = getattr(direct, "_dry_run_motion_window_duration_s", None)
+    if callable(duration_fn):
+        try:
+            duration_s = float(duration_fn(q0, q_points, args))
+        except Exception:
+            duration_s = 0.0
+    if duration_s <= 1e-9:
+        estimate_fn = getattr(direct, "_estimate_real_waypoint_stream_duration_s", None)
+        if callable(estimate_fn):
+            try:
+                base_s = float(estimate_fn(q0, q_points, args))
+            except Exception:
+                base_s = 0.0
+        else:
+            base_s = 0.0
+        duration_s = base_s * float(max(getattr(args, "dry_run_motion_window_scale", 0.0), 0.0))
+    if duration_s > 1e-9:
+        print(
+            f"[jimu dry-window] simulating motion window for {label}: "
+            f"{duration_s:.2f}s, waypoints={len(q_points)}, attach={bool(use_attach)}"
+        )
+        time.sleep(duration_s)
+    direct.targeted.base.sync_demo_arm_qpos(demo, q_points[-1])
+    if use_attach:
+        try:
+            direct.targeted.base.force_active_object_to_attached_pose(demo)
+        except Exception:
+            pass
+        try:
+            direct.targeted.base.update_attached_box_visual(demo)
+        except Exception:
+            pass
+
+
 def _jimu_execute_pose_path_stage_base(
     demo,
     bridge_mod,
@@ -6123,6 +6199,14 @@ def _jimu_execute_pose_path_stage_base(
             args,
             use_attach=use_attach,
         )
+        return True, q_path[-1]
+    if _jimu_dry_run_motion_window_enabled(args, real_exec):
+        if not q_path:
+            q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+            print(f"[planner] {label} is a zero-length pose path; skipping execution")
+            return True, q_current
+        q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+        _jimu_play_dry_run_motion_window(demo, str(label), q_start, q_path, args, use_attach=use_attach)
         return True, q_path[-1]
     return _ORIGINAL_EXECUTE_POSE_PATH_STAGE(
         demo,
@@ -6354,6 +6438,14 @@ def execute_joint_path_stage_jimu(
             use_attach=use_attach,
         )
         return True, q_path[-1]
+    if _jimu_dry_run_motion_window_enabled(args, real_exec):
+        if not q_path:
+            q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+            print(f"[planner] {label} is a zero-length joint path; skipping execution")
+            return True, q_current
+        q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+        _jimu_play_dry_run_motion_window(demo, str(label), q_start, q_path, args, use_attach=use_attach)
+        return True, q_path[-1]
     return _ORIGINAL_EXECUTE_JOINT_PATH_STAGE(
         demo,
         bridge_mod,
@@ -6384,7 +6476,8 @@ def build_arg_parser():
         target_selection_order="cycle",
         repeat_count=len(JIMU_PICK_ROLES),
         skip_return_to_cycle_start_after_final_place=False,
-        next_cycle_plan_prefetch=False,
+        next_cycle_plan_prefetch=True,
+        next_cycle_prefetch_low_priority=True,
         lerobot_sim2real_root=str(PORTABLE_LEROBOT_SIM2REAL_ROOT),
         urdf_path=str(PORTABLE_MANISKILL_RM75_URDF),
         srdf_path=str(PORTABLE_MANISKILL_RM75_SRDF),
@@ -6952,7 +7045,7 @@ def build_arg_parser():
         dest="jimu_partial_open_during_post_place_clearance",
         action="store_true",
         default=True,
-        help="Release with a partial gripper opening, lift away with that opening, then fully open after clearance.",
+        help="Release with a partial gripper opening, then lift/return with that opening to avoid hitting neighboring blocks.",
     )
     parser.add_argument(
         "--no-jimu-partial-open-during-post-place-clearance",
@@ -7211,11 +7304,23 @@ def build_arg_parser():
         "--jimu-full-open-after-post-place-clearance",
         dest="jimu_full_open_after_post_place_clearance",
         action="store_true",
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--no-jimu-full-open-after-post-place-clearance",
         dest="jimu_full_open_after_post_place_clearance",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--jimu-keep-partial-open-between-cycles",
+        dest="jimu_keep_partial_open_between_cycles",
+        action="store_true",
+        default=True,
+        help="Keep the real gripper at the Jimu pregrasp partial opening after reset/return instead of full-open.",
+    )
+    parser.add_argument(
+        "--no-jimu-keep-partial-open-between-cycles",
+        dest="jimu_keep_partial_open_between_cycles",
         action="store_false",
     )
     parser.add_argument(
@@ -7229,7 +7334,9 @@ def build_arg_parser():
 
 
 def parse_args():
+    global _JIMU_ACTIVE_ARGS
     args = build_arg_parser().parse_args()
+    _JIMU_ACTIVE_ARGS = args
     default_pick_roles = _default_pick_roles_for_layers(getattr(args, "jimu_build_layers", "two"))
     default_scene_roles = [JIMU_FLOOR_ROLE, *default_pick_roles]
     if bool(getattr(args, "jimu_base_support_obstacles", True)):
@@ -7486,6 +7593,7 @@ def parse_args():
         f"min_s={float(args.jimu_render_motion_min_s):.2f}, "
         f"max_s={float(args.jimu_render_motion_max_s):.2f}, "
         f"fps={float(args.jimu_render_motion_fps):.1f}, "
+        f"rgb_window_scale={float(max(getattr(args, 'dry_run_motion_window_scale', 0.0), 0.0)):.2f}, "
         f"roof_return_linear_fallback={bool(args.jimu_dry_run_return_linear_fallback)}"
     )
     print(

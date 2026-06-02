@@ -1398,7 +1398,7 @@ def _roof_post_place_translation_retreat_candidates(item: dict, release_pose, ho
     lateral = float(max(getattr(args, "jimu_roof_post_place_retreat_lateral_step_m", 0.006), 0.0))
     forward_extra = float(max(getattr(args, "jimu_roof_post_place_retreat_forward_extra_m", 0.010), 0.0))
     up_ratio = float(max(getattr(args, "jimu_roof_post_place_retreat_up_ratio", DEFAULT_ROOF_POST_PLACE_RETREAT_UP_RATIO), 0.0))
-    up_m = float(retreat_m * up_ratio)
+    up_m = float(min(retreat_m * up_ratio, 0.025))
     followup_up_m = float(max(getattr(args, "jimu_roof_post_place_followup_up_m", DEFAULT_ROOF_POST_PLACE_FOLLOWUP_UP_M), 0.0))
     followup_side_m = float(
         max(getattr(args, "jimu_roof_post_place_followup_side_m", DEFAULT_ROOF_POST_PLACE_FOLLOWUP_SIDE_M), 0.0)
@@ -1409,30 +1409,22 @@ def _roof_post_place_translation_retreat_candidates(item: dict, release_pose, ho
         max_count = 16
     allow_free_motiongen = bool(getattr(args, "jimu_roof_post_place_free_motiongen_fallback", False))
 
-    specs = [
-        ("world_z_only", 0.0, 0.0, up_m),
-        ("world_z_high", 0.0, 0.0, 1.5 * up_m),
-        ("world_z_xhigh", 0.0, 0.0, 2.0 * up_m),
-        ("plane_main_up45", retreat_m, 0.0, up_m),
-        ("plane_main_extra_up45", retreat_m + forward_extra, 0.0, up_m),
-        ("plane_main_long_up45", 1.5 * retreat_m, 0.0, up_m),
-        ("plane_main_high", retreat_m, 0.0, 1.5 * up_m),
-        ("plane_main_extra_high", retreat_m + forward_extra, 0.0, 1.5 * up_m),
-        ("plane_main_long_high", 1.5 * retreat_m, 0.0, 1.5 * up_m),
-        ("plane_main_xhigh", retreat_m, 0.0, 2.0 * up_m),
-        ("plane_perp_p1_up45", 0.0, retreat_m, up_m),
-        ("plane_perp_m1_up45", 0.0, -retreat_m, up_m),
-        ("plane_perp_p2_high", 0.0, retreat_m + forward_extra, 1.5 * up_m),
-        ("plane_perp_m2_high", 0.0, -(retreat_m + forward_extra), 1.5 * up_m),
-        ("plane_diag_p1_high", retreat_m, lateral, 1.5 * up_m),
-        ("plane_diag_m1_high", retreat_m, -lateral, 1.5 * up_m),
-        ("plane_diag_p2_high", retreat_m, 2.0 * lateral, 1.5 * up_m),
-        ("plane_diag_m2_high", retreat_m, -2.0 * lateral, 1.5 * up_m),
-        ("plane_perp_p_0p8_up45", 0.0, 0.8 * retreat_m, 0.8 * up_m),
-        ("plane_perp_m_0p8_up45", 0.0, -0.8 * retreat_m, 0.8 * up_m),
-        ("plane_perp_p_0p7_up45", 0.0, 0.7 * retreat_m, 0.7 * up_m),
-        ("plane_perp_m_0p7_up45", 0.0, -0.7 * retreat_m, 0.7 * up_m),
-    ]
+    far_m = float(retreat_m + max(forward_extra, 4.0 * lateral, 0.025))
+    specs = []
+    for level_label, dist in (("near", retreat_m), ("far", far_m)):
+        diag = float(dist / max(2.0 ** 0.5, 1e-6))
+        specs.extend(
+            [
+                (f"plane_main_p_{level_label}_up", dist, 0.0, up_m),
+                (f"plane_main_m_{level_label}_up", -dist, 0.0, up_m),
+                (f"plane_perp_p_{level_label}_up", 0.0, dist, up_m),
+                (f"plane_perp_m_{level_label}_up", 0.0, -dist, up_m),
+                (f"plane_diag_pp_{level_label}_up", diag, diag, up_m),
+                (f"plane_diag_pm_{level_label}_up", diag, -diag, up_m),
+                (f"plane_diag_mp_{level_label}_up", -diag, diag, up_m),
+                (f"plane_diag_mm_{level_label}_up", -diag, -diag, up_m),
+            ]
+        )
     candidates = []
     for label, main_offset, perp_offset, up_offset in specs[:max_count]:
         delta = (
