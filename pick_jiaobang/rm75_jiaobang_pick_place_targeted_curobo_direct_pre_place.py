@@ -2159,6 +2159,42 @@ def build_arg_parser():
         ),
     )
     parser.add_argument(
+        "--final-contact-constrained-num-trajopt-seeds",
+        type=int,
+        default=1,
+        help=(
+            "Minimum trajopt seed count for cuRobo PoseCostMetric final-contact planning. "
+            "This only affects hover->release constrained contact moves."
+        ),
+    )
+    parser.add_argument(
+        "--final-contact-constrained-num-ik-seeds",
+        type=int,
+        default=64,
+        help=(
+            "Minimum IK seed count for cuRobo PoseCostMetric final-contact planning. "
+            "This only affects hover->release constrained contact moves."
+        ),
+    )
+    parser.add_argument(
+        "--final-contact-constrained-max-attempts",
+        type=int,
+        default=2,
+        help=(
+            "Minimum cuRobo attempt count for PoseCostMetric final-contact planning. "
+            "This only affects hover->release constrained contact moves."
+        ),
+    )
+    parser.add_argument(
+        "--final-contact-constrained-timeout",
+        type=float,
+        default=5.0,
+        help=(
+            "Minimum cuRobo timeout for PoseCostMetric final-contact planning. "
+            "This only affects hover->release constrained contact moves."
+        ),
+    )
+    parser.add_argument(
         "--curobo-approach-metric-tstep-fraction",
         type=float,
         default=0.0,
@@ -3586,13 +3622,70 @@ def _prevalidate_post_place_clearance_before_release(
                 if return_extra_obstacles
                 else []
             )
-            prof["release_clearance_contact_relaxed_links"] = list(contact_relaxed_links)
+            placed_contact_object_names = _scene_obstacle_object_names(return_extra_obstacles)
+            prof["release_clearance_selective_contact_links"] = list(contact_relaxed_links)
+            prof["release_clearance_placed_contact_object_names"] = sorted(placed_contact_object_names)
+            prof["release_clearance_placed_contact_world_names"] = _scene_obstacle_world_name_candidates(return_extra_obstacles)
             prof["return_check_required"] = bool(
                 getattr(args, "validate_post_place_clearance_return_to_start", False)
             ) and not _should_skip_return_to_cycle_start_for_current_place(args, place_choice)
             clearance_backtrack_tol_m = float(
                 max(getattr(args, "strict_short_linear_waypoint_backtrack_tol_m", 0.008), 0.0)
             )
+
+            def _refresh_clearance_world_allowing_placed_contact(reason: str) -> None:
+                # The short empty-gripper retreat starts from a release pose that
+                # can overlap the just-placed part.  Remove only that object from
+                # the planning world; all other placed/tray/table obstacles stay
+                # active.  A later selective audit re-checks that the only
+                # tolerated contact is gripper-vs-this placed object.
+                _refresh_curobo_world(
+                    planner,
+                    demo,
+                    args,
+                    label=f"pre_release_post_place_clearance_{reason}_placed_contact_allowed",
+                    include_active_object=False,
+                    include_table=bool(getattr(args, "curobo_table_collision", True)),
+                    exclude_object_names=placed_contact_object_names or None,
+                    extra_scene_obstacles=[],
+                )
+
+            def _plan_constrained_clearance_retry(
+                candidate_pose,
+                *,
+                safe_label: str,
+                reason: str,
+            ) -> list[np.ndarray] | None:
+                if return_extra_obstacles:
+                    _refresh_clearance_world_allowing_placed_contact(f"{safe_label}_{reason}_constrained")
+                old_endpoint_ik_first = getattr(args, "short_linear_endpoint_ik_first", None)
+                had_endpoint_ik_first = hasattr(args, "short_linear_endpoint_ik_first")
+                try:
+                    # Force the real cuRobo PoseCostMetric path here.  The batch
+                    # endpoint-IK path has already tested straight joint
+                    # interpolation; retrying it would reproduce the same collision.
+                    args.short_linear_endpoint_ik_first = False
+                    return _plan_constrained_linear_segment(
+                        planner,
+                        demo,
+                        args,
+                        release_q,
+                        release_pose,
+                        candidate_pose,
+                        label=f"pre_release_post_place_clearance_{safe_label}_{reason}_constrained",
+                        validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
+                        validation_rot_tol_deg=None,
+                        validation_backtrack_tol_m=clearance_backtrack_tol_m,
+                    )
+                finally:
+                    if had_endpoint_ik_first:
+                        args.short_linear_endpoint_ik_first = old_endpoint_ik_first
+                    else:
+                        try:
+                            delattr(args, "short_linear_endpoint_ik_first")
+                        except Exception:
+                            pass
+
             batch_endpoint_q_paths: dict[int, list[np.ndarray]] = {}
             batch_endpoint_records: list[dict] = []
             batch_endpoint_attempted: set[int] = set()
@@ -3608,38 +3701,22 @@ def _prevalidate_post_place_clearance_before_release(
                     and candidate.get("pose") is not None
                 ]
                 if batch_items:
-                    relaxed_disabled = []
-                    if contact_relaxed_links:
-                        relaxed_disabled = _set_world_collision_for_links(
-                            planner,
-                            contact_relaxed_links,
-                            enabled=False,
-                            label="pre_release_post_place_clearance_batch_endpoint_contact_relaxed",
-                        )
-                    try:
-                        batch_endpoint_q_paths, batch_endpoint_records = _plan_short_linear_segments_via_goal_ik_batch(
-                            planner,
-                            demo,
-                            args,
-                            release_q,
-                            release_pose,
-                            batch_items,
-                            label_prefix="pre_release_post_place_clearance",
-                            use_attach=False,
-                            validation_pos_tol_m=float(
-                                max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)
-                            ),
-                            max_backtrack_m=clearance_backtrack_tol_m,
-                            cuda_batch_size=16,
-                        )
-                    finally:
-                        if relaxed_disabled:
-                            _set_world_collision_for_links(
-                                planner,
-                                relaxed_disabled,
-                                enabled=True,
-                                label="pre_release_post_place_clearance_batch_endpoint_contact_relaxed",
-                            )
+                    _refresh_clearance_world_allowing_placed_contact("batch_endpoint")
+                    batch_endpoint_q_paths, batch_endpoint_records = _plan_short_linear_segments_via_goal_ik_batch(
+                        planner,
+                        demo,
+                        args,
+                        release_q,
+                        release_pose,
+                        batch_items,
+                        label_prefix="pre_release_post_place_clearance",
+                        use_attach=False,
+                        validation_pos_tol_m=float(
+                            max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)
+                        ),
+                        max_backtrack_m=clearance_backtrack_tol_m,
+                        cuda_batch_size=16,
+                    )
                     batch_endpoint_attempted = {
                         int(record.get("candidate_index", -1))
                         for record in batch_endpoint_records
@@ -3664,18 +3741,12 @@ def _prevalidate_post_place_clearance_before_release(
                     continue
                 candidate_label = str(candidate.get("label", f"candidate_{candidate_idx:02d}") or f"candidate_{candidate_idx:02d}")
                 safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", candidate_label)[:48] or f"candidate_{candidate_idx:02d}"
-                relaxed_disabled = []
                 needs_candidate_curobo_call = not (
                     candidate_idx in batch_endpoint_attempted
                     and bool(batch_endpoint_q_paths)
                 )
-                if contact_relaxed_links and needs_candidate_curobo_call:
-                    relaxed_disabled = _set_world_collision_for_links(
-                        planner,
-                        contact_relaxed_links,
-                        enabled=False,
-                        label=f"pre_release_post_place_clearance_{safe_label}_contact_relaxed",
-                    )
+                if return_extra_obstacles and needs_candidate_curobo_call:
+                    _refresh_clearance_world_allowing_placed_contact(safe_label)
                 try:
                     segment_label = f"pre_release_post_place_clearance_{candidate_idx:02d}_{safe_label}"
                     clearance_source = ""
@@ -3686,7 +3757,9 @@ def _prevalidate_post_place_clearance_before_release(
                     elif candidate_idx in batch_endpoint_attempted and batch_endpoint_q_paths:
                         q_clearance_path = None
                         clearance_source = "batch_endpoint_ik_rejected"
-                        skip_secondary_clearance_planners = True
+                        skip_secondary_clearance_planners = not bool(
+                            getattr(args, "post_place_constrained_retry_after_batch_endpoint", True)
+                        )
                     elif (
                         bool(candidate.get("post_place_endpoint_ik_first", False))
                         and candidate_idx not in batch_endpoint_attempted
@@ -3708,16 +3781,10 @@ def _prevalidate_post_place_clearance_before_release(
                     else:
                         q_clearance_path = None
                     if q_clearance_path is None and not skip_secondary_clearance_planners:
-                        q_clearance_path = _plan_constrained_linear_segment(
-                            planner,
-                            demo,
-                            args,
-                            release_q,
-                            release_pose,
+                        q_clearance_path = _plan_constrained_clearance_retry(
                             candidate_pose,
-                            label=segment_label,
-                            validation_pos_tol_m=float(max(getattr(args, "strict_short_linear_waypoint_pos_tol_m", 0.010), 0.0)),
-                            validation_backtrack_tol_m=clearance_backtrack_tol_m,
+                            safe_label=safe_label,
+                            reason="endpoint_fail",
                         )
                         if q_clearance_path is not None:
                             clearance_source = "constrained_linear"
@@ -3752,13 +3819,7 @@ def _prevalidate_post_place_clearance_before_release(
                                 q_clearance_path = candidate_path
                                 clearance_source = "free_motiongen"
                 finally:
-                    if relaxed_disabled:
-                        _set_world_collision_for_links(
-                            planner,
-                            relaxed_disabled,
-                            enabled=True,
-                            label=f"pre_release_post_place_clearance_{safe_label}_contact_relaxed",
-                        )
+                    pass
                 record = {
                     "candidate_index": int(candidate_idx),
                     "candidate_label": candidate_label,
@@ -3771,6 +3832,68 @@ def _prevalidate_post_place_clearance_before_release(
                 if candidate_idx in batch_endpoint_records_by_idx:
                     record["batch_endpoint_ik"] = batch_endpoint_records_by_idx[candidate_idx]
                 if q_clearance_path:
+                    selective_contact_audit = _audit_post_place_clearance_selective_contact_path(
+                        planner,
+                        demo,
+                        args,
+                        q_clearance_path,
+                        placed_object_obstacles=return_extra_obstacles,
+                        contact_relaxed_links=contact_relaxed_links,
+                        label=f"pre_release_post_place_clearance_{safe_label}",
+                    )
+                    record["selective_contact_audit"] = selective_contact_audit
+                    if not bool(selective_contact_audit.get("success", False)):
+                        retry_path = None
+                        retry_audit = None
+                        retry_status = str(selective_contact_audit.get("status", "SELECTIVE_CONTACT_AUDIT_FAIL"))
+                        if (
+                            clearance_source != "constrained_linear"
+                            and retry_status == "REJECTED_COLLISION_WITH_OTHER_WORLD_OBSTACLE"
+                            and bool(getattr(args, "post_place_constrained_retry_after_contact_audit", True))
+                        ):
+                            retry_path = _plan_constrained_clearance_retry(
+                                candidate_pose,
+                                safe_label=safe_label,
+                                reason="contact_audit",
+                            )
+                            record["constrained_contact_retry_waypoints"] = int(len(retry_path or []))
+                            if retry_path:
+                                retry_audit = _audit_post_place_clearance_selective_contact_path(
+                                    planner,
+                                    demo,
+                                    args,
+                                    retry_path,
+                                    placed_object_obstacles=return_extra_obstacles,
+                                    contact_relaxed_links=contact_relaxed_links,
+                                    label=f"pre_release_post_place_clearance_{safe_label}_constrained_retry",
+                                )
+                                record["constrained_contact_retry_audit"] = retry_audit
+                                if bool(retry_audit.get("success", False)):
+                                    q_clearance_path = retry_path
+                                    clearance_source = "constrained_linear_after_contact_audit"
+                                    record["clearance_success"] = True
+                                    record["clearance_waypoints"] = int(len(q_clearance_path))
+                                    record["clearance_source"] = clearance_source
+                                    record["selective_contact_audit"] = retry_audit
+                                    print(
+                                        "[pre_release] post-place retreat candidate "
+                                        f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}: "
+                                        "endpoint path hit another obstacle; cuRobo constrained retry passed"
+                                    )
+                                else:
+                                    record["constrained_contact_retry_status"] = str(
+                                        (retry_audit or {}).get("status", "CONSTRAINED_RETRY_AUDIT_FAIL")
+                                    )
+                        if not bool(record.get("clearance_success", False)):
+                            record["clearance_success"] = False
+                            record["status"] = retry_status
+                            print(
+                                "[pre_release] rejected post-place retreat candidate "
+                                f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}: "
+                                f"selective contact audit failed status={record['status']}"
+                            )
+                            checks.append(record)
+                            continue
                     print(
                         "[pre_release] post-place retreat candidate "
                         f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}: "
@@ -3909,6 +4032,93 @@ def _prevalidate_post_place_clearance_before_release(
     return True
 
 
+def _place_choice_has_prevalidated_return_to_start(place_choice: dict | None) -> bool:
+    if not isinstance(place_choice, dict):
+        return False
+    prevalidated = place_choice.get("_prevalidated_post_place_clearance")
+    if not isinstance(prevalidated, dict):
+        return False
+    return_payload = prevalidated.get("return_payload")
+    if not isinstance(return_payload, dict):
+        return False
+    return bool(return_payload.get("q_path"))
+
+
+def _return_to_start_is_required_before_release(args, place_choice: dict | None) -> bool:
+    return bool(getattr(args, "validate_post_place_clearance_return_to_start", False)) and not (
+        _should_skip_return_to_cycle_start_for_current_place(args, place_choice)
+    )
+
+
+def _enforce_prevalidated_return_to_start_before_real_release(
+    args,
+    place_choice: dict | None,
+    *,
+    stage_name: str,
+    return_goal_q=None,
+) -> bool:
+    if not _return_to_start_is_required_before_release(args, place_choice):
+        _record_profile(args, stage_name, success=True, status="RETURN_NOT_REQUIRED")
+        return True
+    if _place_choice_has_prevalidated_return_to_start(place_choice):
+        prevalidated = place_choice.get("_prevalidated_post_place_clearance") or {}
+        return_payload = prevalidated.get("return_payload") or {}
+        expected_goal_q = _q7_or_none(return_goal_q)
+        planned_goal_q = _q7_or_none(return_payload.get("goal_q"))
+        q_tol = float(max(getattr(args, "return_to_start_preplan_start_q_tolerance", 0.05), 0.0))
+        goal_delta = 0.0
+        if expected_goal_q is not None and planned_goal_q is not None:
+            goal_delta = float(np.max(np.abs(expected_goal_q - planned_goal_q)))
+            if goal_delta > q_tol:
+                args._episode_failure_kind = "planning_no_complete_chain"
+                args._episode_failure_phase = str(stage_name)
+                _record_profile(
+                    args,
+                    stage_name,
+                    success=False,
+                    status="PREVALIDATED_RETURN_GOAL_MISMATCH",
+                    candidate_index=prevalidated.get("candidate_index"),
+                    candidate_label=prevalidated.get("candidate_label"),
+                    return_waypoints=len(return_payload.get("q_path") or []),
+                    goal_delta=goal_delta,
+                    q_tol=q_tol,
+                )
+                print(
+                    "[full_chain][FAIL] prevalidated return_to_start goal does not match "
+                    f"the current cycle start (delta={goal_delta:.4f}rad > tol={q_tol:.4f}); "
+                    "rejecting before release"
+                )
+                return False
+        _record_profile(
+            args,
+            stage_name,
+            success=True,
+            status="RETURN_PREVALIDATED",
+            candidate_index=prevalidated.get("candidate_index"),
+            candidate_label=prevalidated.get("candidate_label"),
+            return_waypoints=len(return_payload.get("q_path") or []),
+            goal_delta=goal_delta,
+            q_tol=q_tol,
+        )
+        return True
+    args._episode_failure_kind = "planning_no_complete_chain"
+    args._episode_failure_phase = str(stage_name)
+    _record_profile(
+        args,
+        stage_name,
+        success=False,
+        status="MISSING_PREVALIDATED_RETURN_TO_START",
+        validate_return=bool(getattr(args, "validate_post_place_clearance_return_to_start", False)),
+        skip_return=bool(_should_skip_return_to_cycle_start_for_current_place(args, place_choice)),
+        place_label=None if not isinstance(place_choice, dict) else str(place_choice.get("label", "")),
+    )
+    print(
+        "[full_chain][FAIL] selected place candidate has no prevalidated "
+        "post_place_clearance->return_to_start path; rejecting before release"
+    )
+    return False
+
+
 def _placed_obstacle_world_z_height(obstacle: dict | None) -> float | None:
     if not isinstance(obstacle, dict):
         return None
@@ -4043,6 +4253,18 @@ def _sync_curobo_world_obstacle_enable_state(planner, cuboids, meshes, *, label:
     except Exception as exc:
         if bool(getattr(planner, "config", None)) or "active_target_object" in stale_names:
             print(f"[curobo] {label}: failed to sync world obstacle enable state: {exc}")
+
+
+def _force_disable_active_target_world_obstacle(planner, *, label: str) -> None:
+    """Prevent a stale world copy of the carried object from surviving a world refresh."""
+    if not hasattr(planner, "set_world_obstacles_enabled"):
+        return
+    try:
+        disabled = planner.set_world_obstacles_enabled(["active_target_object"], enabled=False)
+        if disabled and bool(getattr(planner, "config", None)):
+            print(f"[curobo] {label}: forced disabled stale active_target_object")
+    except Exception as exc:
+        print(f"[curobo] {label}: failed to force-disable stale active_target_object: {exc}")
 
 
 def _visualize_attached_spheres(planner, demo, args):
@@ -4208,6 +4430,8 @@ def _refresh_curobo_world(
             planner._last_world_cache_forced_refresh = True
             print(f"[curobo] {label}: forced world cache refresh after attached lift")
         _sync_curobo_world_obstacle_enable_state(planner, cuboids, meshes, label=label)
+        if not include_active_object:
+            _force_disable_active_target_world_obstacle(planner, label=label)
         if requested_excludes:
             print(
                 f"[curobo] {label} world: excluded scene obstacle(s): {sorted(requested_excludes)}"
@@ -4336,6 +4560,243 @@ def _set_world_collision_for_links(planner, link_names, *, enabled: bool, label:
         action = "re-enabled" if enabled else "temporarily disabled"
         print(f"[curobo] {label} {action} world collision for links: {normalized}")
     return normalized
+
+
+def _scene_obstacle_object_names(entries) -> set[str]:
+    names: set[str] = set()
+    for item in list(entries or []):
+        if not isinstance(item, dict):
+            continue
+        normalized = curobo_wrapper.normalize_object_name(item.get("object_name"))
+        if normalized is not None:
+            names.add(normalized)
+    return names
+
+
+def _scene_obstacle_world_name_candidates(entries) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in list(entries or []):
+        if not isinstance(item, dict):
+            continue
+        candidates = [
+            item.get("actor_name"),
+            item.get("planner_actor_name"),
+            item.get("planner_box_actor_name"),
+            item.get("object_name"),
+        ]
+        object_name = curobo_wrapper.normalize_object_name(item.get("object_name"))
+        if object_name is not None:
+            candidates.append(f"scene_obstacle_{object_name}")
+        for raw_name in candidates:
+            name = str(raw_name or "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _world_collision_audit_indices(q_path, args) -> list[int]:
+    path_len = len(list(q_path or []))
+    if path_len <= 0:
+        return []
+    stride = int(max(getattr(args, "post_place_clearance_contact_audit_stride", 1), 1))
+    indices = list(range(0, path_len, stride))
+    if 0 not in indices:
+        indices.insert(0, 0)
+    if (path_len - 1) not in indices:
+        indices.append(path_len - 1)
+    return sorted(set(int(i) for i in indices if 0 <= int(i) < path_len))
+
+
+def _audit_current_world_collision_path(planner, args, q_path, *, label: str, mode: str) -> dict:
+    path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    if planner is None or not path:
+        return {"status": "SKIPPED_NO_PATH", "success": True}
+    indices = _world_collision_audit_indices(path, args)
+    invalid_records: list[dict] = []
+    errors: list[str] = []
+    checked_count = 0
+    with _CUROBO_GPU_LOCK:
+        for idx in indices:
+            checked_count += 1
+            try:
+                diag = planner.diagnose_start_state_world_collision(path[idx])
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            if bool(diag.get("valid", True)):
+                continue
+            valid_after_removing = [
+                str(item.get("removed", ""))
+                for item in list(diag.get("ablation", []) or [])
+                if bool(item.get("valid", False))
+            ]
+            invalid_records.append(
+                {
+                    "waypoint": int(idx),
+                    "status": str(diag.get("status", "WORLD_COLLISION")),
+                    "world_obstacle_names": list(diag.get("world_obstacle_names") or []),
+                    "valid_after_removing": valid_after_removing[:12],
+                }
+            )
+            if len(invalid_records) >= 8:
+                break
+    success = not invalid_records and not errors
+    if not success:
+        first = invalid_records[0] if invalid_records else {}
+        print(
+            f"[post_place_contact_audit] {label}: rejected {mode}; "
+            f"status={first.get('status', 'ERROR')} waypoint={first.get('waypoint', 'n/a')} "
+            f"valid_after_removing={first.get('valid_after_removing', [])}"
+        )
+    return {
+        "status": "CLEAR" if success else "WORLD_COLLISION",
+        "success": bool(success),
+        "mode": str(mode),
+        "path_waypoints": int(len(path)),
+        "checked_waypoints": int(checked_count),
+        "invalid_count": int(len(invalid_records)),
+        "invalid_records": invalid_records,
+        "errors": errors[:5],
+    }
+
+
+def _audit_post_place_clearance_selective_contact_path(
+    planner,
+    demo,
+    args,
+    q_path,
+    *,
+    placed_object_obstacles,
+    contact_relaxed_links,
+    label: str,
+) -> dict:
+    """
+    Validate the retreat path with exactly one contact exception:
+    gripper links may overlap the just-placed object while pulling away.
+
+    cuRobo exposes link-level and obstacle-level toggles but not a pair-specific
+    "gripper vs obstacle X" filter.  Use two audits whose intersection gives the
+    desired policy:
+      1. remove only the just-placed obstacle and keep all links enabled, catching
+         gripper collisions with every other obstacle;
+      2. restore all obstacles and relax only gripper links, catching any
+         non-gripper collision with the placed object or the rest of the world.
+    """
+    if planner is None or not q_path:
+        return {"status": "SKIPPED_NO_PATH", "success": True}
+    placed_object_obstacles = _copy_scene_obstacle_entries(placed_object_obstacles)
+    placed_object_names = _scene_obstacle_object_names(placed_object_obstacles)
+    placed_world_names = _scene_obstacle_world_name_candidates(placed_object_obstacles)
+    contact_relaxed_links = _normalize_disabled_world_collision_links(planner, contact_relaxed_links)
+    if not placed_object_obstacles or not contact_relaxed_links:
+        return {
+            "status": "SKIPPED_NO_PLACED_CONTACT_EXCEPTION",
+            "success": True,
+            "placed_object_names": sorted(placed_object_names),
+            "placed_world_names": placed_world_names,
+            "contact_relaxed_links": list(contact_relaxed_links),
+        }
+
+    try:
+        _refresh_curobo_world(
+            planner,
+            demo,
+            args,
+            label=f"{label}_audit_except_placed_object",
+            include_active_object=False,
+            include_table=bool(getattr(args, "curobo_table_collision", True)),
+            exclude_object_names=placed_object_names or None,
+            extra_scene_obstacles=[],
+        )
+    except Exception as exc:
+        return {
+            "status": "WORLD_REFRESH_ERROR_EXCEPT_PLACED",
+            "success": False,
+            "error": str(exc),
+            "placed_object_names": sorted(placed_object_names),
+            "placed_world_names": placed_world_names,
+        }
+    except_placed_audit = _audit_current_world_collision_path(
+        planner,
+        args,
+        q_path,
+        label=label,
+        mode="all_links_vs_world_except_just_placed_object",
+    )
+    if not bool(except_placed_audit.get("success", False)):
+        return {
+            "status": "REJECTED_COLLISION_WITH_OTHER_WORLD_OBSTACLE",
+            "success": False,
+            "placed_object_names": sorted(placed_object_names),
+            "placed_world_names": placed_world_names,
+            "contact_relaxed_links": list(contact_relaxed_links),
+            "except_placed_audit": except_placed_audit,
+        }
+
+    try:
+        _refresh_curobo_world(
+            planner,
+            demo,
+            args,
+            label=f"{label}_audit_gripper_vs_placed_only",
+            include_active_object=False,
+            include_table=bool(getattr(args, "curobo_table_collision", True)),
+            extra_scene_obstacles=placed_object_obstacles,
+        )
+    except Exception as exc:
+        return {
+            "status": "WORLD_REFRESH_ERROR_WITH_PLACED",
+            "success": False,
+            "error": str(exc),
+            "placed_object_names": sorted(placed_object_names),
+            "placed_world_names": placed_world_names,
+        }
+    disabled_links = []
+    try:
+        disabled_links = _set_world_collision_for_links(
+            planner,
+            contact_relaxed_links,
+            enabled=False,
+            label=f"{label}_audit_gripper_vs_placed_only",
+        )
+        non_gripper_audit = _audit_current_world_collision_path(
+            planner,
+            args,
+            q_path,
+            label=label,
+            mode="non_gripper_links_vs_full_world",
+        )
+    finally:
+        if disabled_links:
+            _set_world_collision_for_links(
+                planner,
+                disabled_links,
+                enabled=True,
+                label=f"{label}_audit_gripper_vs_placed_only",
+            )
+    if not bool(non_gripper_audit.get("success", False)):
+        return {
+            "status": "REJECTED_NON_GRIPPER_COLLISION_WITH_PLACED_OR_WORLD",
+            "success": False,
+            "placed_object_names": sorted(placed_object_names),
+            "placed_world_names": placed_world_names,
+            "contact_relaxed_links": list(contact_relaxed_links),
+            "except_placed_audit": except_placed_audit,
+            "non_gripper_audit": non_gripper_audit,
+        }
+
+    return {
+        "status": "SELECTIVE_GRIPPER_PLACED_CONTACT_CLEAR",
+        "success": True,
+        "placed_object_names": sorted(placed_object_names),
+        "placed_world_names": placed_world_names,
+        "contact_relaxed_links": list(contact_relaxed_links),
+        "except_placed_audit": except_placed_audit,
+        "non_gripper_audit": non_gripper_audit,
+    }
 
 
 def _path_metrics_and_score(q_start, q_path):
@@ -5872,6 +6333,12 @@ def _audit_return_to_start_world_collision_path(
                     "status": str(diag.get("status", "WORLD_COLLISION")),
                     "world_obstacle_names": list(diag.get("world_obstacle_names") or []),
                     "world_collision_count": int(diag.get("world_collision_count", 0) or 0),
+                    "valid_after_removing": [
+                        str(item.get("removed", ""))
+                        for item in list(diag.get("ablation", []) or [])
+                        if bool(item.get("valid", False))
+                    ],
+                    "ablation": list(diag.get("ablation", []) or [])[:8],
                 }
             )
             if len(invalid_records) >= 8:
@@ -6363,15 +6830,41 @@ def _plan_with_official_approach_metric(
         f"[curobo] {label} trying cuRobo constrained straight-line metric "
         f"(frame={metric_frame}, free_axis={free_axis}, frame_delta={np.round(delta_goal, 6)})"
     )
+    max_attempts = int(getattr(args, "curobo_max_attempts", 2))
+    timeout = float(getattr(args, "curobo_timeout", 5.0))
+    num_ik_seeds = int(getattr(args, "curobo_num_ik_seeds", 64))
+    num_trajopt_seeds = int(getattr(args, "curobo_num_trajopt_seeds", 1))
+    if "final_contact" in str(label):
+        old_cfg = (max_attempts, timeout, num_ik_seeds, num_trajopt_seeds)
+        max_attempts = max(max_attempts, int(getattr(args, "final_contact_constrained_max_attempts", max_attempts) or 0))
+        timeout = max(timeout, float(getattr(args, "final_contact_constrained_timeout", timeout) or 0.0))
+        num_ik_seeds = max(num_ik_seeds, int(getattr(args, "final_contact_constrained_num_ik_seeds", num_ik_seeds) or 0))
+        num_trajopt_seeds = max(
+            num_trajopt_seeds,
+            int(getattr(args, "final_contact_constrained_num_trajopt_seeds", num_trajopt_seeds) or 0),
+        )
+        new_cfg = (max_attempts, timeout, num_ik_seeds, num_trajopt_seeds)
+        if new_cfg != old_cfg:
+            print(
+                f"[curobo] {label} using final-contact constrained planning budget: "
+                f"attempts={max_attempts}, timeout={timeout:.1f}s, "
+                f"ik_seeds={num_ik_seeds}, trajopt_seeds={num_trajopt_seeds}"
+            )
+        args._last_final_contact_constrained_budget = {
+            "effective_max_attempts": max_attempts,
+            "effective_timeout": timeout,
+            "effective_num_ik_seeds": num_ik_seeds,
+            "effective_num_trajopt_seeds": num_trajopt_seeds,
+        }
     result = _profile_plan_constrained_linear_to_pose(
         planner,
         start_q,
         planner_pose,
         enable_graph=False,
-        max_attempts=int(getattr(args, "curobo_max_attempts", 2)),
-        timeout=float(getattr(args, "curobo_timeout", 5.0)),
-        num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
-        num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+        max_attempts=max_attempts,
+        timeout=timeout,
+        num_ik_seeds=num_ik_seeds,
+        num_trajopt_seeds=num_trajopt_seeds,
         num_graph_seeds=int(getattr(args, "curobo_num_graph_seeds", 1)),
         pose_cost_metric=metric,
     )
@@ -7983,30 +8476,6 @@ def _consume_return_to_start_preplan(demo, args, current_q, goal_q, *, use_attac
     if not q_path:
         return None
     q_path[0] = current_q.copy()
-    if not _validate_candidate_joint_path_with_demo_planner(
-        demo,
-        current_q,
-        q_path,
-        use_attach=use_attach,
-        label="return_to_start_preplan_cached",
-    ):
-        _record_profile(
-            args,
-            "return_to_start_preplan_consume",
-            success=False,
-            status="DEMO_VALIDATE_FAIL",
-            wait_timeout=wait_timeout,
-            start_delta=start_delta,
-            goal_delta=goal_delta,
-            q_tol=q_tol,
-            worker_elapsed_ms=payload.get("elapsed_ms"),
-            path_waypoints=len(q_path),
-            mode=payload.get("mode"),
-            direct_status=payload.get("direct_status"),
-            prelift_waypoints=payload.get("prelift_waypoints"),
-            return_waypoints=payload.get("return_waypoints"),
-        )
-        return None
     args._return_to_start_preplan_last_mode = str(payload.get("mode", "direct") or "direct")
     _record_profile(
         args,
@@ -8073,10 +8542,22 @@ def _plan_and_execute_return_to_cycle_start(
         label=label,
     )
     target_pose = _get_demo_tcp_pose_for_joint_q(demo, start_q)
+    endpoint_tol = float(getattr(args, "return_to_start_endpoint_tol_rad", 0.05))
+
+    def _read_return_endpoint_q() -> tuple[np.ndarray | None, str]:
+        if real_exec is not None:
+            try:
+                q_real = _q7_or_none(real_exec.get_arm_qpos())
+                if q_real is not None:
+                    return q_real, "real"
+            except Exception:
+                pass
+        return _q7_or_none(demo.current_arm_qpos()), "sim"
 
     planner = _get_or_create_curobo_planner_serialized(args)
     q_path = None
     return_mode = "live"
+    using_cached_prevalidated_return = False
     return_extra_obstacles = _return_to_start_placed_obstacles(demo, args)
     if return_extra_obstacles:
         args._return_to_start_extra_scene_obstacles = _copy_scene_obstacle_entries(return_extra_obstacles)
@@ -8085,42 +8566,17 @@ def _plan_and_execute_return_to_cycle_start(
         q_path = cached_path
         cached_plan_mode = str(getattr(args, "_return_to_start_preplan_last_mode", "direct") or "direct")
         return_mode = f"preplan_cached_{cached_plan_mode}"
+        using_cached_prevalidated_return = True
         print(f"[return_preplan] using cached return_to_start path ({len(q_path)} waypoint(s))")
-        with _profile_stage(
+        _record_profile(
             args,
             "return_to_start_cached_path_validate",
+            success=True,
+            status="SKIPPED_PREVALIDATED_EXECUTE_DIRECTLY",
             mode=return_mode,
             path_waypoints=len(q_path or []),
-        ) as prof:
-            world_audit = _audit_return_to_start_world_collision_path(
-                planner,
-                demo,
-                args,
-                q_path,
-                label=label,
-                mode=return_mode,
-                extra_scene_obstacles=return_extra_obstacles,
-            )
-            prof.update(world_audit)
-            if bool(world_audit.get("success", False)):
-                prof["status"] = "WORLD_AUDIT_PASS"
-            else:
-                prof["status"] = str(world_audit.get("status", "WORLD_AUDIT_FAIL"))
-                print(
-                    "[return_preplan][FAIL] cached return_to_start path collides in current world; "
-                    "rejecting cached path before execution"
-                )
-                q_path = None
-        if cached_path and q_path is None and real_exec is not None:
-            _record_profile(
-                args,
-                "return_to_start",
-                success=False,
-                status="CACHED_PATH_WORLD_AUDIT_FAIL",
-                elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
-                mode=return_mode,
-            )
-            return False
+            reason="already_checked_during_candidate_prevalidation",
+        )
     clearance_lift_m, clearance_lift_debug = _return_start_clearance_lift_m(args, return_extra_obstacles)
     if q_path is None and clearance_lift_m > 1e-5:
         with _profile_stage(
@@ -8328,17 +8784,29 @@ def _plan_and_execute_return_to_cycle_start(
 
     if q_path is None:
         with _profile_stage(args, "return_to_start_mplib_fallback") as prof:
-            q_path = targeted.base.plan_joint_path(
-                demo,
-                start_q,
-                use_attach=use_attach,
-                label=label,
-                start_q=q_current,
-                allow_reverse_rrt_fallback=False,
+            allow_mplib_return = (
+                real_exec is None
+                or bool(getattr(args, "allow_return_to_start_mplib_fallback_for_real", False))
+                or bool(getattr(args, "allow_demo_planner_rescue", False))
             )
-            prof["success"] = bool(q_path)
-            prof["status"] = "Success" if q_path else "PLAN_FAIL"
-            prof["path_waypoints"] = len(q_path or [])
+            prof["enabled"] = bool(allow_mplib_return)
+            if not allow_mplib_return:
+                prof["success"] = False
+                prof["status"] = "DISABLED_FOR_REAL"
+                prof["path_waypoints"] = 0
+                print(f"[planner] {label}: legacy MPLib return fallback disabled for real execution")
+            else:
+                q_path = targeted.base.plan_joint_path(
+                    demo,
+                    start_q,
+                    use_attach=use_attach,
+                    label=label,
+                    start_q=q_current,
+                    allow_reverse_rrt_fallback=False,
+                )
+                prof["success"] = bool(q_path)
+                prof["status"] = "Success" if q_path else "PLAN_FAIL"
+                prof["path_waypoints"] = len(q_path or [])
     source_name = _current_source_object_name(args)
     roof_dry_run_linear_fallback = (
         q_path is None
@@ -8381,8 +8849,56 @@ def _plan_and_execute_return_to_cycle_start(
             elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
         )
         return False
+    if not using_cached_prevalidated_return:
+        endpoint_delta = _max_joint_angle_delta_wrapped(q_path[-1], start_q)
+        endpoint_ok = endpoint_delta is not None and endpoint_delta <= endpoint_tol
+        _record_profile(
+            args,
+            "return_to_start_endpoint_validate",
+            success=bool(endpoint_ok),
+            status="Success" if endpoint_ok else "ENDPOINT_MISMATCH",
+            endpoint_delta_rad=endpoint_delta,
+            endpoint_tol_rad=endpoint_tol,
+            path_waypoints=len(q_path or []),
+            mode=return_mode,
+        )
+        if not endpoint_ok:
+            print(
+                f"[FAIL] {label} path endpoint does not reach cycle start: "
+                f"delta={float(endpoint_delta or 0.0):.4f}rad tol={endpoint_tol:.4f}rad"
+            )
+            _record_profile(
+                args,
+                "return_to_start",
+                success=False,
+                status="ENDPOINT_MISMATCH",
+                elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
+                path_waypoints=len(q_path or []),
+                mode=return_mode,
+                endpoint_delta_rad=endpoint_delta,
+                endpoint_tol_rad=endpoint_tol,
+            )
+            return False
+    else:
+        _record_profile(
+            args,
+            "return_to_start_endpoint_validate",
+            success=True,
+            status="SKIPPED_PREVALIDATED_EXECUTE_DIRECTLY",
+            path_waypoints=len(q_path or []),
+            mode=return_mode,
+        )
     return_audit = None
-    if bool(getattr(args, "return_to_start_self_collision_audit", True)) and planner is not None:
+    if using_cached_prevalidated_return:
+        _record_profile(
+            args,
+            "return_to_start_self_collision_audit",
+            success=True,
+            status="SKIPPED_PREVALIDATED_EXECUTE_DIRECTLY",
+            mode=return_mode,
+            path_waypoints=len(q_path or []),
+        )
+    elif bool(getattr(args, "return_to_start_self_collision_audit", True)) and planner is not None:
         with _profile_stage(
             args,
             "return_to_start_self_collision_audit",
@@ -8471,7 +8987,7 @@ def _plan_and_execute_return_to_cycle_start(
     execute_start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
     with _profile_stage(args, "return_to_start_execute", mode=return_mode, path_waypoints=len(q_path or [])) as prof:
         try:
-            ok, _ = targeted.base.execute_pose_path_stage(
+            ok, q_sent = targeted.base.execute_pose_path_stage(
                 demo,
                 bridge_mod,
                 real_exec,
@@ -8484,6 +9000,23 @@ def _plan_and_execute_return_to_cycle_start(
             )
             prof["success"] = bool(ok)
             prof["status"] = "Success" if ok else "EXEC_FAIL"
+            prof["q_sent_available"] = q_sent is not None
+            if ok:
+                q_after, q_after_source = _read_return_endpoint_q()
+                final_delta = _max_joint_angle_delta_wrapped(q_after, start_q)
+                prof["final_q_source"] = q_after_source
+                prof["final_start_delta_rad"] = final_delta
+                prof["endpoint_tol_rad"] = endpoint_tol
+                prof["final_endpoint_check_enforced"] = not bool(using_cached_prevalidated_return)
+                if (not using_cached_prevalidated_return) and (final_delta is None or final_delta > endpoint_tol):
+                    ok = False
+                    prof["success"] = False
+                    prof["status"] = "ENDPOINT_NOT_REACHED"
+                    print(
+                        f"[FAIL] {label} execution ended away from cycle start: "
+                        f"delta={float(final_delta or 0.0):.4f}rad tol={endpoint_tol:.4f}rad "
+                        f"source={q_after_source}"
+                    )
         except Exception as exc:
             ok = False
             prof["success"] = False
@@ -8510,10 +9043,12 @@ def _plan_and_execute_return_to_cycle_start(
         elapsed_ms=round((time.perf_counter() - profile_start_t) * 1000.0, 3),
         path_waypoints=len(q_path or []),
         mode=return_mode,
+        final_start_delta_rad=_max_joint_angle_delta_wrapped(_read_return_endpoint_q()[0], start_q),
         enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
         num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
         num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
     )
+    args._episode_returned_to_cycle_start = True
     return True
 
 
@@ -14176,6 +14711,7 @@ def plan_final_contact_approach(
 ):
     start_t = time.perf_counter()
     counter_start = _snapshot_profile_counters()
+    args._last_final_contact_constrained_budget = {}
     place_mode = str(transport_choice.get("place_mode", "drop_place"))
     pre_q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in transport_choice["q_path"]]
     hover_pose = transport_choice.get("hover_pose", transport_choice["pose"])
@@ -14263,6 +14799,7 @@ def plan_final_contact_approach(
         )
     try:
         release_q_path = None
+        release_q_segments = []
         cached_release_q = _q7_or_none(
             transport_choice.get("q_release", transport_choice.get("fast_chain_release_q"))
         )
@@ -14270,62 +14807,109 @@ def plan_final_contact_approach(
         final_contact_backtrack_tol_m = float(
             max(getattr(args, "strict_final_contact_waypoint_backtrack_tol_m", 0.008), 0.0)
         )
-        if cached_release_q is not None and final_contact_fast_path:
-            release_q_path = _build_validated_linear_path_to_q(
-                demo,
-                args,
-                final_start_q,
-                cached_release_q,
-                hover_pose,
-                release_pose,
-                label=f"{final_label}_cached_q_release",
-                use_attach=False,
-                validation_pos_tol_m=float(max(getattr(args, "strict_final_contact_waypoint_pos_tol_m", 0.012), 0.0)),
-                max_backtrack_m=final_contact_backtrack_tol_m,
-            )
-            if release_q_path is not None:
-                print(
-                    f"[place_state] {final_label}: using pair-first cached q_release "
-                    f"as the straight final-contact primitive ({len(release_q_path)} waypoint(s))"
+
+        def _plan_final_contact_segment(segment_start_q, segment_start_pose, segment_goal_pose, *, segment_label: str, cached_goal_q=None):
+            segment_path = None
+            if cached_goal_q is not None and final_contact_fast_path:
+                segment_path = _build_validated_linear_path_to_q(
+                    demo,
+                    args,
+                    segment_start_q,
+                    cached_goal_q,
+                    segment_start_pose,
+                    segment_goal_pose,
+                    label=f"{segment_label}_cached_q_release",
+                    use_attach=False,
+                    validation_pos_tol_m=float(max(getattr(args, "strict_final_contact_waypoint_pos_tol_m", 0.012), 0.0)),
+                    max_backtrack_m=final_contact_backtrack_tol_m,
                 )
-        if release_q_path is None and final_contact_fast_path:
-            release_q_path = _plan_short_linear_segment_via_goal_ik(
-                planner,
-                demo,
-                args,
-                final_start_q,
-                hover_pose,
-                release_pose,
-                label=f"{final_label}_release_ik",
-                use_attach=False,
-                validation_pos_tol_m=float(max(getattr(args, "strict_final_contact_waypoint_pos_tol_m", 0.012), 0.0)),
-                max_backtrack_m=final_contact_backtrack_tol_m,
-            )
-            if release_q_path is not None:
-                print(
-                    f"[place_state] {final_label}: using endpoint-IK straight final contact "
-                    f"({len(release_q_path)} waypoint(s))"
+                if segment_path is not None:
+                    print(
+                        f"[place_state] {segment_label}: using pair-first cached q_release "
+                        f"as the straight final-contact primitive ({len(segment_path)} waypoint(s))"
+                    )
+            if segment_path is None and final_contact_fast_path:
+                segment_path = _plan_short_linear_segment_via_goal_ik(
+                    planner,
+                    demo,
+                    args,
+                    segment_start_q,
+                    segment_start_pose,
+                    segment_goal_pose,
+                    label=f"{segment_label}_release_ik",
+                    use_attach=False,
+                    validation_pos_tol_m=float(max(getattr(args, "strict_final_contact_waypoint_pos_tol_m", 0.012), 0.0)),
+                    max_backtrack_m=final_contact_backtrack_tol_m,
                 )
-        if release_q_path is None and use_segmented_final_contact:
-            release_q_path = _plan_short_curobo_cartesian_descent(
-                planner,
-                demo,
-                args,
-                final_start_q,
-                hover_pose,
-                release_pose,
-                label=final_label,
-                force_segmented=force_segmented_final_contact,
+                if segment_path is not None:
+                    print(
+                        f"[place_state] {segment_label}: using endpoint-IK straight final contact "
+                        f"({len(segment_path)} waypoint(s))"
+                    )
+            if segment_path is None and use_segmented_final_contact:
+                segment_path = _plan_short_curobo_cartesian_descent(
+                    planner,
+                    demo,
+                    args,
+                    segment_start_q,
+                    segment_start_pose,
+                    segment_goal_pose,
+                    label=segment_label,
+                    force_segmented=force_segmented_final_contact,
+                )
+            elif segment_path is None:
+                segment_path = _plan_release_with_motiongen_constraint(
+                    planner,
+                    demo,
+                    args,
+                    segment_start_q,
+                    segment_start_pose,
+                    segment_goal_pose,
+                    label=segment_label,
+                )
+            return segment_path
+
+        intermediate_poses = list(transport_choice.get("final_contact_intermediate_poses") or [])
+        if intermediate_poses:
+            segment_goals = intermediate_poses + [release_pose]
+            print(
+                f"[place_state] {final_label}: planning multi-segment final contact "
+                f"segments={len(segment_goals)}"
             )
-        elif release_q_path is None:
-            release_q_path = _plan_release_with_motiongen_constraint(
-                planner,
-                demo,
-                args,
+            current_q = final_start_q
+            current_pose = hover_pose
+            combined_release_path = None
+            for segment_idx, segment_goal_pose in enumerate(segment_goals):
+                is_last_segment = segment_idx == len(segment_goals) - 1
+                segment_label = f"{final_label}_seg{segment_idx + 1}_{len(segment_goals)}"
+                segment_path = _plan_final_contact_segment(
+                    current_q,
+                    current_pose,
+                    segment_goal_pose,
+                    segment_label=segment_label,
+                    cached_goal_q=cached_release_q if is_last_segment else None,
+                )
+                if segment_path is None:
+                    release_q_path = None
+                    release_q_segments = []
+                    break
+                segment_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in segment_path]
+                release_q_segments.append((segment_path, current_pose, segment_goal_pose, segment_label))
+                if combined_release_path is None:
+                    combined_release_path = list(segment_path)
+                else:
+                    combined_release_path.extend(segment_path[1:])
+                current_q = np.asarray(segment_path[-1], dtype=np.float32).reshape(-1)[:7]
+                current_pose = segment_goal_pose
+            if release_q_segments:
+                release_q_path = combined_release_path
+        else:
+            release_q_path = _plan_final_contact_segment(
                 final_start_q,
                 hover_pose,
                 release_pose,
-                label=final_label,
+                segment_label=final_label,
+                cached_goal_q=cached_release_q,
             )
     finally:
         set_payload_collision_mode(
@@ -14346,19 +14930,37 @@ def plan_final_contact_approach(
             enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
             num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
             num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+            **dict(getattr(args, "_last_final_contact_constrained_budget", {}) or {}),
             **_profile_counter_delta(counter_start),
         )
         return None
     release_q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in release_q_path]
-    if strict_linear_final_contact and not _validate_strict_linear_waypoints(
-        demo,
-        args,
-        release_q_path,
-        hover_pose,
-        release_pose,
-        label=final_label,
-        max_backtrack_m=final_contact_backtrack_tol_m,
-    ):
+    if release_q_segments:
+        strict_ok = True
+        if strict_linear_final_contact:
+            for segment_path, segment_start_pose, segment_goal_pose, segment_label in release_q_segments:
+                if not _validate_strict_linear_waypoints(
+                    demo,
+                    args,
+                    segment_path,
+                    segment_start_pose,
+                    segment_goal_pose,
+                    label=segment_label,
+                    max_backtrack_m=final_contact_backtrack_tol_m,
+                ):
+                    strict_ok = False
+                    break
+    else:
+        strict_ok = (not strict_linear_final_contact) or _validate_strict_linear_waypoints(
+            demo,
+            args,
+            release_q_path,
+            hover_pose,
+            release_pose,
+            label=final_label,
+            max_backtrack_m=final_contact_backtrack_tol_m,
+        )
+    if not strict_ok:
         _record_profile(
             args,
             "final_contact",
@@ -14366,6 +14968,8 @@ def plan_final_contact_approach(
             status="STRICT_LINEAR_VALIDATE_FAIL",
             elapsed_ms=round((time.perf_counter() - start_t) * 1000.0, 3),
             path_waypoints=len(release_q_path),
+            segment_count=len(release_q_segments) if release_q_segments else 1,
+            **dict(getattr(args, "_last_final_contact_constrained_budget", {}) or {}),
             **_profile_counter_delta(counter_start),
         )
         return None
@@ -14383,6 +14987,7 @@ def plan_final_contact_approach(
             status="DEMO_VALIDATE_FAIL",
             elapsed_ms=round((time.perf_counter() - start_t) * 1000.0, 3),
             path_waypoints=len(release_q_path),
+            **dict(getattr(args, "_last_final_contact_constrained_budget", {}) or {}),
             **_profile_counter_delta(counter_start),
         )
         return None
@@ -14400,6 +15005,9 @@ def plan_final_contact_approach(
     item["q_place_path"] = release_q_path
     item["two_stage_place"] = True
     item["final_contact_policy"] = "payload_world_collision_disabled"
+    if release_q_segments:
+        item["final_contact_policy"] = "multi_segment_payload_world_collision_disabled"
+        item["final_contact_segment_count"] = len(release_q_segments)
     item["metrics"] = metrics
     item["score"] = float(score)
     print(
@@ -14417,6 +15025,7 @@ def plan_final_contact_approach(
         enable_graph=bool(getattr(args, "curobo_enable_graph", False)),
         num_ik_seeds=int(getattr(args, "curobo_num_ik_seeds", 64)),
         num_trajopt_seeds=int(getattr(args, "curobo_num_trajopt_seeds", 1)),
+        **dict(getattr(args, "_last_final_contact_constrained_budget", {}) or {}),
         **_profile_counter_delta(counter_start),
     )
     return item
@@ -15843,9 +16452,12 @@ def run_targeted_place_episode_curobo_direct(
     args._episode_failure_phase = ""
     args._episode_failure_kind = ""
     args._episode_object_grasped = False
+    args._episode_place_released = False
+    args._episode_place_completed = False
     args._episode_empty_grasp_after_lift = False
     args._episode_empty_grasp_gripper_pos = None
     args._episode_empty_grasp_blocked_before_full_close = None
+    args._episode_returned_to_cycle_start = False
 
     def _mark_real_motion_started(phase: str) -> None:
         if real_exec is not None:
@@ -15857,6 +16469,7 @@ def run_targeted_place_episode_curobo_direct(
 
     def _mark_object_released() -> None:
         args._episode_object_grasped = False
+        args._episode_place_released = True
 
     def _mark_empty_grasp_after_lift(check: dict, *, phase: str = "empty_grasp_after_lift") -> None:
         args._episode_failure_kind = "empty_grasp_after_lift"
@@ -15894,7 +16507,7 @@ def run_targeted_place_episode_curobo_direct(
 
     print("\n[episode] planning from FoundationPose-initialized object pose")
 
-    start_q = demo.current_arm_qpos()
+    start_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7].copy()
     if real_exec is not None and bool(getattr(args, "single_confirm_per_object", False)):
         if not targeted.base.begin_single_confirm_window_for_object(demo, bridge_mod, args):
             print("[abort] user cancelled before executing this object's pick-place sequence")
@@ -15908,8 +16521,25 @@ def run_targeted_place_episode_curobo_direct(
             print("[abort] failed to align the real robot to the simulation start pose")
             return False
         targeted.base.sync_demo_arm_qpos(demo, q_sent if q_sent is not None else start_q)
+        start_q = np.asarray(
+            q_sent if q_sent is not None else demo.current_arm_qpos(),
+            dtype=np.float32,
+        ).reshape(-1)[:7].copy()
     else:
         print("\n[dry-run] --execute-real was not provided, so motions will only be planned and previewed")
+    args._episode_cycle_start_q = np.asarray(start_q, dtype=np.float32).reshape(-1)[:7].copy()
+    _record_profile(
+        args,
+        "episode_cycle_start",
+        success=True,
+        status="RECORDED",
+        execute_real=real_exec is not None,
+        cycle_start_q_rad=[float(v) for v in args._episode_cycle_start_q.astype(np.float32).tolist()],
+        cycle_start_q_deg=[float(v) for v in np.rad2deg(args._episode_cycle_start_q).astype(np.float32).tolist()],
+        jimu_sim_start_joints_deg=getattr(args, "_jimu_sim_start_joints_deg_applied", None),
+        align_real_to_sim_start_before_cycle=bool(getattr(args, "align_real_to_sim_start_before_cycle", False)),
+        no_move_real_to_sim_start=bool(getattr(args, "no_move_real_to_sim_start", False)),
+    )
 
     planner = _get_or_create_curobo_planner_serialized(args)
     if getattr(planner, "attached_object_active", False):
@@ -16451,13 +17081,21 @@ def run_targeted_place_episode_curobo_direct(
         return False
     if selected_joint_chain is not None:
         selected_joint_chain["grasp_choice"] = grasp_choice
+        selected_pre_place_choice = selected_joint_chain.get("pre_place_choice")
         if not _prevalidate_post_place_clearance_before_release(
             planner,
             demo,
             args,
             start_q,
-            selected_joint_chain.get("pre_place_choice"),
+            selected_pre_place_choice,
             selected_joint_chain.get("q_place_path"),
+        ):
+            return False
+        if real_exec is not None and not _enforce_prevalidated_return_to_start_before_real_release(
+            args,
+            selected_pre_place_choice,
+            stage_name="pre_grasp_full_chain_gate",
+            return_goal_q=start_q,
         ):
             return False
 
@@ -17152,6 +17790,13 @@ def run_targeted_place_episode_curobo_direct(
         and isinstance(place_choice["_prevalidated_post_place_clearance"].get("return_payload"), dict)
         and bool(place_choice["_prevalidated_post_place_clearance"]["return_payload"].get("q_path"))
     )
+    if real_exec is not None and not _enforce_prevalidated_return_to_start_before_real_release(
+        args,
+        place_choice,
+        stage_name="pre_place_full_chain_gate",
+        return_goal_q=start_q,
+    ):
+        return False
     if (
         not skip_return_after_place
         and bool(getattr(args, "return_to_start_preplan", True))
@@ -17513,6 +18158,7 @@ def run_targeted_place_episode_curobo_direct(
                 nonlocal clearance_pose
                 endpoint_audits: list[dict] = []
                 return_checks: list[dict] = []
+                selective_contact_audits: list[dict] = []
 
                 def _clearance_endpoint_self_collision_ok(candidate_idx: int, candidate_label: str, q_path: list[np.ndarray]) -> bool:
                     if not (
@@ -17863,6 +18509,45 @@ def run_targeted_place_episode_curobo_direct(
                                 ):
                                     if meta_key in followup_meta:
                                         prof[f"retreat_{meta_key}"] = followup_meta.get(meta_key)
+                        contact_relaxed_links = (
+                            _direct_grasp_target_contact_only_disabled_links(planner)
+                            if placed_object_obstacles
+                            else []
+                        )
+                        selective_contact_audit = _audit_post_place_clearance_selective_contact_path(
+                            planner,
+                            demo,
+                            args,
+                            q_path,
+                            placed_object_obstacles=placed_object_obstacles,
+                            contact_relaxed_links=contact_relaxed_links,
+                            label=f"{segment_label}_selective_contact",
+                        )
+                        selective_contact_audits.append(
+                            {
+                                "candidate_index": int(candidate_idx),
+                                "candidate_label": str(candidate_label),
+                                "success": bool(selective_contact_audit.get("success", False)),
+                                "status": str(selective_contact_audit.get("status", "")),
+                                "placed_object_names": list(selective_contact_audit.get("placed_object_names") or []),
+                                "placed_world_names": list(selective_contact_audit.get("placed_world_names") or []),
+                                "invalid_records": list(
+                                    (
+                                        selective_contact_audit.get("except_placed_audit")
+                                        or selective_contact_audit.get("non_gripper_audit")
+                                        or {}
+                                    ).get("invalid_records", [])
+                                )[:4],
+                            }
+                        )
+                        prof["retreat_candidate_selective_contact_audits"] = selective_contact_audits
+                        if not bool(selective_contact_audit.get("success", False)):
+                            print(
+                                "[place] post_place_clearance rejected retreat candidate "
+                                f"{candidate_idx + 1}/{len(clearance_candidates)} {candidate_label}: "
+                                f"selective contact audit failed status={selective_contact_audit.get('status')}"
+                            )
+                            continue
                         if not _clearance_endpoint_self_collision_ok(candidate_idx, candidate_label, q_path):
                             continue
                         if not _cache_validated_return_to_start_path(candidate_idx, candidate_label, q_path):
@@ -18086,8 +18771,10 @@ def run_targeted_place_episode_curobo_direct(
 
     if not settled_before_clearance:
         targeted.base.settle_released_active_object_for_scene_cache(demo, args)
+    _force_placed_pose_cache_to_predicted_target(demo, args, place_choice)
     _record_placed_pose_prediction_error(args, demo, place_choice)
     targeted._mark_place_rule_success(rule, place_state_cache, place_choice["slot_name"])
+    args._episode_place_completed = True
 
     if relaxed_target_collision:
         targeted._set_scene_obstacle_planner_box_scale(demo, place_choice["target_name"], 1.0)
@@ -18144,6 +18831,9 @@ def run_targeted_place_episode_curobo_direct(
             "treating pick-place as successful and continuing from the current arm pose"
         )
         return True
+    if not return_ok:
+        args._episode_failure_kind = "return_after_place_failed"
+        args._episode_failure_phase = "return_to_cycle_start_after_place"
     return return_ok
 
 
@@ -18907,6 +19597,43 @@ def _apply_predicted_place_to_scene_cache(scene_capture_cache: dict, object_name
     return T_world_obj
 
 
+def _force_placed_pose_cache_to_predicted_target(demo, args, place_choice) -> np.ndarray | None:
+    if not bool(getattr(args, "jimu_force_placed_scene_cache_to_target", False)):
+        return None
+    T_world_obj = _predicted_place_T_world_obj(place_choice)
+    if T_world_obj is None:
+        _record_profile(
+            args,
+            "placed_pose_cache_target_sync",
+            success=False,
+            status="MISSING_PREDICTED_POSE",
+        )
+        return None
+    T_world_obj = np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4).copy()
+    actor_pose_applied = False
+    actor_error = None
+    try:
+        actor = getattr(getattr(demo, "base_env", None), "obj", None)
+        if actor is not None:
+            actor.set_pose(_pose_from_world_matrix(T_world_obj))
+            _single_scene_zero_actor_velocity(actor)
+            actor_pose_applied = True
+            _single_scene_refresh_after_pose_change(demo)
+    except Exception as exc:
+        actor_error = str(exc)
+    demo._scene_cache_placed_object_world_pose = T_world_obj.copy()
+    _record_profile(
+        args,
+        "placed_pose_cache_target_sync",
+        success=True,
+        status="TARGET_POSE_CACHED",
+        actor_pose_applied=actor_pose_applied,
+        actor_error=actor_error,
+        target_xyz=[float(v) for v in T_world_obj[:3, 3].astype(np.float32).tolist()],
+    )
+    return T_world_obj
+
+
 def _record_placed_pose_prediction_error(args, demo, place_choice) -> None:
     predicted_T = _predicted_place_T_world_obj(place_choice)
     actual_T = getattr(demo, "_scene_cache_placed_object_world_pose", None)
@@ -19203,6 +19930,9 @@ class _NextCyclePlanPrefetchManager:
 
         if not bool(getattr(current_args, "next_cycle_plan_prefetch", True)):
             record_start("DISABLED")
+            return
+        if bool(getattr(current_args, "_single_scene_no_remaining_after_current", False)):
+            record_start("FINAL_TARGET")
             return
         if bool(getattr(current_args, "skip_return_to_cycle_start", False)):
             print("[prefetch] next-cycle plan prefetch skipped: next start_q is not fixed when return_to_start is skipped")
@@ -20150,6 +20880,9 @@ def _run_single_scene_main(create_demo_func) -> None:
                 scene_capture_cache,
                 place_state_cache,
             )
+            episode_cycle_start_q = _q7_or_none(getattr(cycle_args, "_episode_cycle_start_q", None))
+            if episode_cycle_start_q is not None:
+                cycle_start_q = episode_cycle_start_q.copy()
             final_sim_arm_q = None
             if ok:
                 final_sim_arm_q = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
@@ -20158,6 +20891,7 @@ def _run_single_scene_main(create_demo_func) -> None:
                     f"{np.round(final_sim_arm_q, 5).tolist()}"
                 )
                 if real_exec is not None and not bool(getattr(cycle_args, "_single_scene_no_remaining_after_current", False)):
+                    already_returned_to_start = bool(getattr(cycle_args, "_episode_returned_to_cycle_start", False))
                     try:
                         q_real_now = np.asarray(real_exec.get_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
                     except Exception:
@@ -20168,12 +20902,25 @@ def _run_single_scene_main(create_demo_func) -> None:
                     _record_profile(
                         cycle_args,
                         "post_success_real_return_guard",
-                        success=max_start_delta <= 0.03,
-                        status="ALREADY_AT_START" if max_start_delta <= 0.03 else "RETURN_REQUIRED",
+                        success=(max_start_delta <= 0.03) or already_returned_to_start,
+                        status=(
+                            "ALREADY_AT_START"
+                            if max_start_delta <= 0.03
+                            else (
+                                "SKIPPED_ALREADY_RETURNED_WITH_PREVALIDATED_PATH"
+                                if already_returned_to_start
+                                else "RETURN_REQUIRED"
+                            )
+                        ),
                         target_name=selected_name,
                         start_delta=max_start_delta,
                     )
-                    if max_start_delta > 0.03:
+                    if max_start_delta > 0.03 and already_returned_to_start:
+                        print(
+                            "[single_scene] completed place and already executed the prevalidated return path; "
+                            f"not issuing a second return_to_cycle_start (reported max_delta={max_start_delta:.4f}rad)"
+                        )
+                    elif max_start_delta > 0.03:
                         print(
                             "[single_scene] completed place but real robot is not at cycle start "
                             f"(max_delta={max_start_delta:.4f}rad); returning before next cycle"
@@ -20191,6 +20938,13 @@ def _run_single_scene_main(create_demo_func) -> None:
                             use_attach=False,
                             gripper_pos=cycle_args.real_gripper_open,
                         )
+                        final_start_delta = None
+                        if return_ok:
+                            try:
+                                q_real_after_return = np.asarray(real_exec.get_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                            except Exception:
+                                q_real_after_return = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                            final_start_delta = _max_joint_angle_delta_wrapped(q_real_after_return, q_cycle_start)
                         _record_profile(
                             cycle_args,
                             "post_success_real_return_guard",
@@ -20198,6 +20952,7 @@ def _run_single_scene_main(create_demo_func) -> None:
                             status="RETURN_SUCCESS" if return_ok else "RETURN_FAIL",
                             target_name=selected_name,
                             start_delta=max_start_delta,
+                            final_start_delta=final_start_delta,
                         )
                         if not return_ok:
                             print(
@@ -20208,6 +20963,114 @@ def _run_single_scene_main(create_demo_func) -> None:
                             break
 
             print(f"\ncycle {cycle_idx} success = {ok}")
+            if not ok and bool(getattr(cycle_args, "_episode_place_completed", False)):
+                failure_phase = str(getattr(cycle_args, "_episode_failure_phase", "") or "")
+                failure_kind = str(getattr(cycle_args, "_episode_failure_kind", "") or "")
+                print(
+                    "[single_scene] target was already released at the place pose "
+                    f"(target={selected_name}, failure={failure_kind or failure_phase or 'post_place'}); "
+                    "marking it placed and disabling target/source retry."
+                )
+                _record_profile(
+                    cycle_args,
+                    "post_place_failure_mark_placed",
+                    success=True,
+                    status="PLACED_NO_RETRY",
+                    target_name=selected_name,
+                    failure_kind=failure_kind,
+                    failure_phase=failure_phase,
+                )
+                failed_targets_this_cycle.clear()
+                deferred_failed_targets.discard(selected_name)
+                empty_grasp_retry_counts.pop(selected_name, None)
+                targeted.base.cache_successfully_placed_object_world_pose(demo, cycle_args.object_name, cycle_args)
+                registry = _single_scene_registry(demo)
+                if selected_name in registry:
+                    registry[selected_name]["object_args"] = cycle_args
+
+                if real_exec is not None and not bool(getattr(cycle_args, "_single_scene_no_remaining_after_current", False)):
+                    already_returned_to_start = bool(getattr(cycle_args, "_episode_returned_to_cycle_start", False))
+                    try:
+                        q_real_now = np.asarray(real_exec.get_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                    except Exception:
+                        q_real_now = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                    q_cycle_start = np.asarray(cycle_start_q, dtype=np.float32).reshape(-1)[:7]
+                    q_start_delta = (q_real_now - q_cycle_start + np.pi) % (2.0 * np.pi) - np.pi
+                    max_start_delta = float(np.max(np.abs(q_start_delta)))
+                    if max_start_delta > 0.03 and already_returned_to_start:
+                        _record_profile(
+                            cycle_args,
+                            "post_place_failure_return_guard",
+                            success=True,
+                            status="SKIPPED_ALREADY_RETURNED_WITH_PREVALIDATED_PATH",
+                            target_name=selected_name,
+                            start_delta=max_start_delta,
+                        )
+                        print(
+                            "[single_scene] placed target and already executed the prevalidated return path; "
+                            f"not issuing a second return_to_cycle_start (reported max_delta={max_start_delta:.4f}rad)"
+                        )
+                    elif max_start_delta > 0.03:
+                        print(
+                            "[single_scene] placed target but robot is not at cycle start "
+                            f"(max_delta={max_start_delta:.4f}rad); returning before next cycle"
+                        )
+                        try:
+                            targeted.base.sync_demo_arm_qpos(demo, q_real_now)
+                        except Exception:
+                            pass
+                        return_ok = _plan_and_execute_return_to_cycle_start(
+                            demo,
+                            bridge_mod,
+                            real_exec,
+                            cycle_args,
+                            cycle_start_q,
+                            use_attach=False,
+                            gripper_pos=cycle_args.real_gripper_open,
+                        )
+                        final_start_delta = None
+                        if return_ok:
+                            try:
+                                q_real_after_return = np.asarray(real_exec.get_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                            except Exception:
+                                q_real_after_return = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+                            final_start_delta = _max_joint_angle_delta_wrapped(q_real_after_return, q_cycle_start)
+                        _record_profile(
+                            cycle_args,
+                            "post_place_failure_return_guard",
+                            success=bool(return_ok),
+                            status="RETURN_SUCCESS" if return_ok else "RETURN_FAIL",
+                            target_name=selected_name,
+                            start_delta=max_start_delta,
+                            final_start_delta=final_start_delta,
+                        )
+                        if not return_ok:
+                            print(
+                                "[single_scene] failed to return the real robot to the cycle start after "
+                                f"already placed target={selected_name}; stopping without retrying that target."
+                            )
+                            final_ok = False
+                            break
+                    else:
+                        _record_profile(
+                            cycle_args,
+                            "post_place_failure_return_guard",
+                            success=True,
+                            status="ALREADY_AT_START",
+                            target_name=selected_name,
+                            start_delta=max_start_delta,
+                        )
+
+                if not base_args.repeat_forever and cycle_idx >= int(base_args.repeat_count):
+                    break
+                if real_exec is not None:
+                    real_exec.set_gripper(args.real_gripper_open)
+                    print(
+                        f"\n[cycle {cycle_idx}] placed target completed despite post-place failure; "
+                        "continuing with the next target in the same scene"
+                    )
+                print(f"[cycle {cycle_idx}] ready for the next cycle in the same scene")
+                continue
             if not ok:
                 real_motion_started = bool(getattr(cycle_args, "_episode_real_motion_started", False))
                 failure_phase = str(getattr(cycle_args, "_episode_failure_phase", "") or "")

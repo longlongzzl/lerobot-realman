@@ -114,7 +114,8 @@ PORTABLE_DEFAULT_ASSEMBLY_SCENE_JSON = PORTABLE_REPRO_DIR / "scenes" / "jimu_ass
 PORTABLE_DEFAULT_SCENE_JSON = PORTABLE_DEFAULT_ASSEMBLY_SCENE_JSON
 PORTABLE_LEGACY_DEFAULT_SCENE_JSON = PORTABLE_REPRO_DIR / "scenes" / "jimu_9objects_default_sam6d.json"
 PORTABLE_DEFAULT_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "red_jimu_cube.glb"
-PORTABLE_DEFAULT_SIM_ASSET_FILE = PORTABLE_REPRO_DIR / "assets" / "red_jimu_plate_74x6x74.glb"
+PORTABLE_DEFAULT_SIM_ASSET_FILE = PORTABLE_REPRO_DIR / "assets" / "red_jimu_plate_74x6p5x74.glb"
+PORTABLE_DEFAULT_HALF_SIM_ASSET_FILE = PORTABLE_REPRO_DIR / "assets" / "red_jimu_half_plate_37x6p5x74.glb"
 PORTABLE_DEFAULT_TRAY_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "jimu_liaoban_new" / "jimu_liaoban_new.obj"
 PORTABLE_DEFAULT_LOADED_TRAY_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "jimu_liaoban_new" / "jimu_liaoban_new_loaded_14plates.glb"
 PORTABLE_DEFAULT_BASE_ASSEMBLY_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "jimu_base_assembly_5plates.glb"
@@ -144,9 +145,14 @@ PORTABLE_MANISKILL_RM75_URDF = (
 PORTABLE_MANISKILL_RM75_PLANNING_URDF = PORTABLE_MANISKILL_RM75_URDF.with_name("RM75-B.planning.tiny.urdf")
 PORTABLE_MANISKILL_RM75_SRDF = PORTABLE_MANISKILL_RM75_URDF.with_name("RM75-B.permissive.srdf")
 JIMU_PLATE_SIZE_M = 0.074
-JIMU_PLATE_THICKNESS_M = 0.006
+JIMU_PLATE_THICKNESS_M = 0.0065
+JIMU_HALF_PLATE_WIDTH_M = 0.5 * JIMU_PLATE_SIZE_M
 DEFAULT_JIMU_PHYSICAL_EXTENTS_M = np.asarray(
     [JIMU_PLATE_SIZE_M, JIMU_PLATE_THICKNESS_M, JIMU_PLATE_SIZE_M],
+    dtype=np.float32,
+)
+DEFAULT_JIMU_HALF_PHYSICAL_EXTENTS_M = np.asarray(
+    [JIMU_HALF_PLATE_WIDTH_M, JIMU_PLATE_THICKNESS_M, JIMU_PLATE_SIZE_M],
     dtype=np.float32,
 )
 DEFAULT_JIMU_MESH_EXTENTS_M = DEFAULT_JIMU_PHYSICAL_EXTENTS_M.copy()
@@ -161,6 +167,7 @@ _JIMU_RUNTIME_CONTEXT = threading.local()
 _ORIGINAL_TARGETED_BUILD_PLACE_PLAN_VARIANTS = None
 _ORIGINAL_FAST_CHAIN_RANK_PAIRED_RELATION_CANDIDATES = None
 _ORIGINAL_FAST_CHAIN_RELATION_MATCH_KEY = None
+_ORIGINAL_RAW_GRASP_RELATION_SORT_KEY = None
 _ORIGINAL_EVALUATE_CUROBO_POSE_CANDIDATES_MULTI_START = None
 _ORIGINAL_COPY_LAST_CANDIDATE_COUNTS_TO_PROFILE = None
 _ORIGINAL_PROFILE_PLAN_TO_JOINT_STATE = None
@@ -192,6 +199,208 @@ _ORIGINAL_CUROBO_SOLVE_IK = None
 _ORIGINAL_CUROBO_SOLVE_BATCH_START_GOAL_IK = None
 _ORIGINAL_CUROBO_SOLVE_BATCH_START_GOAL_IK_CUDA_GRAPH = None
 _JIMU_ACTIVE_ARGS = None
+_JIMU_TRAJECTORY_RECORD_LOCK = threading.Lock()
+_JIMU_TRAJECTORY_RECORD_STATE: dict[str, Any] = {}
+
+
+def _jimu_now_timestamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _jimu_record_trajectory_requested(args: argparse.Namespace | None) -> bool:
+    if args is None:
+        return False
+    if bool(getattr(args, "_planning_prefetch_capture_only", False)):
+        return False
+    raw = str(getattr(args, "jimu_record_trajectory", "") or "").strip()
+    return bool(raw)
+
+
+def _jimu_record_trajectory_path(args: argparse.Namespace | None) -> Path | None:
+    if not _jimu_record_trajectory_requested(args):
+        return None
+    cached = getattr(args, "_jimu_record_trajectory_path_resolved", None)
+    if cached:
+        return Path(str(cached))
+    raw = str(getattr(args, "jimu_record_trajectory", "") or "").strip()
+    if raw.lower() in {"1", "true", "yes", "auto"}:
+        out_dir = Path(str(getattr(args, "jimu_record_trajectory_dir", SCRIPT_DIR / "jimu_trajectory_records")))
+        run_name = str(getattr(args, "jimu_record_trajectory_name", "") or "").strip()
+        if not run_name:
+            task = str(getattr(args, "jimu_task_dir", "") or "").strip()
+            task_name = Path(task).name if task else "jimu"
+            run_name = f"{_jimu_now_timestamp()}_{task_name}_pid{os.getpid()}"
+        path = out_dir.expanduser() / f"{run_name}.json"
+    else:
+        path = Path(raw).expanduser()
+        if path.suffix.lower() != ".json":
+            path = path / f"{_jimu_now_timestamp()}_jimu_pid{os.getpid()}.json"
+    path = path.resolve()
+    setattr(args, "_jimu_record_trajectory_path_resolved", str(path))
+    return path
+
+
+def _jimu_record_trajectory_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    fields = (
+        "execute_real",
+        "auto_execute",
+        "render_mode",
+        "jimu_task_dir",
+        "jimu_builder_scene_json",
+        "sam6d_fixed_scene_result_file",
+        "jimu_apriltag_anchor_localization",
+        "jimu_apriltag_base_id",
+        "jimu_apriltag_tray_id",
+        "real_control_hz",
+        "real_max_delta_per_step",
+        "real_hold_steps",
+        "real_stream_waypoint_path",
+        "real_gripper_open",
+        "real_gripper_close",
+        "real_gripper_command_repeats",
+        "real_gripper_command_hz",
+        "robot_ip",
+        "jimu_pregrasp_partial_open_m",
+        "jimu_partial_release_open_m",
+        "jimu_keep_partial_open_between_cycles",
+    )
+    return {name: getattr(args, name, None) for name in fields if hasattr(args, name)}
+
+
+def _jimu_trajectory_payload_template(args: argparse.Namespace, path: Path) -> dict[str, Any]:
+    return {
+        "schema": "jimu_real_trajectory_v1",
+        "created_at": _jimu_now_timestamp(),
+        "source": {
+            "script": str(Path(__file__).resolve()),
+            "cwd": str(Path.cwd()),
+            "argv": list(sys.argv),
+            "pid": int(os.getpid()),
+        },
+        "record_path": str(path),
+        "metadata": _jimu_record_trajectory_metadata(args),
+        "segments": [],
+    }
+
+
+def _jimu_load_or_init_trajectory_payload(args: argparse.Namespace, path: Path) -> dict[str, Any]:
+    state_key = str(path)
+    payload = _JIMU_TRAJECTORY_RECORD_STATE.get(state_key)
+    if isinstance(payload, dict):
+        return payload
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = _jimu_trajectory_payload_template(args, path)
+    else:
+        payload = _jimu_trajectory_payload_template(args, path)
+    if payload.get("schema") != "jimu_real_trajectory_v1":
+        payload = _jimu_trajectory_payload_template(args, path)
+    payload.setdefault("segments", [])
+    _JIMU_TRAJECTORY_RECORD_STATE[state_key] = payload
+    return payload
+
+
+def _jimu_write_trajectory_payload(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _jimu_record_trajectory_segment(args: argparse.Namespace | None, segment: dict[str, Any]) -> None:
+    if args is None or not _jimu_record_trajectory_requested(args):
+        return
+    path = _jimu_record_trajectory_path(args)
+    if path is None:
+        return
+    with _JIMU_TRAJECTORY_RECORD_LOCK:
+        payload = _jimu_load_or_init_trajectory_payload(args, path)
+        segments = payload.setdefault("segments", [])
+        segment = dict(segment)
+        segment["index"] = int(len(segments))
+        segment.setdefault("timestamp", _jimu_now_timestamp())
+        segments.append(segment)
+        payload["updated_at"] = _jimu_now_timestamp()
+        payload["segment_count"] = int(len(segments))
+        _jimu_write_trajectory_payload(path, payload)
+    print(
+        f"[jimu trajectory] recorded segment {segment['index']:03d} "
+        f"{segment.get('type')}:{segment.get('label')} -> {path}"
+    )
+
+
+def _jimu_q_path_to_list(q_path) -> list[list[float]]:
+    out: list[list[float]] = []
+    for q in list(q_path or []):
+        out.append(np.asarray(q, dtype=np.float32).reshape(-1)[:7].astype(float).tolist())
+    return out
+
+
+def _jimu_record_path_segment(
+    args: argparse.Namespace | None,
+    *,
+    segment_type: str,
+    label: str,
+    q_start,
+    q_path,
+    gripper_pos: float,
+    use_attach: bool,
+    allow_start_in_collision: bool,
+    ok: bool,
+    q_sent=None,
+) -> None:
+    if not ok:
+        return
+    q_points = _jimu_q_path_to_list(q_path)
+    if not q_points:
+        return
+    q_start_list = None
+    if q_start is not None:
+        q_start_list = np.asarray(q_start, dtype=np.float32).reshape(-1)[:7].astype(float).tolist()
+    q_sent_list = None
+    if q_sent is not None:
+        q_sent_list = np.asarray(q_sent, dtype=np.float32).reshape(-1)[:7].astype(float).tolist()
+    _jimu_record_trajectory_segment(
+        args,
+        {
+            "type": "joint_path",
+            "source_stage_type": str(segment_type),
+            "label": str(label or ""),
+            "q_start_rad": q_start_list,
+            "q_path_rad": q_points,
+            "q_sent_rad": q_sent_list,
+            "gripper_pos": float(gripper_pos),
+            "use_attach": bool(use_attach),
+            "allow_start_in_collision": bool(allow_start_in_collision),
+            "real_control_hz": float(getattr(args, "real_control_hz", 10.0) if args is not None else 10.0),
+            "real_max_delta_per_step": float(
+                getattr(args, "real_max_delta_per_step", 0.03) if args is not None else 0.03
+            ),
+            "real_hold_steps": int(getattr(args, "real_hold_steps", 0) if args is not None else 0),
+        },
+    )
+
+
+def _jimu_record_gripper_segment(
+    args: argparse.Namespace | None,
+    *,
+    label: str,
+    gripper_pos: float,
+    repeats: int | None = None,
+    hz: float | None = None,
+) -> None:
+    _jimu_record_trajectory_segment(
+        args,
+        {
+            "type": "gripper",
+            "label": str(label or "set_gripper"),
+            "gripper_pos": float(gripper_pos),
+            "repeats": int(repeats if repeats is not None else getattr(args, "real_gripper_command_repeats", 2)),
+            "hz": float(hz if hz is not None else getattr(args, "real_gripper_command_hz", 10.0)),
+        },
+    )
 
 
 def _jimu_to_numpy(value) -> np.ndarray | None:
@@ -2179,6 +2388,12 @@ def _cache_jimu_derived_role(
     cached["jimu_provider_result_index"] = int(source_entry["fallback_index"])
     cached["jimu_derived_from_anchor"] = source_name
     cached["jimu_T_base_obj"] = np.asarray(T_base_obj, dtype=np.float32).reshape(4, 4).copy()
+    if role in set(JIMU_BASE_ROLES):
+        object_args = cached.get("object_args")
+        object_args = copy.copy(object_args if object_args is not None else args)
+        object_args.min_object_center_z_margin = 0.0
+        cached["object_args"] = object_args
+        cached["jimu_static_base_role"] = True
     if slot_index is not None:
         cached["jimu_tray_slot_index"] = int(slot_index)
     debug = {
@@ -2518,6 +2733,7 @@ def _run_jimu_sam6d_provider_batch(
         jimu_apriltag_base_world_offset_y_m=float(getattr(args, "jimu_apriltag_base_world_offset_y_m", PORTABLE_DEFAULT_BASE_WORLD_OFFSET_Y_M)),
         jimu_apriltag_tray_world_offset_x_m=float(getattr(args, "jimu_apriltag_tray_world_offset_x_m", PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_X_M)),
         jimu_apriltag_tray_world_offset_y_m=float(getattr(args, "jimu_apriltag_tray_world_offset_y_m", PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_Y_M)),
+        jimu_builder_scene_json=str(getattr(args, "jimu_builder_scene_json", "") or ""),
     )
     print("[jimu-sam6d] using portable same-object SAM3/SAM6D subprocess call")
     return direct_sam6d._run_sam6d_provider(run_args, provider_names)
@@ -2683,6 +2899,8 @@ def _jimu_export_pose_entry(
         asset_name = Path(sim_asset_file or mesh_file).name.lower()
         if "triangle" in asset_name:
             entry["jimu_shape"] = "red_triangle"
+        elif "half" in asset_name:
+            entry["jimu_shape"] = "red_half_plate"
         elif "jimu" in asset_name or "plate" in asset_name or "cube" in asset_name:
             entry["jimu_shape"] = "red_square_plate"
     if slot_index is not None:
@@ -3495,6 +3713,334 @@ def _snap_yaw_deg(yaw_deg: float, step_deg: float) -> float:
     return ((snapped + 180.0) % 360.0) - 180.0
 
 
+def _jimu_pre_place_hover_height(place_mode: str, args, rule) -> float:
+    place_mode_text = str(place_mode or "")
+    if place_mode_text == "drop_place":
+        return 0.0
+    if place_mode_text == "vertical_place":
+        return float(max(getattr(args, "vertical_place_hover_height_m", 0.040), 0.0))
+    if place_mode_text == "surface_place":
+        return float(max(getattr(args, "surface_place_hover_height_m", 0.050), 0.0))
+    return float(max(getattr(rule, "hover_height", 0.05), 0.0))
+
+
+def _jimu_pose_from_target_obj_and_tcp(T_world_obj: np.ndarray, T_obj_tcp: np.ndarray):
+    T_world_tcp = (np.asarray(T_world_obj, dtype=np.float32).reshape(4, 4) @ T_obj_tcp).astype(np.float32)
+    return direct._pose_from_world_matrix(T_world_tcp)
+
+
+def _jimu_normalize_vec(vec) -> np.ndarray | None:
+    arr = np.asarray(vec, dtype=np.float32).reshape(3)
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-8:
+        return None
+    return (arr / norm).astype(np.float32)
+
+
+def _jimu_update_parallel_hover_pose(item: dict, hover_pose, *, mode: str, hover_height: float, label_suffix: str) -> dict:
+    out = dict(item)
+    base_label = str(out.get("label", "transport_hover") or "transport_hover")
+    if label_suffix and label_suffix not in base_label:
+        out["label"] = f"{base_label}_{label_suffix}"
+    base_variant = str(out.get("variant_label", "") or "")
+    if label_suffix and label_suffix not in base_variant:
+        out["variant_label"] = "+".join([part for part in (base_variant, label_suffix) if part])
+    token = str(out.get("_fast_chain_yaw_expansion_token", "parallel_grasp") or "parallel_grasp")
+    if label_suffix and label_suffix not in token:
+        out["_fast_chain_yaw_expansion_token"] = f"{token}_{label_suffix}"
+    out["pose"] = hover_pose
+    out["hover_pose"] = hover_pose
+    out["pre_place_pose"] = hover_pose
+    out["retreat_pose"] = hover_pose
+    out["jimu_parallel_pre_place_mode"] = mode
+    out["jimu_parallel_pre_place_hover_height_m"] = float(hover_height)
+    try:
+        out["jimu_parallel_pre_place_tcp_position"] = (
+            direct.targeted.base.flatten_np(hover_pose.p)[:3].astype(float).tolist()
+        )
+    except Exception:
+        pass
+    for stale_key in (
+        "result",
+        "q_path",
+        "q_goal",
+        "q_hover",
+        "q_release",
+        "fast_chain_hover_q",
+        "fast_chain_release_q",
+        "fast_chain_score",
+        "pair_score",
+        "ik_pos_error",
+        "ik_rot_error",
+        "ik_score",
+    ):
+        out.pop(stale_key, None)
+    return out
+
+
+def _jimu_final_contact_route_rank(item: dict | None) -> int:
+    if not isinstance(item, dict):
+        return 0
+    try:
+        return int(item.get("jimu_final_contact_fallback_rank", 0) or 0)
+    except Exception:
+        pass
+    label = (
+        str(item.get("label", "") or "")
+        + " "
+        + str(item.get("variant_label", "") or "")
+        + " "
+        + str(item.get("_fast_chain_yaw_expansion_token", "") or "")
+    ).lower()
+    if "side_neg" in label:
+        return 3
+    if "side_pos" in label or "side_" in label:
+        return 2
+    if "low_z" in label:
+        return 1
+    return 0
+
+
+def _jimu_retreat_pose_with_position(release_pose, position: np.ndarray):
+    return direct.targeted.base.make_pose_with_position(
+        release_pose,
+        np.asarray(position, dtype=np.float32).reshape(3),
+    )
+
+
+def _jimu_post_place_retreat_distance_m(args, source_name: str | None) -> float:
+    if hasattr(args, "jimu_post_place_retreat_m"):
+        value = float(max(getattr(args, "jimu_post_place_retreat_m", 0.0) or 0.0, 0.0))
+        if value > 1e-8:
+            return value
+    source_text = str(source_name or "").lower()
+    if "triangle" in source_text:
+        return float(max(getattr(args, "jimu_roof_post_place_retreat_m", 0.05) or 0.05, 0.0))
+    if source_name in set(JIMU_SECOND_LAYER_ROLES):
+        return float(max(getattr(args, "jimu_second_layer_release_retreat_height", 0.08) or 0.08, 0.0))
+    return float(max(getattr(args, "jimu_wall_release_retreat_height", 0.08) or 0.08, 0.0))
+
+
+def _jimu_post_place_retreat_basis(item: dict, release_pose, hover_pose) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    release_p = direct.targeted.base.flatten_np(release_pose.p)[:3].astype(np.float32)
+    plane_normal = None
+    plane_x = None
+    plane_z = None
+    try:
+        T_world_obj = np.asarray(item.get("T_world_obj_desired"), dtype=np.float32).reshape(4, 4)
+        R_world_obj = T_world_obj[:3, :3].astype(np.float32)
+        # Jimu plates use local Y as the thin axis; the broad plate face is X/Z.
+        plane_x = _jimu_normalize_vec(R_world_obj[:, 0])
+        plane_normal = _jimu_normalize_vec(R_world_obj[:, 1])
+        plane_z = _jimu_normalize_vec(R_world_obj[:, 2])
+    except Exception:
+        pass
+
+    world_up = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    main_dir = None
+    if hover_pose is not None:
+        hover_p = direct.targeted.base.flatten_np(hover_pose.p)[:3].astype(np.float32)
+        hover_dir = _jimu_normalize_vec(hover_p - release_p)
+        if hover_dir is not None and plane_normal is not None:
+            main_dir = _jimu_normalize_vec(hover_dir - plane_normal * float(np.dot(hover_dir, plane_normal)))
+        elif hover_dir is not None:
+            main_dir = hover_dir
+    if main_dir is None and plane_z is not None:
+        main_dir = _jimu_normalize_vec(plane_z * (1.0 if float(np.dot(plane_z, world_up)) >= 0.0 else -1.0))
+    if main_dir is None and plane_x is not None:
+        main_dir = plane_x
+    if main_dir is None:
+        main_dir = world_up
+
+    if plane_normal is not None:
+        perp_dir = _jimu_normalize_vec(np.cross(plane_normal, main_dir))
+    else:
+        perp_dir = _jimu_normalize_vec(np.cross(main_dir, world_up))
+    if perp_dir is None and plane_x is not None:
+        perp_dir = plane_x
+    if perp_dir is None:
+        perp_dir = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+
+    if plane_normal is not None:
+        reorthogonalized_main = _jimu_normalize_vec(np.cross(perp_dir, plane_normal))
+        if reorthogonalized_main is not None:
+            main_dir = reorthogonalized_main
+        if hover_pose is not None:
+            hover_p = direct.targeted.base.flatten_np(hover_pose.p)[:3].astype(np.float32)
+            hover_dir = _jimu_normalize_vec(hover_p - release_p)
+            if hover_dir is not None and float(np.dot(main_dir, hover_dir)) < 0.0:
+                main_dir = -main_dir
+                perp_dir = -perp_dir
+    return main_dir.astype(np.float32), perp_dir.astype(np.float32), plane_normal
+
+
+def _jimu_post_place_retreat_candidates(item: dict, args) -> list[dict]:
+    release_pose = item.get("release_pose", item.get("place_pose"))
+    if release_pose is None:
+        return []
+    hover_pose = item.get("pre_place_pose", item.get("hover_pose", item.get("pose")))
+    source = direct.curobo_wrapper.normalize_object_name(getattr(args, "object_name", None))
+    retreat_m = _jimu_post_place_retreat_distance_m(args, source)
+    if retreat_m <= 1e-8:
+        return [{"label": "post_world_z_zero", "pose": release_pose, "post_place_endpoint_ik_first": True}]
+
+    try:
+        max_count = max(1, int(getattr(args, "jimu_post_place_retreat_candidate_count", 16) or 16))
+    except Exception:
+        max_count = 16
+    lateral = float(max(getattr(args, "jimu_post_place_retreat_lateral_step_m", 0.006) or 0.0, 0.0))
+    forward_extra = float(max(getattr(args, "jimu_post_place_retreat_forward_extra_m", 0.010) or 0.0, 0.0))
+    up_ratio = float(max(getattr(args, "jimu_post_place_retreat_up_ratio", 1.0) or 0.0, 0.0))
+    up_m = float(min(retreat_m * up_ratio, 0.025))
+    allow_free_motiongen = bool(getattr(args, "jimu_post_place_free_motiongen_fallback", False))
+
+    release_p = direct.targeted.base.flatten_np(release_pose.p)[:3].astype(np.float32)
+    main_dir, perp_dir, plane_normal = _jimu_post_place_retreat_basis(item, release_pose, hover_pose)
+    world_up = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    far_m = float(retreat_m + max(forward_extra, 4.0 * lateral, 0.025))
+
+    specs: list[tuple[str, float, float, float]] = [("world_z_up", 0.0, 0.0, retreat_m)]
+    for level_label, dist in (("near", retreat_m), ("far", far_m)):
+        diag = float(dist / max(2.0 ** 0.5, 1e-6))
+        specs.extend(
+            [
+                (f"plane_main_p_{level_label}_up", dist, 0.0, up_m),
+                (f"plane_main_m_{level_label}_up", -dist, 0.0, up_m),
+                (f"plane_perp_p_{level_label}_up", 0.0, dist, up_m),
+                (f"plane_perp_m_{level_label}_up", 0.0, -dist, up_m),
+                (f"plane_diag_pp_{level_label}_up", diag, diag, up_m),
+                (f"plane_diag_pm_{level_label}_up", diag, -diag, up_m),
+                (f"plane_diag_mp_{level_label}_up", -diag, diag, up_m),
+                (f"plane_diag_mm_{level_label}_up", -diag, -diag, up_m),
+            ]
+        )
+
+    candidates: list[dict] = []
+    for label, main_offset, perp_offset, up_offset in specs[:max_count]:
+        delta = (
+            main_dir * float(main_offset)
+            + perp_dir * float(perp_offset)
+            + world_up * float(up_offset)
+        )
+        plane_normal_error = 0.0
+        if plane_normal is not None:
+            plane_normal_error = float(np.dot(delta, plane_normal))
+        candidates.append(
+            {
+                "label": f"post_{label}",
+                "pose": _jimu_retreat_pose_with_position(release_pose, release_p + delta),
+                "plane_main_m": float(main_offset),
+                "plane_perp_m": float(perp_offset),
+                "world_z_m": float(up_offset),
+                "retreat_up_ratio": float(up_ratio),
+                "retreat_delta_norm_m": float(np.linalg.norm(delta)),
+                "plane_normal_error_m": plane_normal_error,
+                "allow_post_place_free_motiongen": allow_free_motiongen,
+                "post_place_endpoint_ik_first": True,
+            }
+        )
+    return candidates
+
+
+def _jimu_apply_post_place_retreat_candidates(item: dict, args) -> dict:
+    out = dict(item)
+    candidates = _jimu_post_place_retreat_candidates(out, args)
+    if candidates:
+        out["retreat_pose_candidates"] = candidates
+        out["retreat_pose"] = candidates[0]["pose"]
+        out["jimu_post_place_retreat_mode"] = "generic_world_z_first_16way"
+        out["jimu_post_place_retreat_candidate_count"] = len(candidates)
+        out["force_replan_post_place_clearance"] = True
+    return out
+
+
+def _jimu_parallel_final_contact_fallback_candidates(
+    item: dict,
+    T_world_obj_target: np.ndarray,
+    T_obj_tcp: np.ndarray,
+    args,
+) -> list[dict]:
+    if not bool(getattr(args, "jimu_final_contact_fallbacks", True)):
+        return [_jimu_apply_post_place_retreat_candidates(item, args)]
+    source = direct.curobo_wrapper.normalize_object_name(getattr(args, "object_name", None))
+    target_z = float(np.asarray(T_world_obj_target, dtype=np.float32).reshape(4, 4)[2, 3])
+    min_z = float(max(getattr(args, "jimu_final_contact_fallback_min_target_z_m", 0.0), 0.0))
+    if target_z < min_z:
+        return [_jimu_apply_post_place_retreat_candidates(item, args)]
+
+    place_mode = str(item.get("place_mode", "vertical_place") or "vertical_place")
+    if place_mode == "drop_place":
+        return [_jimu_apply_post_place_retreat_candidates(item, args)]
+
+    T_world_obj_target = np.asarray(T_world_obj_target, dtype=np.float32).reshape(4, 4).copy()
+    T_obj_tcp = np.asarray(T_obj_tcp, dtype=np.float32).reshape(4, 4)
+    target_p = T_world_obj_target[:3, 3].astype(np.float32)
+    low_h = float(max(getattr(args, "jimu_final_contact_low_hover_height_m", 0.02), 0.0))
+    side_m = float(max(getattr(args, "jimu_final_contact_side_push_m", 0.02), 0.0))
+    high_h = float(max(item.get("jimu_parallel_pre_place_hover_height_m", 0.0) or 0.0, low_h))
+
+    base_item = dict(item)
+    base_item["jimu_final_contact_fallback"] = "world_z_high"
+    base_item["jimu_final_contact_fallback_rank"] = 0
+    out = [base_item]
+    T_low = T_world_obj_target.copy()
+    T_low[:3, 3] = (target_p + np.asarray([0.0, 0.0, low_h], dtype=np.float32)).astype(np.float32)
+    low_pose = _jimu_pose_from_target_obj_and_tcp(T_low, T_obj_tcp)
+
+    if bool(getattr(args, "jimu_final_contact_low_hover_fallback", True)) and low_h > 1e-6:
+        low_item = _jimu_update_parallel_hover_pose(
+            item,
+            low_pose,
+            mode="object_world_z_low",
+            hover_height=low_h,
+            label_suffix=f"low_z_{int(round(low_h * 1000.0))}mm",
+        )
+        low_item["jimu_final_contact_fallback"] = "low_world_z"
+        low_item["jimu_final_contact_fallback_rank"] = 1
+        out.append(low_item)
+
+    if bool(getattr(args, "jimu_final_contact_side_push_fallback", True)) and side_m > 1e-6 and low_h > 1e-6:
+        normal = T_world_obj_target[:3, 1].astype(np.float32)
+        normal[2] = 0.0
+        norm = float(np.linalg.norm(normal))
+        if norm > 1e-8:
+            normal /= norm
+            for sign, sign_label in ((1.0, "pos"), (-1.0, "neg")):
+                side_dir = normal * float(sign)
+                T_side = T_world_obj_target.copy()
+                T_side[:3, 3] = (
+                    target_p
+                    + np.asarray([0.0, 0.0, high_h], dtype=np.float32)
+                    + side_dir * side_m
+                ).astype(np.float32)
+                side_pose = _jimu_pose_from_target_obj_and_tcp(T_side, T_obj_tcp)
+                side_item = _jimu_update_parallel_hover_pose(
+                    item,
+                    side_pose,
+                    mode="object_side_high_to_low_world_z",
+                    hover_height=high_h,
+                    label_suffix=(
+                        f"side_{sign_label}_{int(round(side_m * 1000.0))}mm_"
+                        f"high_z_{int(round(high_h * 1000.0))}mm_low_z_{int(round(low_h * 1000.0))}mm"
+                    ),
+                )
+                side_item["final_contact_intermediate_poses"] = [low_pose]
+                side_item["jimu_final_contact_fallback"] = "side_high_to_low_then_vertical"
+                side_item["jimu_final_contact_fallback_rank"] = 2 if sign > 0 else 3
+                side_item["jimu_final_contact_side_push_m"] = float(side_m)
+                side_item["jimu_final_contact_low_hover_height_m"] = float(low_h)
+                side_item["jimu_final_contact_side_hover_height_m"] = float(high_h)
+                side_item["jimu_final_contact_side_direction_world"] = side_dir.astype(float).tolist()
+                out.append(side_item)
+    if len(out) > 1:
+        print(
+            f"[jimu place] added final-contact fallback hover(s) for {source}: "
+            f"target_z={target_z:.3f}m, base={out[0].get('label')}, extra={len(out) - 1}, "
+            f"low_z={low_h:.3f}m, side_high={high_h:.3f}m, side={side_m:.3f}m"
+        )
+    return [_jimu_apply_post_place_retreat_candidates(candidate, args) for candidate in out]
+
+
 def _make_jimu_parallel_grasp_place_candidate(
     grasp_candidate: dict,
     place_candidate: dict,
@@ -3534,30 +4080,23 @@ def _make_jimu_parallel_grasp_place_candidate(
         target_center = T_world_obj_target[:3, 3].astype(np.float32)
 
     yaw_delta_deg = _jimu_world_z_yaw_delta_deg(T_world_obj_grasp, T_world_obj_target)
-    T_world_tcp_release = (T_world_obj_target @ np.linalg.inv(T_tcp_obj).astype(np.float32)).astype(np.float32)
+    T_obj_tcp = np.linalg.inv(T_tcp_obj).astype(np.float32)
+    T_world_tcp_release = (T_world_obj_target @ T_obj_tcp).astype(np.float32)
     release_pose = direct._pose_from_world_matrix(T_world_tcp_release)
 
     place_mode = str(place_candidate.get("place_mode", "vertical_place") or "vertical_place")
-    try:
-        hover_pose = direct.build_hover_pose(
-            release_pose,
-            place_mode,
-            args,
-            rule,
-            candidate_pre_place_pose=None,
-        )
-    except Exception:
-        hover_height = float(max(getattr(args, "vertical_place_hover_height_m", 0.08), 0.0))
-        hover_pose = direct.targeted.base.make_pose_with_position(
-            release_pose,
-            (T_world_tcp_release[:3, 3] + np.asarray([0.0, 0.0, hover_height], dtype=np.float32)).astype(np.float32),
-        )
     hover_extra = float(max(place_candidate.get("hover_extra_height_m", 0.0) or 0.0, 0.0))
-    if hover_extra > 1e-6:
-        try:
-            hover_pose = direct._extend_hover_pose_along_release_approach(release_pose, hover_pose, hover_extra)
-        except Exception:
-            pass
+    hover_height = _jimu_pre_place_hover_height(place_mode, args, rule) + hover_extra
+    if hover_height > 1e-8:
+        T_world_obj_pre_place = T_world_obj_target.copy()
+        T_world_obj_pre_place[:3, 3] = (
+            T_world_obj_target[:3, 3] + np.asarray([0.0, 0.0, hover_height], dtype=np.float32)
+        ).astype(np.float32)
+        T_world_tcp_hover = (T_world_obj_pre_place @ T_obj_tcp).astype(np.float32)
+        hover_pose = direct._pose_from_world_matrix(T_world_tcp_hover)
+    else:
+        T_world_obj_pre_place = T_world_obj_target.copy()
+        hover_pose = release_pose
 
     predicted_obj = (T_world_tcp_release @ T_tcp_obj).astype(np.float32)
     item = dict(place_candidate)
@@ -3581,7 +4120,11 @@ def _make_jimu_parallel_grasp_place_candidate(
     item["jimu_parallel_release_mode"] = release_mode
     item["jimu_parallel_target_symmetry_deg"] = float(target_symmetry_deg)
     item["jimu_parallel_target_center"] = target_center.astype(float).tolist()
+    item["jimu_parallel_pre_place_mode"] = "object_world_z"
+    item["jimu_parallel_pre_place_hover_height_m"] = float(hover_height)
+    item["jimu_parallel_pre_place_obj_position"] = T_world_obj_pre_place[:3, 3].astype(float).tolist()
     item["jimu_parallel_release_tcp_position"] = T_world_tcp_release[:3, 3].astype(float).tolist()
+    item["jimu_parallel_pre_place_tcp_position"] = direct.targeted.base.flatten_np(hover_pose.p)[:3].astype(float).tolist()
     item["jimu_parallel_source_place_label"] = base_label
     item["jimu_parallel_source_grasp_label"] = str(grasp_candidate.get("label", ""))
     item["jimu_parallel_grasp_tcp_position"] = T_world_tcp_grasp[:3, 3].astype(float).tolist()
@@ -3696,6 +4239,105 @@ def _jimu_grasp_tilt_abs_deg(item: dict | None) -> float:
     if match:
         return abs(float(match.group(1)))
     return 0.0
+
+
+def _jimu_grasp_signed_tilt_deg(item: dict | None) -> float:
+    if not isinstance(item, dict):
+        return 0.0
+    for key in ("jimu_grasp_tilt_deg", "grasp_tilt_deg"):
+        if item.get(key) is not None:
+            try:
+                return float(item.get(key) or 0.0)
+            except Exception:
+                pass
+    label = str(item.get("label", "") or "").lower()
+    match = re.search(r"tilt_toward_robot_([+-]?\d+(?:\.\d+)?)deg", label)
+    if match:
+        return abs(float(match.group(1)))
+    match = re.search(r"tilt_away_robot_([+-]?\d+(?:\.\d+)?)deg", label)
+    if match:
+        return -abs(float(match.group(1)))
+    match = re.search(r"tilt_([+-]?\d+(?:\.\d+)?)deg", label)
+    if match:
+        return float(match.group(1))
+    return 0.0
+
+
+def _jimu_pregrasp_height_rank(item: dict | None, args) -> tuple[int, float]:
+    if not isinstance(item, dict):
+        return (99, 0.0)
+    try:
+        value = float(item.get("jimu_pregrasp_extra_world_z_m", 0.0) or 0.0)
+    except Exception:
+        value = 0.0
+    configured = [
+        float(getattr(args, "jimu_pregrasp_extra_world_z_m", 0.0) or 0.0),
+        float(getattr(args, "jimu_pregrasp_fallback_world_z_m", 0.0) or 0.0),
+        float(getattr(args, "jimu_pregrasp_emergency_world_z_m", 0.0) or 0.0),
+        float(getattr(args, "jimu_pregrasp_legacy_low_world_z_m", 0.0) or 0.0),
+        float(getattr(args, "jimu_roof_pregrasp_extra_world_z_m", 0.0) or 0.0),
+        float(getattr(args, "jimu_roof_pregrasp_fallback_world_z_m", 0.0) or 0.0),
+        float(getattr(args, "jimu_roof_pregrasp_emergency_world_z_m", 0.0) or 0.0),
+        float(getattr(args, "jimu_roof_pregrasp_legacy_low_world_z_m", 0.0) or 0.0),
+        float(getattr(args, "jimu_roof_pregrasp_safety_low_world_z_m", 0.0) or 0.0),
+    ]
+    seen: set[int] = set()
+    ordered: list[float] = []
+    for candidate in configured:
+        if candidate <= 1.0e-6:
+            continue
+        bucket = int(round(candidate * 1000000.0))
+        if bucket in seen:
+            continue
+        seen.add(bucket)
+        ordered.append(candidate)
+    for idx, candidate in enumerate(ordered):
+        if abs(value - candidate) <= 1.0e-5:
+            return (idx, value)
+    return (len(ordered), value)
+
+
+def raw_grasp_relation_sort_key_jimu(item, args, rule, source_name: str | None) -> tuple:
+    original = _ORIGINAL_RAW_GRASP_RELATION_SORT_KEY
+    source = direct.curobo_wrapper.normalize_object_name(source_name)
+    if source not in set(JIMU_PICK_ROLES):
+        if callable(original):
+            return original(item, args, rule, source_name)
+        return ("label", "" if item is None else str(item.get("label", "") or ""))
+
+    label = "" if item is None else str(item.get("label", "") or "")
+    label_l = label.lower()
+    signed_tilt = _jimu_grasp_signed_tilt_deg(item)
+    configured_tilts = _jimu_float_list_from_args(
+        args,
+        "direct_grasp_tilt_toward_robot_deg",
+        [],
+    )
+    tilt_rank = 0
+    if abs(signed_tilt) > 1.0e-6:
+        tilt_rank = len(configured_tilts) + 1
+        for idx, value in enumerate(configured_tilts):
+            if abs(float(value) - float(signed_tilt)) <= 1.0:
+                tilt_rank = idx + 1
+                break
+    height_rank, height_value = _jimu_pregrasp_height_rank(item, args)
+    axis_shift = abs(float((item or {}).get("grasp_axis_shift_m", 0.0) or 0.0))
+    z_lift = max(float((item or {}).get("grasp_z_lift_m", 0.0) or 0.0), 0.0)
+    roll_deg = abs(float((item or {}).get("grasp_approach_roll_deg", 0.0) or 0.0))
+    place_first_rank = 0 if bool((item or {}).get("place_first", False)) or "place_first" in label_l else 1
+    # For Jimu, the 16 relation IK slots should cover relation diversity first:
+    # one pregrasp height with direct + all signed tilts.  Height fallbacks are
+    # useful, but they should not evict large-tilt relations from the first batch.
+    return (
+        place_first_rank,
+        height_rank,
+        tilt_rank,
+        axis_shift,
+        z_lift,
+        roll_deg,
+        height_value,
+        label,
+    )
 
 
 def _jimu_float_list_from_args(args, name: str, default, *, min_value: float | None = None) -> list[float]:
@@ -3845,6 +4487,12 @@ def fast_chain_relation_match_key_jimu(item: dict | None, source_name: str | Non
         if original is None:
             return ("label", "" if item is None else str(item.get("label", "") or ""))
         return original(item, source_name)
+    if isinstance(item, dict) and item.get("_jimu_parallel_relation_id") is not None:
+        # Jimu parallel grasp/place candidates are generated with a grasp-time
+        # T_tcp_obj.  Matching by abs(tilt) can cross-pair a +tilt grasp with the
+        # -tilt release TCP, so keep the fast-chain relation tied to the exact
+        # grasp candidate that produced the place pose.
+        return ("jimu_parallel_relation_id", int(item.get("_jimu_parallel_relation_id")))
     label = "" if item is None else str(item.get("label", "") or "")
     return ("jimu_tilt_abs_label", _jimu_tilt_abs_relation_label(label))
 
@@ -3916,6 +4564,7 @@ def fast_chain_rank_paired_relation_candidates_jimu(
     missing_relation_count = 0
     skipped_grasp_chain_count = 0
     for grasp_candidate in list(grasp_relation_candidates or [])[:relation_slots]:
+        grasp_candidate["_jimu_parallel_relation_id"] = int(id(grasp_candidate))
         if grasp_candidate.get("T_tcp_obj") is None:
             missing_relation_count += 1
             continue
@@ -3955,7 +4604,24 @@ def fast_chain_rank_paired_relation_candidates_jimu(
                     target_symmetry_deg=float(symmetry_deg),
                 )
                 if parallel_candidate is not None:
-                    parallel_candidates.append(parallel_candidate)
+                    try:
+                        T_tcp_obj = np.asarray(grasp_candidate.get("T_tcp_obj"), dtype=np.float32).reshape(4, 4)
+                        T_obj_tcp = np.linalg.inv(T_tcp_obj).astype(np.float32)
+                        T_world_obj_target = np.asarray(
+                            parallel_candidate.get("T_world_obj_desired"),
+                            dtype=np.float32,
+                        ).reshape(4, 4)
+                        parallel_candidates.extend(
+                            _jimu_parallel_final_contact_fallback_candidates(
+                                parallel_candidate,
+                                T_world_obj_target,
+                                T_obj_tcp,
+                                args,
+                            )
+                        )
+                    except Exception as exc:
+                        print(f"[jimu place] failed to expand final-contact fallbacks: {exc}")
+                        parallel_candidates.append(parallel_candidate)
         if not parallel_candidates:
             missing_place_count += 1
             continue
@@ -3979,6 +4645,7 @@ def fast_chain_rank_paired_relation_candidates_jimu(
         "missing_relation_count": int(missing_relation_count),
         "skipped_grasp_chain_count": int(skipped_grasp_chain_count),
         "paired_jimu_parallel_grasp_place": True,
+        "paired_jimu_parallel_exact_relation_match": True,
         "paired_jimu_parallel_candidate_count": int(len(records)),
         "paired_place_expansion_kind": "jimu_parallel_grasp",
     }
@@ -3987,7 +4654,8 @@ def fast_chain_rank_paired_relation_candidates_jimu(
 
     print(
         f"[winner_chain] {source} jimu parallel-grasp place IK: "
-        f"{len(records)} relation-place candidate(s); target object pose with 0/180 symmetry"
+        f"{len(records)} relation-place candidate(s); exact grasp/T_tcp_obj matching; "
+        "target object pose with 0/180 symmetry"
     )
     pair_records, paired_debug = direct._fast_chain_evaluate_paired_relation_records(
         planner,
@@ -4005,6 +4673,7 @@ def fast_chain_rank_paired_relation_candidates_jimu(
     paired_debug["missing_relation_count"] = int(missing_relation_count)
     paired_debug["skipped_grasp_chain_count"] = int(skipped_grasp_chain_count)
     paired_debug["paired_jimu_parallel_grasp_place"] = True
+    paired_debug["paired_jimu_parallel_exact_relation_match"] = True
     paired_debug["paired_jimu_parallel_candidate_count"] = int(len(records))
     paired_debug["paired_place_expansion_kind"] = "jimu_parallel_grasp"
     tilted_symmetry_bias = 0
@@ -4013,6 +4682,11 @@ def fast_chain_rank_paired_relation_candidates_jimu(
     tilt_penalty_per_deg = float(max(getattr(args, "jimu_grasp_tilt_score_penalty_per_deg", 0.25) or 0.0, 0.0))
     return_start_penalty_count = 0
     max_return_start_penalty = 0.0
+    route_rank_penalty_count = 0
+    max_route_rank_penalty = 0.0
+    route_rank_penalty_weight = float(
+        max(getattr(args, "jimu_final_contact_fallback_rank_score_penalty", 100.0) or 0.0, 0.0)
+    )
     symmetry_bias = float(getattr(args, "jimu_tilted_symmetry_score_bias", 0.75) or 0.0)
     for rec in pair_records:
         place_candidate = rec.get("place_candidate", {})
@@ -4043,6 +4717,14 @@ def fast_chain_rank_paired_relation_candidates_jimu(
             rec["score"] = float(rec.get("score", 0.0)) + float(return_penalty)
             return_start_penalty_count += 1
             max_return_start_penalty = max(max_return_start_penalty, float(return_penalty))
+        route_rank = _jimu_final_contact_route_rank(place_candidate)
+        place_candidate["jimu_final_contact_fallback_rank"] = int(route_rank)
+        if route_rank_penalty_weight > 0.0 and route_rank > 0:
+            route_penalty = route_rank_penalty_weight * float(route_rank)
+            rec["score"] = float(rec.get("score", 0.0)) + float(route_penalty)
+            place_candidate["jimu_final_contact_fallback_rank_score_penalty"] = float(route_penalty)
+            route_rank_penalty_count += 1
+            max_route_rank_penalty = max(max_route_rank_penalty, float(route_penalty))
     score_preview = []
     for rec in sorted(pair_records, key=lambda item: float(item.get("score", 0.0)))[:8]:
         grasp_candidate = rec.get("grasp_candidate", {})
@@ -4052,6 +4734,7 @@ def fast_chain_rank_paired_relation_candidates_jimu(
                 "score": float(rec.get("score", 0.0)),
                 "grasp": str(grasp_candidate.get("label", "")),
                 "tilt_abs_deg": float(_jimu_grasp_tilt_abs_deg(grasp_candidate)),
+                "route_rank": int(_jimu_final_contact_route_rank(place_candidate)),
                 "place": str(place_candidate.get("label", "")),
             }
         )
@@ -4063,6 +4746,9 @@ def fast_chain_rank_paired_relation_candidates_jimu(
     paired_debug["paired_jimu_score_preview"] = score_preview
     paired_debug["paired_jimu_return_to_start_penalty_count"] = int(return_start_penalty_count)
     paired_debug["paired_jimu_return_to_start_penalty_max"] = float(max_return_start_penalty)
+    paired_debug["paired_jimu_final_contact_route_rank_penalty_weight"] = float(route_rank_penalty_weight)
+    paired_debug["paired_jimu_final_contact_route_rank_penalty_count"] = int(route_rank_penalty_count)
+    paired_debug["paired_jimu_final_contact_route_rank_penalty_max"] = float(max_route_rank_penalty)
     return pair_records, paired_debug
 
 
@@ -4110,6 +4796,19 @@ def _record_jimu_motiongen_result(planner, kind: str, result) -> None:
             if isinstance(diag, dict):
                 event["fallback_valid_after_removing"] = list(diag.get("valid_after_removing") or [])[:8]
                 event["fallback_world_obstacle_names"] = list(diag.get("world_obstacle_names") or [])[:16]
+        if isinstance(debug, dict):
+            goal_diag = debug.get("jimu_goal_collision_diag")
+            if isinstance(goal_diag, dict):
+                event["goal_collision_diag"] = {
+                    "status": str(goal_diag.get("status", "") or ""),
+                    "valid_after_removing": list(goal_diag.get("valid_after_removing") or [])[:8],
+                    "attached_disabled": goal_diag.get("attached_disabled_diag"),
+                    "attached_world_obstacle_contacts": list(goal_diag.get("attached_world_obstacle_contacts") or [])[:5],
+                    "robot_world_obstacle_contacts": list(goal_diag.get("robot_world_obstacle_contacts") or [])[:5],
+                    "robot_internal_cube_contacts": list(goal_diag.get("robot_internal_cube_contacts") or [])[:5],
+                    "attached_robot_sphere_contacts": list(goal_diag.get("attached_robot_sphere_contacts") or [])[:5],
+                    "curobo_raw_world_collision": goal_diag.get("curobo_raw_world_collision"),
+                }
         events.append(event)
 
 
@@ -4451,6 +5150,75 @@ def _jimu_start_collision_diagnosis(planner, args_ns, candidates, label: str, di
     return result
 
 
+def _jimu_print_q_collision_diag(label: str, diag: dict, *, phase: str) -> None:
+    if not isinstance(diag, dict):
+        return
+    print(
+        f"[jimu-curobo-diag] {label or 'unknown'} {phase} collision diag: "
+        f"status={diag.get('status')} "
+        f"valid_if_remove={diag.get('valid_after_removing')} "
+        f"attached_disabled={diag.get('attached_disabled_diag')}"
+    )
+
+    def _print_contacts(key: str, fields: tuple[str, ...], limit: int = 5) -> None:
+        contacts = list(diag.get(key) or [])
+        if not contacts:
+            return
+        print(f"[jimu-curobo-diag]   {phase} {key}:")
+        for item in contacts[:limit]:
+            if not isinstance(item, dict):
+                continue
+            if item.get("error"):
+                print(f"[jimu-curobo-diag]     error={item.get('error')}")
+                continue
+            clearance = item.get("clearance_m")
+            try:
+                clearance_text = f"{float(clearance) * 1000.0:.2f}mm"
+            except Exception:
+                clearance_text = str(clearance)
+            parts = [f"{field}={item.get(field)}" for field in fields if field in item]
+            print(f"[jimu-curobo-diag]     clearance={clearance_text} " + " ".join(parts))
+
+    _print_contacts("attached_world_obstacle_contacts", ("attached_sphere", "obstacle"))
+    _print_contacts("robot_world_obstacle_contacts", ("robot_link", "robot_sphere", "obstacle"))
+    _print_contacts("robot_internal_cube_contacts", ("robot_link", "robot_sphere", "obstacle", "obstacle_idx"))
+    _print_contacts("attached_robot_sphere_contacts", ("attached_sphere", "robot_link", "robot_sphere"))
+
+    raw = diag.get("curobo_raw_world_collision")
+    if isinstance(raw, dict):
+        nonzero = list(raw.get("nonzero") or [])
+        if nonzero:
+            print(f"[jimu-curobo-diag]   {phase} raw cuRobo nonzero spheres:")
+            for item in nonzero[:5]:
+                print(
+                    f"[jimu-curobo-diag]     link={item.get('link')} "
+                    f"sphere={item.get('sphere')} value={item.get('value')} "
+                    f"radius={item.get('radius')}"
+                )
+
+
+def _jimu_goal_collision_diagnosis(planner, args_ns, q_goal, label: str, disabled_world_collision_links):
+    if planner is None or q_goal is None:
+        return None
+    try:
+        q = np.asarray(q_goal, dtype=np.float32).reshape(-1)[:7]
+    except Exception:
+        return None
+    if q.size != 7 or not np.all(np.isfinite(q)):
+        return None
+    diag = _jimu_start_collision_diagnosis(
+        planner,
+        args_ns,
+        [{"start_q": q, "label": f"{label}_goal"}],
+        label,
+        disabled_world_collision_links,
+    )
+    if isinstance(diag, dict):
+        diag["diagnosed_q_role"] = "goal"
+        _jimu_print_q_collision_diag(label, diag, phase="goal")
+    return diag
+
+
 def profile_plan_to_joint_state_jimu(planner, *args, **kwargs):
     original = _ORIGINAL_PROFILE_PLAN_TO_JOINT_STATE
     if original is None:
@@ -4610,7 +5378,21 @@ def profile_plan_batch_start_goal_pairs_jimu(planner, *args, **kwargs):
         results = planner.plan_batch_start_goal_pairs(*args, **kwargs)
     else:
         results = original(planner, *args, **kwargs)
-    if _jimu_linear_transport_fallback_allowed(planner) and len(args) >= 2:
+    label = _jimu_motiongen_capture_label(planner)
+    args_ns = _jimu_motiongen_capture_args(planner)
+    disabled_links = getattr(planner, "_jimu_motiongen_capture_disabled_links", None)
+    fallback_allowed = _jimu_linear_transport_fallback_allowed(planner)
+    failed_statuses = [str(getattr(result, "status", "") or "") for result in list(results or []) if not bool(getattr(result, "success", False))]
+    need_goal_collision_diag = (
+        "joint_transport_hover_pairs" in label
+        and any(
+            "INVALID_START_STATE_WORLD_COLLISION" in status
+            or "TRAJOPT_FAIL" in status
+            or "IK_FAIL" in status
+            for status in failed_statuses
+        )
+    )
+    if (fallback_allowed or need_goal_collision_diag) and len(args) >= 2:
         start_qs = list(args[0] or [])
         goal_poses = list(args[1] or [])
         if start_qs and goal_poses:
@@ -4625,6 +5407,8 @@ def profile_plan_batch_start_goal_pairs_jimu(planner, *args, **kwargs):
                 print(f"[jimu-curobo] linear transport fallback could not solve hover IK batch: {exc}")
                 ik_results = []
             patched = []
+            goal_diag_count = 0
+            goal_diag_limit = int(getattr(args_ns, "curobo_transport_failure_diag_limit", 4) if args_ns is not None else 4)
             for idx, result in enumerate(list(results or [])):
                 if bool(getattr(result, "success", False)) or idx >= len(ik_results):
                     patched.append(result)
@@ -4633,7 +5417,39 @@ def profile_plan_batch_start_goal_pairs_jimu(planner, *args, **kwargs):
                 if not bool(getattr(ik_result, "success", False)) or getattr(ik_result, "goal_joint", None) is None:
                     patched.append(result)
                     continue
-                patched.append(_jimu_make_linear_transport_result(planner, result, start_qs[idx], ik_result.goal_joint))
+                goal_diag = None
+                if need_goal_collision_diag and goal_diag_count < max(1, goal_diag_limit):
+                    try:
+                        world_diag = planner.diagnose_start_state_world_collision(ik_result.goal_joint)
+                        if (
+                            not bool(world_diag.get("valid", False))
+                            and str(world_diag.get("status", "")) == "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION"
+                        ):
+                            goal_diag_count += 1
+                            goal_diag = _jimu_goal_collision_diagnosis(
+                                planner,
+                                args_ns,
+                                ik_result.goal_joint,
+                                f"{label}_idx{idx}",
+                                disabled_links,
+                            )
+                    except Exception as exc:
+                        goal_diag = {"error": f"{type(exc).__name__}: {exc}"}
+                if fallback_allowed:
+                    patched_result = _jimu_make_linear_transport_result(planner, result, start_qs[idx], ik_result.goal_joint)
+                else:
+                    patched_result = result
+                if isinstance(goal_diag, dict):
+                    debug = getattr(patched_result, "debug", None)
+                    if not isinstance(debug, dict):
+                        debug = {}
+                        try:
+                            patched_result.debug = debug
+                        except Exception:
+                            debug = None
+                    if isinstance(debug, dict):
+                        debug["jimu_goal_collision_diag"] = goal_diag
+                patched.append(patched_result)
             results = patched
     _record_jimu_motiongen_results(planner, "plan_batch_start_goal_pairs", results)
     return results
@@ -5385,15 +6201,7 @@ def build_hover_pose_jimu(release_pose, place_mode: str, args, rule, *, candidat
     original = _ORIGINAL_BUILD_HOVER_POSE
     source = direct.curobo_wrapper.normalize_object_name(getattr(args, "object_name", None))
     if source in set(JIMU_PICK_ROLES) and bool(getattr(args, "jimu_lift_world_z_only", True)):
-        place_mode_text = str(place_mode or "")
-        if place_mode_text == "drop_place":
-            return release_pose
-        if place_mode_text == "vertical_place":
-            hover_height = float(max(getattr(args, "vertical_place_hover_height_m", 0.040), 0.0))
-        elif place_mode_text == "surface_place":
-            hover_height = float(max(getattr(args, "surface_place_hover_height_m", 0.050), 0.0))
-        else:
-            hover_height = float(max(getattr(rule, "hover_height", 0.05), 0.0))
+        hover_height = _jimu_pre_place_hover_height(str(place_mode or ""), args, rule)
         if hover_height <= 1e-8:
             return release_pose
         print(f"[jimu-lift] build_hover_pose: using world-Z hover for {source} ({hover_height:.3f}m)")
@@ -5567,6 +6375,8 @@ def _jimu_should_retry_next_source_after_failure(args: argparse.Namespace) -> bo
         return False
     if not bool(getattr(args, "jimu_retry_next_tray_source_on_grasp_failure", True)):
         return False
+    if bool(getattr(args, "_episode_place_released", False)) or bool(getattr(args, "_episode_place_completed", False)):
+        return False
     if bool(getattr(args, "_episode_object_grasped", False)):
         return False
     if bool(getattr(args, "_episode_real_motion_started", False)):
@@ -5574,6 +6384,8 @@ def _jimu_should_retry_next_source_after_failure(args: argparse.Namespace) -> bo
     failure_kind = str(getattr(args, "_episode_failure_kind", "") or "")
     failure_phase = str(getattr(args, "_episode_failure_phase", "") or "")
     if failure_kind == "empty_grasp_after_lift":
+        return False
+    if any(token in failure_phase for token in ("place_open", "post_place", "return_to_cycle_start")):
         return False
     return True
 
@@ -5883,7 +6695,15 @@ def realman_set_gripper_jimu(self, gripper_pos: float, repeats: int | None = Non
             "[jimu gripper] grasp approach uses partial open to avoid tray/neighbor collision: "
             f"{float(gripper_pos):.3f} -> {partial:.3f}"
         )
-        return _ORIGINAL_REALMAN_SET_GRIPPER(self, partial, repeats=repeats, hz=hz)
+        result = _ORIGINAL_REALMAN_SET_GRIPPER(self, partial, repeats=repeats, hz=hz)
+        _jimu_record_gripper_segment(
+            args,
+            label=stage or "set_gripper_pregrasp_partial",
+            gripper_pos=partial,
+            repeats=repeats,
+            hz=hz,
+        )
+        return result
     if stage == "place_open_gripper" and _jimu_partial_release_enabled(args):
         full_open = float(getattr(args, "real_gripper_open", 0.0))
         if abs(float(gripper_pos) - full_open) <= 1e-6:
@@ -5893,7 +6713,15 @@ def realman_set_gripper_jimu(self, gripper_pos: float, repeats: int | None = Non
                 f"{full_open:.3f} -> {partial:.3f}"
             )
             setattr(args, "_jimu_release_partial_open_used", True)
-            return _ORIGINAL_REALMAN_SET_GRIPPER(self, partial, repeats=repeats, hz=hz)
+            result = _ORIGINAL_REALMAN_SET_GRIPPER(self, partial, repeats=repeats, hz=hz)
+            _jimu_record_gripper_segment(
+                args,
+                label=stage or "place_open_gripper_partial",
+                gripper_pos=partial,
+                repeats=repeats,
+                hz=hz,
+            )
+            return result
     if (
         not stage
         and _jimu_should_keep_partial_open_between_cycles(args)
@@ -5905,8 +6733,24 @@ def realman_set_gripper_jimu(self, gripper_pos: float, repeats: int | None = Non
             "[jimu gripper] cycle/reset idle full-open request replaced with pregrasp partial open: "
             f"{float(gripper_pos):.3f} -> {partial:.3f}"
         )
-        return _ORIGINAL_REALMAN_SET_GRIPPER(self, partial, repeats=repeats, hz=hz)
-    return _ORIGINAL_REALMAN_SET_GRIPPER(self, gripper_pos, repeats=repeats, hz=hz)
+        result = _ORIGINAL_REALMAN_SET_GRIPPER(self, partial, repeats=repeats, hz=hz)
+        _jimu_record_gripper_segment(
+            args,
+            label=stage or "idle_pregrasp_partial",
+            gripper_pos=partial,
+            repeats=repeats,
+            hz=hz,
+        )
+        return result
+    result = _ORIGINAL_REALMAN_SET_GRIPPER(self, gripper_pos, repeats=repeats, hz=hz)
+    _jimu_record_gripper_segment(
+        args,
+        label=stage or "set_gripper",
+        gripper_pos=float(gripper_pos),
+        repeats=repeats,
+        hz=hz,
+    )
+    return result
 
 
 def sync_demo_gripper_state_jimu(demo, closed: bool, steps: int = 3):
@@ -6171,6 +7015,11 @@ def _jimu_execute_pose_path_stage_base(
     if _ORIGINAL_EXECUTE_POSE_PATH_STAGE is None:
         raise RuntimeError("Jimu execute_pose_path_stage wrapper was installed before original function was captured")
     q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    q_start_for_record = None
+    try:
+        q_start_for_record = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+    except Exception:
+        q_start_for_record = None
     if _jimu_render_dry_run_motion_enabled(args, real_exec):
         if not q_path:
             q_current = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
@@ -6199,6 +7048,18 @@ def _jimu_execute_pose_path_stage_base(
             args,
             use_attach=use_attach,
         )
+        _jimu_record_path_segment(
+            args,
+            segment_type="pose_path",
+            label=str(label),
+            q_start=q_start_for_record if q_start_for_record is not None else q_start,
+            q_path=q_path,
+            gripper_pos=gripper_pos,
+            use_attach=use_attach,
+            allow_start_in_collision=allow_start_in_collision,
+            ok=True,
+            q_sent=q_path[-1],
+        )
         return True, q_path[-1]
     if _jimu_dry_run_motion_window_enabled(args, real_exec):
         if not q_path:
@@ -6207,8 +7068,20 @@ def _jimu_execute_pose_path_stage_base(
             return True, q_current
         q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
         _jimu_play_dry_run_motion_window(demo, str(label), q_start, q_path, args, use_attach=use_attach)
+        _jimu_record_path_segment(
+            args,
+            segment_type="pose_path",
+            label=str(label),
+            q_start=q_start_for_record if q_start_for_record is not None else q_start,
+            q_path=q_path,
+            gripper_pos=gripper_pos,
+            use_attach=use_attach,
+            allow_start_in_collision=allow_start_in_collision,
+            ok=True,
+            q_sent=q_path[-1],
+        )
         return True, q_path[-1]
-    return _ORIGINAL_EXECUTE_POSE_PATH_STAGE(
+    ok, q_sent = _ORIGINAL_EXECUTE_POSE_PATH_STAGE(
         demo,
         bridge_mod,
         real_exec,
@@ -6221,6 +7094,19 @@ def _jimu_execute_pose_path_stage_base(
         allow_start_in_collision=allow_start_in_collision,
         skip_confirmation=skip_confirmation,
     )
+    _jimu_record_path_segment(
+        args,
+        segment_type="pose_path",
+        label=str(label),
+        q_start=q_start_for_record,
+        q_path=q_path,
+        gripper_pos=gripper_pos,
+        use_attach=use_attach,
+        allow_start_in_collision=allow_start_in_collision,
+        ok=bool(ok),
+        q_sent=q_sent,
+    )
+    return ok, q_sent
 
 
 def execute_pose_path_stage_jimu(
@@ -6275,6 +7161,13 @@ def execute_pose_path_stage_jimu(
                 print("[jimu gripper] real gripper pre-set to partial open before grasp motion")
             except Exception as exc:
                 print(f"[warn] failed to pre-set real gripper partial open before grasp motion: {exc}")
+        _jimu_record_gripper_segment(
+            args,
+            label=f"{label_text}_pregrasp_partial",
+            gripper_pos=partial,
+            repeats=int(getattr(args, "real_gripper_command_repeats", 2)),
+            hz=float(getattr(args, "real_gripper_command_hz", 10.0)),
+        )
     if label_text != "post_place_clearance" and _jimu_should_keep_partial_open_after_release(label_text, gripper_pos, args):
         partial = _jimu_partial_release_gripper_value(args)
         sim_partial = _jimu_partial_release_sim_gripper_value(args)
@@ -6354,6 +7247,13 @@ def execute_pose_path_stage_jimu(
                 sync_fn = getattr(direct.targeted.base, "sync_demo_gripper_state", None)
                 if callable(sync_fn):
                     sync_fn(demo, closed=False, steps=max(int(getattr(args, "sim_gripper_sync_min_steps", 8)), 1))
+            _jimu_record_gripper_segment(
+                args,
+                label=f"{label_text}_full_open_after_clearance",
+                gripper_pos=full_open,
+                repeats=int(getattr(args, "real_gripper_command_repeats", 2)),
+                hz=float(getattr(args, "real_gripper_command_hz", 10.0)),
+            )
             direct._record_profile(
                 args,
                 "jimu_full_open_after_post_place_clearance",
@@ -6392,6 +7292,11 @@ def execute_joint_path_stage_jimu(
     if _ORIGINAL_EXECUTE_JOINT_PATH_STAGE is None:
         raise RuntimeError("Jimu execute_joint_path_stage wrapper was installed before original function was captured")
     q_path = [np.asarray(q, dtype=np.float32).reshape(-1)[:7] for q in list(q_path or [])]
+    q_start_for_record = None
+    try:
+        q_start_for_record = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
+    except Exception:
+        q_start_for_record = None
     if _jimu_should_keep_partial_open_after_release(label, gripper_pos, args):
         partial = _jimu_partial_release_gripper_value(args)
         sim_partial = _jimu_partial_release_sim_gripper_value(args)
@@ -6437,6 +7342,18 @@ def execute_joint_path_stage_jimu(
             args,
             use_attach=use_attach,
         )
+        _jimu_record_path_segment(
+            args,
+            segment_type="joint_path",
+            label=str(label),
+            q_start=q_start_for_record if q_start_for_record is not None else q_start,
+            q_path=q_path,
+            gripper_pos=gripper_pos,
+            use_attach=use_attach,
+            allow_start_in_collision=allow_start_in_collision,
+            ok=True,
+            q_sent=q_path[-1],
+        )
         return True, q_path[-1]
     if _jimu_dry_run_motion_window_enabled(args, real_exec):
         if not q_path:
@@ -6445,8 +7362,20 @@ def execute_joint_path_stage_jimu(
             return True, q_current
         q_start = np.asarray(demo.current_arm_qpos(), dtype=np.float32).reshape(-1)[:7]
         _jimu_play_dry_run_motion_window(demo, str(label), q_start, q_path, args, use_attach=use_attach)
+        _jimu_record_path_segment(
+            args,
+            segment_type="joint_path",
+            label=str(label),
+            q_start=q_start_for_record if q_start_for_record is not None else q_start,
+            q_path=q_path,
+            gripper_pos=gripper_pos,
+            use_attach=use_attach,
+            allow_start_in_collision=allow_start_in_collision,
+            ok=True,
+            q_sent=q_path[-1],
+        )
         return True, q_path[-1]
-    return _ORIGINAL_EXECUTE_JOINT_PATH_STAGE(
+    ok, q_sent = _ORIGINAL_EXECUTE_JOINT_PATH_STAGE(
         demo,
         bridge_mod,
         real_exec,
@@ -6457,6 +7386,19 @@ def execute_joint_path_stage_jimu(
         use_attach=use_attach,
         allow_start_in_collision=allow_start_in_collision,
     )
+    _jimu_record_path_segment(
+        args,
+        segment_type="joint_path",
+        label=str(label),
+        q_start=q_start_for_record,
+        q_path=q_path,
+        gripper_pos=gripper_pos,
+        use_attach=use_attach,
+        allow_start_in_collision=allow_start_in_collision,
+        ok=bool(ok),
+        q_sent=q_sent,
+    )
+    return ok, q_sent
 
 
 def build_arg_parser():
@@ -6476,6 +7418,7 @@ def build_arg_parser():
         target_selection_order="cycle",
         repeat_count=len(JIMU_PICK_ROLES),
         skip_return_to_cycle_start_after_final_place=False,
+        align_real_to_sim_start_before_cycle=True,
         next_cycle_plan_prefetch=True,
         next_cycle_prefetch_low_priority=True,
         lerobot_sim2real_root=str(PORTABLE_LEROBOT_SIM2REAL_ROOT),
@@ -6511,6 +7454,10 @@ def build_arg_parser():
         fast_chain_top_pairs=16,
         fast_chain_place_rank_grasp_limit=16,
         fixed_tabletop_fast_chain_place_rank_grasp_limit=16,
+        sam6d_prefetch_fast_chain_top_pairs=16,
+        sam6d_prefetch_fast_chain_place_rank_grasp_limit=16,
+        sam6d_prefetch_max_grasp_candidates=16,
+        sam6d_prefetch_max_pre_place_candidates=16,
         joint_search_max_grasp_candidates=16,
         joint_search_validate_final_contact=True,
         joint_search_start_collision_lift_m=0.10,
@@ -6520,6 +7467,7 @@ def build_arg_parser():
         strict_final_contact_waypoint_pos_tol_m=0.008,
         curobo_approach_metric_locked_axis_tol_m=0.008,
         force_replan_post_place_clearance=False,
+        jimu_force_placed_scene_cache_to_target=True,
         # Jimu blocks are thin and densely staged in the tray.  Use a sparse
         # signed tilt set: positive angles lean toward the robot, negative
         # angles lean away from the robot.  This keeps the first layer in one
@@ -6551,6 +7499,20 @@ def build_arg_parser():
         transport_prefilter_q_goal_timeout=2.0,
         transport_prefilter_q_goal_num_trajopt_seeds=1,
         vertical_place_hover_height_m=0.08,
+        jimu_final_contact_fallbacks=True,
+        jimu_final_contact_fallbacks_for_roof=False,
+        jimu_final_contact_low_hover_fallback=True,
+        jimu_final_contact_side_push_fallback=True,
+        jimu_final_contact_low_hover_height_m=0.02,
+        jimu_final_contact_side_push_m=0.02,
+        jimu_final_contact_fallback_min_target_z_m=0.0,
+        jimu_final_contact_fallback_rank_score_penalty=100.0,
+        jimu_post_place_retreat_m=0.0,
+        jimu_post_place_retreat_candidate_count=16,
+        jimu_post_place_retreat_lateral_step_m=0.006,
+        jimu_post_place_retreat_forward_extra_m=0.010,
+        jimu_post_place_retreat_up_ratio=1.0,
+        jimu_post_place_free_motiongen_fallback=False,
         final_contact_clearance_m=0.0,
         planner_virtual_top_wall_z=1.5,
     )
@@ -6850,6 +7812,65 @@ def build_arg_parser():
     parser.add_argument("--jimu-wall-release-retreat-height", type=float, default=0.08)
     parser.add_argument("--jimu-second-layer-hover-height", type=float, default=0.08)
     parser.add_argument("--jimu-second-layer-release-retreat-height", type=float, default=0.08)
+    parser.add_argument("--jimu-final-contact-fallbacks", dest="jimu_final_contact_fallbacks", action="store_true", default=True)
+    parser.add_argument("--no-jimu-final-contact-fallbacks", dest="jimu_final_contact_fallbacks", action="store_false")
+    parser.add_argument(
+        "--jimu-final-contact-fallbacks-for-roof",
+        dest="jimu_final_contact_fallbacks_for_roof",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--jimu-final-contact-low-hover-fallback",
+        dest="jimu_final_contact_low_hover_fallback",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument("--no-jimu-final-contact-low-hover-fallback", dest="jimu_final_contact_low_hover_fallback", action="store_false")
+    parser.add_argument(
+        "--jimu-final-contact-side-push-fallback",
+        dest="jimu_final_contact_side_push_fallback",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument("--no-jimu-final-contact-side-push-fallback", dest="jimu_final_contact_side_push_fallback", action="store_false")
+    parser.add_argument("--jimu-final-contact-low-hover-height-m", type=float, default=0.02)
+    parser.add_argument("--jimu-final-contact-side-push-m", type=float, default=0.02)
+    parser.add_argument("--jimu-final-contact-fallback-min-target-z-m", type=float, default=0.0)
+    parser.add_argument(
+        "--jimu-final-contact-fallback-rank-score-penalty",
+        type=float,
+        default=100.0,
+        help=(
+            "Score penalty per Jimu final-contact fallback rank. "
+            "Rank 0 is the high world-Z vertical preplace, rank 1 is low-Z vertical, "
+            "and rank 2/3 are side-high fallbacks."
+        ),
+    )
+    parser.add_argument(
+        "--jimu-post-place-retreat-m",
+        type=float,
+        default=0.0,
+        help=(
+            "Override the generic Jimu post-place retreat distance. 0 keeps per-role defaults "
+            "(wall/second-layer release retreat height, roof post-place retreat distance)."
+        ),
+    )
+    parser.add_argument("--jimu-post-place-retreat-candidate-count", type=int, default=16)
+    parser.add_argument("--jimu-post-place-retreat-lateral-step-m", type=float, default=0.006)
+    parser.add_argument("--jimu-post-place-retreat-forward-extra-m", type=float, default=0.010)
+    parser.add_argument(
+        "--jimu-post-place-retreat-up-ratio",
+        type=float,
+        default=1.0,
+        help="World-Z lift component for generic Jimu post-place fallback routes, as ratio * retreat distance.",
+    )
+    parser.add_argument(
+        "--jimu-post-place-free-motiongen-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow ordinary unconstrained MotionGen after constrained/endpoint-IK post-place retreat routes fail.",
+    )
     parser.add_argument(
         "--jimu-second-layer-z-extra",
         type=float,
@@ -7330,6 +8351,28 @@ def build_arg_parser():
         default=True,
     )
     parser.add_argument("--no-jimu-print-role-assignment", dest="jimu_print_role_assignment", action="store_false")
+    parser.add_argument(
+        "--jimu-record-trajectory",
+        type=str,
+        default="",
+        metavar="PATH_OR_AUTO",
+        help=(
+            "Record the final executed Jimu joint/gripper trajectory to JSON. "
+            "Use 'auto' for jimu_trajectory_records/<timestamp>.json, or pass a concrete .json path."
+        ),
+    )
+    parser.add_argument(
+        "--jimu-record-trajectory-dir",
+        type=str,
+        default=str(SCRIPT_DIR / "jimu_trajectory_records"),
+        help="Output directory used when --jimu-record-trajectory is auto/true.",
+    )
+    parser.add_argument(
+        "--jimu-record-trajectory-name",
+        type=str,
+        default="",
+        help="Optional filename stem used with --jimu-record-trajectory auto.",
+    )
     return parser
 
 
@@ -7553,6 +8596,15 @@ def parse_args():
         f"virtual_top_wall_z={float(args.planner_virtual_top_wall_z):.3f}"
     )
     print(
+        "[jimu config] final-contact fallbacks="
+        f"{bool(getattr(args, 'jimu_final_contact_fallbacks', True))}, "
+        f"low_z={float(getattr(args, 'jimu_final_contact_low_hover_height_m', 0.0)):.3f}m, "
+        f"side_high_offset={float(getattr(args, 'jimu_final_contact_side_push_m', 0.0)):.3f}m, "
+        f"min_target_z={float(getattr(args, 'jimu_final_contact_fallback_min_target_z_m', 0.0)):.3f}m, "
+        f"rank_penalty={float(getattr(args, 'jimu_final_contact_fallback_rank_score_penalty', 0.0)):.1f}, "
+        f"generic_post_retreat={int(getattr(args, 'jimu_post_place_retreat_candidate_count', 0) or 0)} candidates"
+    )
+    print(
         "[jimu config] canonical_frames="
         f"{bool(args.jimu_canonicalize_local_frames)}, "
         f"snap_cardinal={bool(args.jimu_canonical_snap_cardinal)}, "
@@ -7620,6 +8672,9 @@ def parse_args():
         f"staged_real={bool(args.return_to_start_staged_joint_fallback_for_real)}"
     )
     print(f"[jimu config] legacy_mplib_demo_planner_disabled={bool(args.jimu_disable_mplib_demo_planner)}")
+    record_path = _jimu_record_trajectory_path(args)
+    if record_path is not None:
+        print(f"[jimu trajectory] recording enabled: {record_path}")
     direct._configure_curobo_torch_extensions(args)
     _install_jimu_near_ik_fallback(args)
     return args
@@ -7921,6 +8976,7 @@ def main():
     global _ORIGINAL_TARGETED_BUILD_PLACE_PLAN_VARIANTS
     global _ORIGINAL_FAST_CHAIN_RANK_PAIRED_RELATION_CANDIDATES
     global _ORIGINAL_FAST_CHAIN_RELATION_MATCH_KEY
+    global _ORIGINAL_RAW_GRASP_RELATION_SORT_KEY
     global _ORIGINAL_EVALUATE_CUROBO_POSE_CANDIDATES_MULTI_START
     global _ORIGINAL_COPY_LAST_CANDIDATE_COUNTS_TO_PROFILE
     global _ORIGINAL_PROFILE_PLAN_TO_JOINT_STATE
@@ -7957,6 +9013,7 @@ def main():
     original_build_place_variants = direct.targeted.build_targeted_place_plan_variants
     original_rank_paired = direct._fast_chain_rank_paired_relation_candidates
     original_relation_match_key = direct._fast_chain_relation_match_key
+    original_raw_grasp_relation_sort_key = direct._raw_grasp_relation_sort_key
     original_evaluate_multi_start = direct._evaluate_curobo_pose_candidates_multi_start
     original_copy_candidate_counts = direct._copy_last_candidate_counts_to_profile
     original_profile_plan_joint = direct._profile_plan_to_joint_state
@@ -7983,6 +9040,7 @@ def main():
     _ORIGINAL_TARGETED_BUILD_PLACE_PLAN_VARIANTS = original_build_place_variants
     _ORIGINAL_FAST_CHAIN_RANK_PAIRED_RELATION_CANDIDATES = original_rank_paired
     _ORIGINAL_FAST_CHAIN_RELATION_MATCH_KEY = original_relation_match_key
+    _ORIGINAL_RAW_GRASP_RELATION_SORT_KEY = original_raw_grasp_relation_sort_key
     _ORIGINAL_EVALUATE_CUROBO_POSE_CANDIDATES_MULTI_START = original_evaluate_multi_start
     _ORIGINAL_COPY_LAST_CANDIDATE_COUNTS_TO_PROFILE = original_copy_candidate_counts
     _ORIGINAL_PROFILE_PLAN_TO_JOINT_STATE = original_profile_plan_joint
@@ -8036,8 +9094,9 @@ def main():
             return None
 
         # Use the actual current gripper tip -> block-center line as the final
-        # approach direction.  The legacy helper used robot-base -> block, which
-        # can choose the wrong tilt side when the arm starts from an offset pose.
+        # insertion direction.  The pregrasp/grasp segment retreats along TCP -Z,
+        # so the insertion axis is -TCP_Z rather than TCP_Z.  Using +TCP_Z flips
+        # the signed tilt on asymmetric Jimu parts such as roof triangles.
         desired_xy = (tcp_p - current_tcp_p).astype(np.float32)
         desired_xy[2] = 0.0
         desired_xy = _normalize_vec(desired_xy, eps=1e-5)
@@ -8060,7 +9119,7 @@ def main():
         for sign in (1.0, -1.0):
             R_delta = _axis_angle_rotation_matrix(tilt_axis, sign * angle_rad)
             R_new = (R_delta @ R_tcp).astype(np.float32)
-            approach_xy = R_new[:, 2].astype(np.float32).copy()
+            approach_xy = (-R_new[:, 2]).astype(np.float32).copy()
             approach_xy[2] = 0.0
             approach_xy = _normalize_vec(approach_xy)
             if approach_xy is None:
@@ -8669,6 +9728,9 @@ def main():
                 "--jimu-apriltag-tray-world-offset-y-m",
                 float(getattr(args, "jimu_apriltag_tray_world_offset_y_m", PORTABLE_DEFAULT_TRAY_WORLD_OFFSET_Y_M)),
             )
+            builder_scene_json = str(getattr(args, "jimu_builder_scene_json", "") or "").strip()
+            if builder_scene_json:
+                set_option("--jimu-builder-scene-json", builder_scene_json)
         if bool(getattr(args, "jimu_tabletop_anchor_localization", False)) and "--jimu-tabletop-anchors" not in cmd:
             cmd.append("--jimu-tabletop-anchors")
         if bool(getattr(args, "jimu_manual_sam6d_bboxes", False)) and "--jimu-manual-bboxes" not in cmd:
@@ -8736,6 +9798,7 @@ def main():
         direct.targeted.build_targeted_place_plan_variants = build_targeted_place_plan_variants_jimu
         direct._fast_chain_rank_paired_relation_candidates = fast_chain_rank_paired_relation_candidates_jimu
         direct._fast_chain_relation_match_key = fast_chain_relation_match_key_jimu
+        direct._raw_grasp_relation_sort_key = raw_grasp_relation_sort_key_jimu
         direct._make_ik_preselected_grasp_success = make_ik_preselected_grasp_success_jimu
         direct._build_direct_grasp_candidates = build_direct_grasp_candidates_jimu
         direct._evaluate_curobo_pose_candidates_multi_start = evaluate_curobo_pose_candidates_multi_start_jimu
@@ -8782,6 +9845,7 @@ def main():
         direct.targeted.build_targeted_place_plan_variants = original_build_place_variants
         direct._fast_chain_rank_paired_relation_candidates = original_rank_paired
         direct._fast_chain_relation_match_key = original_relation_match_key
+        direct._raw_grasp_relation_sort_key = original_raw_grasp_relation_sort_key
         direct._make_ik_preselected_grasp_success = original_make_ik_preselected_grasp_success
         direct._build_direct_grasp_candidates = original_build_direct_grasp_candidates
         direct._evaluate_curobo_pose_candidates_multi_start = original_evaluate_multi_start
@@ -8817,6 +9881,7 @@ def main():
         _ORIGINAL_TARGETED_BUILD_PLACE_PLAN_VARIANTS = None
         _ORIGINAL_FAST_CHAIN_RANK_PAIRED_RELATION_CANDIDATES = None
         _ORIGINAL_FAST_CHAIN_RELATION_MATCH_KEY = None
+        _ORIGINAL_RAW_GRASP_RELATION_SORT_KEY = None
         _ORIGINAL_EVALUATE_CUROBO_POSE_CANDIDATES_MULTI_START = None
         _ORIGINAL_COPY_LAST_CANDIDATE_COUNTS_TO_PROFILE = None
         _ORIGINAL_PROFILE_PLAN_TO_JOINT_STATE = None

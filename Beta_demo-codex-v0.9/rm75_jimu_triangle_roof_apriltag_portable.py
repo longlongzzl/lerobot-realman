@@ -8,6 +8,9 @@ same AprilTag/SAM6D/Realman execution path already used by the portable runner.
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import subprocess
 import sys
 import time
 from dataclasses import replace
@@ -42,6 +45,8 @@ DEFAULT_RELATION_SLOTS = 16
 DEFAULT_FIXED_BATCH_SIZE = 16
 DEFAULT_FAST_TOP_PAIRS = 8
 DEFAULT_TRIANGLE_TOPDOWN_GRASP_MAX_INSERTION_DEPTH = 0.07
+JIMU_BUILDER_SQUARE_FAMILY_TYPES = {"square", "half_square"}
+JIMU_BUILDER_SUPPORTED_TYPES = {"square", "half_square", "triangle"}
 DEFAULT_ROOF_MAX_HOVER_CANDIDATES_PER_GRASP = 16
 DEFAULT_ROOF_RELATION_SLOTS = 64
 DEFAULT_ROOF_FIXED_BATCH_SIZE = 16
@@ -65,12 +70,12 @@ DEFAULT_ROOF_SCENE_OBSTACLE_BOX_SCALE = 0.62
 DEFAULT_ROOF_CUROBO_MESH_OBSTACLES = True
 DEFAULT_ROOF_UNIFORM_PREPLACE_HEIGHT_M = 0.03
 DEFAULT_DRY_RUN_RETURN_LINEAR_FALLBACK = False
+DEFAULT_APRILTAG_TASK_SELECT_ATTEMPTS = 5
 # Keep the triangle panel thickness axis aligned with the tray slot narrow axis.
-# The tip-up local rotation already fixes the mesh's vertical direction; an
-# extra yaw here rotates the panel flat across the slot and makes the tray view
-# look wrong.
+# The source-slot frame already has local Z upward.  Do not pitch the triangle
+# by 180 deg here: that flips the roof-panel tip down inside the tray.
 DEFAULT_TRIANGLE_TRAY_SLOT_YAW_OFFSET_DEG = 0.0
-TRIANGLE_TIP_UP_LOCAL_RPY_DEG = (0.0, 180.0, 0.0)
+TRIANGLE_TIP_UP_LOCAL_RPY_DEG = (0.0, 0.0, 0.0)
 DEMO_TRIANGLE_MESH = Path(__file__).resolve().parents[1] / "Demo_Triangle" / "red_triangle_74x135x6p5.glb"
 
 _ORIGINAL_BUILD_ARG_PARSER = portable.build_arg_parser
@@ -88,11 +93,988 @@ _ORIGINAL_SELECT_JIMU_PARALLEL_PLACE_SOURCE_CANDIDATES = portable._select_jimu_p
 _ORIGINAL_BUILD_DIRECT_GRASP_CANDIDATES = portable.direct._build_direct_grasp_candidates
 _ORIGINAL_CHOOSE_NEXT_TRAY_SOURCE_ROLE = portable._jimu_choose_next_tray_source_role
 _ORIGINAL_FAST_CHAIN_PRESELECT_GRASP_PLACE_PAIR = portable.direct._fast_chain_preselect_grasp_place_pair
+_ORIGINAL_BASE_SUPPORT_LOCAL_POSES = portable._jimu_base_support_local_poses
+
+_JIMU_BUILDER_SCENE_CACHE: dict[str, Any] | None = None
+_JIMU_BUILDER_ROLE_PIECES: dict[str, dict[str, Any]] = {}
+_JIMU_BUILDER_LOCKED_PIECES: dict[str, dict[str, Any]] = {}
+_JIMU_BUILDER_LAYER_ROLES: list[tuple[str, ...]] = []
+_JIMU_TASK_MANIFEST_CACHE: dict[str, Any] | None = None
 
 
 def _argv_has_option(option_name: str) -> bool:
     prefix = f"{option_name}="
     return any(arg == option_name or str(arg).startswith(prefix) for arg in sys.argv[1:])
+
+
+def _resolve_task_manifest_path(task_dir_text: str | None) -> Path | None:
+    raw = str(task_dir_text or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if path.is_dir():
+        path = path / "manifest.json"
+    return path.resolve()
+
+
+def _resolve_manifest_relative_path(manifest_path: Path, value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return str(path.resolve())
+
+
+def _apply_jimu_task_manifest_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    global _JIMU_TASK_MANIFEST_CACHE
+
+    manifest_path = _resolve_task_manifest_path(getattr(args, "jimu_task_dir", ""))
+    if manifest_path is None:
+        _JIMU_TASK_MANIFEST_CACHE = None
+        return args
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Jimu task manifest was not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["_manifest_path"] = str(manifest_path)
+    _JIMU_TASK_MANIFEST_CACHE = manifest
+
+    def set_if_not_explicit(option_name: str, attr_name: str, value: Any) -> None:
+        if value in (None, ""):
+            return
+        if _argv_has_option(option_name):
+            return
+        setattr(args, attr_name, value)
+
+    def manifest_tray_slot_role_order(manifest_data: dict[str, Any]) -> list[str] | None:
+        tray_cfg = manifest_data.get("tray") if isinstance(manifest_data.get("tray"), dict) else {}
+        layout = tray_cfg.get("slot_layout")
+        if isinstance(layout, list) and layout:
+            roles: list[str] = []
+            for item in layout:
+                if isinstance(item, dict):
+                    role = str(item.get("role") or "").strip()
+                else:
+                    role = str(item or "").strip()
+                if role:
+                    roles.append(role)
+            if roles:
+                return roles
+        builder_data = manifest_data.get("builder") if isinstance(manifest_data.get("builder"), dict) else {}
+        legacy = builder_data.get("tray_slot_role_order")
+        if isinstance(legacy, list) and legacy:
+            return [str(role).strip() for role in legacy if str(role).strip()]
+        return None
+
+    builder_scene = _resolve_manifest_relative_path(manifest_path, manifest.get("builder_scene_json"))
+    set_if_not_explicit(
+        "--jimu-builder-scene-json",
+        "jimu_builder_scene_json",
+        builder_scene,
+    )
+    if builder_scene and not (
+        _argv_has_option("--jimu-canonical-snap-cardinal")
+        or _argv_has_option("--no-jimu-canonical-snap-cardinal")
+    ):
+        # Match the explicit --jimu-builder-scene-json path: frontend-authored
+        # targets should keep their exported angle instead of snapping to axes.
+        setattr(args, "jimu_canonical_snap_cardinal", False)
+    fixed_scene = _resolve_manifest_relative_path(manifest_path, manifest.get("sam6d_fixed_scene_result_file"))
+    set_if_not_explicit("--sam6d-fixed-scene-result-file", "sam6d_fixed_scene_result_file", fixed_scene)
+    if fixed_scene and not _argv_has_option("--jimu-apriltag-anchor-localization"):
+        setattr(args, "_jimu_task_manifest_fixed_scene", True)
+
+    apriltag = manifest.get("apriltag") if isinstance(manifest.get("apriltag"), dict) else {}
+    set_if_not_explicit("--jimu-apriltag-base-id", "jimu_apriltag_base_id", apriltag.get("base_id"))
+    set_if_not_explicit("--jimu-apriltag-base-size-m", "jimu_apriltag_base_size_m", apriltag.get("base_size_m"))
+    set_if_not_explicit("--jimu-apriltag-base-yaw-deg", "jimu_apriltag_base_yaw_deg", apriltag.get("base_yaw_deg"))
+    set_if_not_explicit("--jimu-apriltag-tray-id", "jimu_apriltag_tray_id", apriltag.get("tray_id"))
+    set_if_not_explicit("--jimu-apriltag-tray-size-m", "jimu_apriltag_tray_size_m", apriltag.get("tray_size_m"))
+    set_if_not_explicit("--jimu-apriltag-tray-yaw-deg", "jimu_apriltag_tray_yaw_deg", apriltag.get("tray_yaw_deg"))
+
+    for option_name, attr_name in [
+        ("--jimu-apriltag-base-world-offset-x-m", "jimu_apriltag_base_world_offset_x_m"),
+        ("--jimu-apriltag-base-world-offset-y-m", "jimu_apriltag_base_world_offset_y_m"),
+        ("--jimu-apriltag-tray-world-offset-x-m", "jimu_apriltag_tray_world_offset_x_m"),
+        ("--jimu-apriltag-tray-world-offset-y-m", "jimu_apriltag_tray_world_offset_y_m"),
+    ]:
+        key = attr_name.replace("jimu_apriltag_", "")
+        set_if_not_explicit(option_name, attr_name, apriltag.get(key))
+
+    builder_cfg = manifest.get("builder") if isinstance(manifest.get("builder"), dict) else {}
+    set_if_not_explicit(
+        "--jimu-builder-outward-clearance-m",
+        "jimu_builder_outward_clearance_m",
+        builder_cfg.get("outward_clearance_m"),
+    )
+    set_if_not_explicit(
+        "--jimu-builder-outward-clearance-max-depth",
+        "jimu_builder_outward_clearance_max_depth",
+        builder_cfg.get("outward_clearance_max_depth"),
+    )
+    set_if_not_explicit(
+        "--jimu-builder-layer-z-extra-m",
+        "jimu_builder_layer_z_extra_m",
+        builder_cfg.get("layer_z_extra_m"),
+    )
+    set_if_not_explicit(
+        "--jimu-builder-canonicalize-outward-normals",
+        "jimu_builder_canonicalize_outward_normals",
+        builder_cfg.get("canonicalize_outward_normals"),
+    )
+    set_if_not_explicit(
+        "--jimu-builder-use-design-parent-targets",
+        "jimu_builder_use_design_parent_targets",
+        builder_cfg.get("use_design_parent_targets"),
+    )
+    set_if_not_explicit(
+        "--jimu-tray-slot-role-order",
+        "jimu_tray_slot_role_order",
+        manifest_tray_slot_role_order(manifest),
+    )
+    set_if_not_explicit(
+        "--jimu-roof-uniform-preplace-height-m",
+        "jimu_roof_uniform_preplace_height_m",
+        builder_cfg.get("roof_uniform_preplace_height_m"),
+    )
+    set_if_not_explicit(
+        "--jimu-final-contact-low-hover-height-m",
+        "jimu_final_contact_low_hover_height_m",
+        builder_cfg.get("final_contact_low_hover_height_m"),
+    )
+
+    print(
+        "[jimu-task] loaded manifest: "
+        f"{manifest_path} tag={manifest.get('tag_id')} name={manifest.get('name', manifest_path.parent.name)}"
+    )
+    return args
+
+
+def _normalize_builder_scene_path(path_text: str | None) -> str:
+    raw = str(path_text or "").strip()
+    if not raw:
+        return ""
+    return str(Path(raw).expanduser())
+
+
+def _normalize_builder_locked_top_surfaces(payload: dict[str, Any]) -> None:
+    # Builder scenes are internally self-consistent: child centers/axes and
+    # optional parent-relative transforms are authored against the locked
+    # pieces exactly as exported.  Do not flip locked-piece normals here; doing
+    # so changes the parent edge frame without moving descendants and can shift
+    # children by a whole plate length.
+    return
+
+
+def _load_builder_scene(path_text: str | None) -> dict[str, Any] | None:
+    path = _normalize_builder_scene_path(path_text)
+    if not path:
+        return None
+    scene_path = Path(path)
+    if not scene_path.exists():
+        raise FileNotFoundError(f"Jimu builder scene JSON not found: {scene_path}")
+    payload = json.loads(scene_path.read_text(encoding="utf-8"))
+    if payload.get("schema") != "jimu_builder_scene_v1":
+        raise ValueError(f"{scene_path} is not a jimu_builder_scene_v1 JSON")
+    pieces = payload.get("pieces")
+    if not isinstance(pieces, list) or not pieces:
+        raise ValueError(f"{scene_path} has no pieces list")
+    _normalize_builder_locked_top_surfaces(payload)
+    payload["_source_path"] = str(scene_path)
+    return payload
+
+
+def _builder_task_pieces(scene: dict[str, Any]) -> list[dict[str, Any]]:
+    pieces = []
+    for item in list(scene.get("pieces") or []):
+        if not isinstance(item, dict):
+            continue
+        if bool(item.get("locked", False)):
+            continue
+        role = str(item.get("role") or item.get("id") or "").strip()
+        ptype = str(item.get("type") or "").strip().lower()
+        if not role or ptype not in JIMU_BUILDER_SUPPORTED_TYPES:
+            continue
+        pieces.append(item)
+    if not pieces:
+        raise ValueError("builder scene has no unlocked square/half_square/triangle task pieces")
+    return pieces
+
+
+def _builder_locked_pieces(scene: dict[str, Any]) -> list[dict[str, Any]]:
+    pieces = []
+    for item in list(scene.get("pieces") or []):
+        if not isinstance(item, dict) or not bool(item.get("locked", False)):
+            continue
+        role = str(item.get("role") or item.get("id") or "").strip()
+        ptype = str(item.get("type") or "").strip().lower()
+        if not role or ptype not in JIMU_BUILDER_SUPPORTED_TYPES:
+            continue
+        pieces.append(item)
+    return pieces
+
+
+def _builder_piece_center(piece: dict[str, Any]) -> np.ndarray:
+    return np.asarray(piece.get("center"), dtype=np.float32).reshape(3)
+
+
+def _builder_piece_role(piece: dict[str, Any] | None) -> str:
+    if not isinstance(piece, dict):
+        return ""
+    return str(piece.get("role") or piece.get("id") or "").strip()
+
+
+def _builder_piece_lookup(key: str | None, *, locked: bool | None = None) -> dict[str, Any] | None:
+    name = portable.direct.curobo_wrapper.normalize_object_name(key)
+    if not name:
+        return None
+    maps = []
+    if locked is not True:
+        maps.append(_JIMU_BUILDER_ROLE_PIECES)
+    if locked is not False:
+        maps.append(_JIMU_BUILDER_LOCKED_PIECES)
+    for mapping in maps:
+        piece = mapping.get(name)
+        if isinstance(piece, dict):
+            return piece
+    for mapping in maps:
+        for piece in mapping.values():
+            if not isinstance(piece, dict):
+                continue
+            if name in {str(piece.get("id") or "").strip(), str(piece.get("role") or "").strip()}:
+                return piece
+    return None
+
+
+def _builder_is_locked_piece(piece: dict[str, Any] | None) -> bool:
+    if isinstance(piece, dict) and bool(piece.get("locked", False)):
+        return True
+    role = _builder_piece_role(piece)
+    if not role:
+        return False
+    return _builder_piece_lookup(role, locked=True) is piece
+
+
+def _builder_piece_matrix(piece: dict[str, Any]) -> np.ndarray:
+    T = np.eye(4, dtype=np.float32)
+    u = np.asarray(piece.get("u"), dtype=np.float32).reshape(3)
+    n = np.asarray(piece.get("n"), dtype=np.float32).reshape(3)
+    v = np.asarray(piece.get("v"), dtype=np.float32).reshape(3)
+    R = np.column_stack([u, n, v]).astype(np.float32)
+    # Re-orthogonalize lightly; frontend exports rounded axes and accumulated
+    # snapping can leave them just outside a valid rotation matrix.
+    x = R[:, 0]
+    x = x / max(float(np.linalg.norm(x)), 1e-8)
+    y = R[:, 1] - float(np.dot(R[:, 1], x)) * x
+    y = y / max(float(np.linalg.norm(y)), 1e-8)
+    z = np.cross(x, y)
+    z = z / max(float(np.linalg.norm(z)), 1e-8)
+    y = np.cross(z, x)
+    T[:3, :3] = np.column_stack([x, y, z]).astype(np.float32)
+    T[:3, 3] = _builder_piece_center(piece)
+    return T
+
+
+def _builder_floor_center_y(args: argparse.Namespace | None = None) -> float:
+    try:
+        return 0.5 * float(portable._load_scaled_jimu_extents(args)[1])
+    except Exception:
+        return 0.00325
+
+
+def _builder_floor_relative_piece_matrix(
+    piece: dict[str, Any],
+    args: argparse.Namespace | None = None,
+) -> np.ndarray:
+    T = _builder_piece_matrix(piece)
+    # Frontend builder coordinates use Y=0 as the table/base contact plane.
+    # The portable backend's `floor` pose is the center of the floor plate.
+    # Convert absolute builder poses to floor-center-relative poses before
+    # multiplying by T_world_floor; otherwise the half thickness is added twice
+    # and base pieces visibly float above the table.
+    T[:3, 3] -= np.asarray([0.0, _builder_floor_center_y(args), 0.0], dtype=np.float32)
+    return T
+
+
+def _builder_matrix_from_json(value: Any) -> np.ndarray | None:
+    try:
+        matrix = np.asarray(value, dtype=np.float32)
+    except Exception:
+        return None
+    if matrix.shape != (4, 4):
+        return None
+    if not np.all(np.isfinite(matrix)):
+        return None
+    return matrix.reshape(4, 4).astype(np.float32)
+
+
+def _builder_parent_relative_matrix(piece: dict[str, Any], parent_piece: dict[str, Any]) -> np.ndarray:
+    for key in ("parentRelativeTransform", "parent_relative_transform", "T_parent_piece"):
+        explicit = _builder_matrix_from_json(piece.get(key))
+        if explicit is not None:
+            return explicit
+    T_builder_parent = _builder_piece_matrix(parent_piece)
+    T_builder_piece = _builder_piece_matrix(piece)
+    return (np.linalg.inv(T_builder_parent).astype(np.float32) @ T_builder_piece).astype(np.float32)
+
+
+def _apply_builder_canonical_outward_normals(scene: dict[str, Any], args: argparse.Namespace | None) -> None:
+    enabled = bool(getattr(args, "jimu_builder_canonicalize_outward_normals", False) if args is not None else False)
+    if not enabled:
+        return
+    pieces = [piece for piece in scene.get("pieces", []) if isinstance(piece, dict)]
+    locked_centers = [
+        _builder_piece_center(piece)
+        for piece in pieces
+        if _builder_is_locked_piece(piece) and str(piece.get("type") or "").strip().lower() in JIMU_BUILDER_SUPPORTED_TYPES
+    ]
+    if not locked_centers:
+        return
+    ref = np.mean(np.stack(locked_centers, axis=0), axis=0).astype(np.float32)
+    changed: list[str] = []
+    for piece in pieces:
+        role = _builder_piece_role(piece)
+        if not role or _builder_is_locked_piece(piece):
+            continue
+        # Rectangular/square plates are 180-degree symmetric in the plate plane.
+        # For triangle plates the same flip would change the tip direction.
+        if str(piece.get("type") or "").strip().lower() not in JIMU_BUILDER_SQUARE_FAMILY_TYPES:
+            continue
+        try:
+            u = np.asarray(piece.get("u"), dtype=np.float32).reshape(3)
+            n = np.asarray(piece.get("n"), dtype=np.float32).reshape(3)
+            piece_center = _builder_piece_center(piece)
+        except Exception:
+            continue
+        radial = piece_center - ref
+        radial[1] = 0.0
+        n_planar = n.copy()
+        n_planar[1] = 0.0
+        radial_norm = float(np.linalg.norm(radial))
+        n_norm = float(np.linalg.norm(n_planar))
+        if radial_norm <= 1e-8 or n_norm <= 1e-8:
+            continue
+        radial /= radial_norm
+        n_planar /= n_norm
+        if float(np.dot(n_planar, radial)) >= 0.0:
+            continue
+        # Keep the same physical plate plane, but choose a consistent symmetric
+        # frame: all wall/roof panels expose local Y toward the outside of the
+        # base. This prevents alternating frontend normals from steering grasp
+        # and place poses in opposite directions.
+        piece["u"] = (-u).astype(float).tolist()
+        piece["n"] = (-n).astype(float).tolist()
+        piece["_canonical_outward_normal_flipped"] = True
+        changed.append(role)
+    if changed:
+        print(
+            "[jimu-builder] canonicalized outward wall normals: "
+            f"flipped={len(changed)} roles={changed[:8]}{' ...' if len(changed) > 8 else ''}"
+        )
+
+
+def _apply_builder_outward_clearance(scene: dict[str, Any], args: argparse.Namespace | None) -> None:
+    try:
+        clearance_m = float(getattr(args, "jimu_builder_outward_clearance_m", 0.0) or 0.0)
+    except Exception:
+        clearance_m = 0.0
+    if clearance_m <= 0.0:
+        return
+    try:
+        max_depth = int(getattr(args, "jimu_builder_outward_clearance_max_depth", 0) or 0)
+    except Exception:
+        max_depth = 0
+
+    raw_pieces = [item for item in list(scene.get("pieces") or []) if isinstance(item, dict)]
+    locked = [piece for piece in raw_pieces if bool(piece.get("locked", False))]
+    if not locked:
+        return
+    by_key: dict[str, dict[str, Any]] = {}
+    for piece in raw_pieces:
+        for key in (piece.get("id"), piece.get("role")):
+            name = str(key or "").strip()
+            if name:
+                by_key[name] = piece
+
+    ref_source = "locked_mean"
+    ref = np.mean([_builder_piece_center(piece) for piece in locked], axis=0).astype(np.float32)
+    attached_tags = list(((scene.get("apriltags") or {}).get("attached_tags") or []))
+    for tag in attached_tags:
+        if not isinstance(tag, dict) or str(tag.get("mount") or "base") != "base":
+            continue
+        tag_role = str(tag.get("attached_to_role") or tag.get("attached_to_piece_id") or "").strip()
+        tag_piece = by_key.get(tag_role)
+        if isinstance(tag_piece, dict):
+            ref = _builder_piece_center(tag_piece).astype(np.float32)
+            ref_source = f"attached_tag:{_builder_piece_role(tag_piece) or tag_role}"
+            break
+
+    original_mats: dict[int, np.ndarray] = {}
+    for piece in raw_pieces:
+        try:
+            original_mats[id(piece)] = _builder_piece_matrix(piece)
+        except Exception:
+            continue
+
+    depth_cache: dict[int, int] = {}
+
+    def clearance_depth(piece: dict[str, Any]) -> int:
+        cache_key = id(piece)
+        cached = depth_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        parent_piece = by_key.get(str(piece.get("parentId") or "").strip())
+        if bool(piece.get("locked", False)):
+            depth = 0
+        elif not isinstance(parent_piece, dict) or parent_piece is piece or bool(parent_piece.get("locked", False)):
+            depth = 1
+        else:
+            depth = clearance_depth(parent_piece) + 1
+        depth_cache[cache_key] = depth
+        return depth
+
+    movable_pieces = [
+        piece
+        for piece in raw_pieces
+        if not bool(piece.get("locked", False))
+        and str(piece.get("type") or "").strip().lower() in JIMU_BUILDER_SUPPORTED_TYPES
+    ]
+    movable_pieces.sort(key=clearance_depth)
+
+    changed: list[dict[str, Any]] = []
+    for piece in movable_pieces:
+        depth = int(clearance_depth(piece))
+        if max_depth > 0 and depth > max_depth:
+            continue
+        parent_key = str(piece.get("parentId") or "").strip()
+        parent_piece = by_key.get(parent_key)
+        if not isinstance(parent_piece, dict):
+            continue
+
+        center = _builder_piece_center(piece)
+        radial = np.asarray([center[0] - ref[0], 0.0, center[2] - ref[2]], dtype=np.float32)
+        radial_norm = float(np.linalg.norm(radial))
+        if radial_norm <= 1e-8:
+            continue
+        radial /= radial_norm
+
+        T_builder_piece = _builder_piece_matrix(piece)
+        outward = np.asarray(T_builder_piece[:3, 1], dtype=np.float32).reshape(3)
+        outward[1] = 0.0
+        outward_norm = float(np.linalg.norm(outward))
+        if outward_norm <= 1e-8:
+            outward = radial
+        else:
+            outward /= outward_norm
+            if float(np.dot(outward, radial)) < 0.0:
+                outward *= -1.0
+
+        T_builder_parent = _builder_piece_matrix(parent_piece)
+        T_builder_parent_original = original_mats.get(id(parent_piece), T_builder_parent)
+        T_builder_piece_original = original_mats.get(id(piece), _builder_piece_matrix(piece))
+        T_parent_piece = (
+            np.linalg.inv(T_builder_parent_original).astype(np.float32)
+            @ np.asarray(T_builder_piece_original, dtype=np.float32).reshape(4, 4)
+        ).astype(np.float32)
+        delta_builder = (outward * clearance_m).astype(np.float32)
+        delta_parent = (T_builder_parent[:3, :3].T @ delta_builder).astype(np.float32)
+        T_parent_piece[:3, 3] = (T_parent_piece[:3, 3] + delta_parent).astype(np.float32)
+        T_builder_piece = (T_builder_parent @ T_parent_piece).astype(np.float32)
+        center_before = center.astype(np.float32)
+        center_after = T_builder_piece[:3, 3].astype(np.float32)
+        piece["center"] = center_after.astype(float).round(6).tolist()
+        piece["parentRelativeTransform"] = T_parent_piece.astype(float).tolist()
+        piece["_outward_clearance_m"] = clearance_m
+        piece["_outward_clearance_depth"] = depth
+        piece["_outward_clearance_ref_source"] = ref_source
+        piece["_outward_clearance_direction_builder"] = outward.astype(float).round(6).tolist()
+        changed.append(
+            {
+                "role": str(piece.get("role") or piece.get("id") or ""),
+                "parent": str(parent_piece.get("role") or parent_piece.get("id") or parent_key),
+                "center_delta_mm": float(np.linalg.norm(center_after - center_before) * 1000.0),
+            }
+        )
+
+    if changed:
+        preview = ", ".join(f"{item['role']}<-{item['parent']}" for item in changed[:8])
+        if len(changed) > 8:
+            preview += f", ... +{len(changed) - 8}"
+        print(
+            "[jimu-builder] applied outward clearance: "
+            f"{clearance_m * 1000.0:.1f}mm to {len(changed)} parent-child target relation(s), "
+            f"max_depth={max_depth}, ref={ref_source}: {preview}"
+        )
+
+
+def _builder_group_layers(pieces: list[dict[str, Any]], *, tol_m: float = 0.012) -> list[tuple[str, ...]]:
+    sorted_pieces = sorted(
+        pieces,
+        key=lambda item: (
+            round(float(_builder_piece_center(item)[1]) / max(tol_m, 1e-6)),
+            float(_builder_piece_center(item)[2]),
+            float(_builder_piece_center(item)[0]),
+            str(item.get("role") or item.get("id") or ""),
+        ),
+    )
+    layers: list[list[dict[str, Any]]] = []
+    layer_centers: list[float] = []
+    for piece in sorted_pieces:
+        y = float(_builder_piece_center(piece)[1])
+        if not layers or abs(y - layer_centers[-1]) > tol_m:
+            layers.append([piece])
+            layer_centers.append(y)
+        else:
+            layers[-1].append(piece)
+            layer_centers[-1] = float(np.mean([float(_builder_piece_center(p)[1]) for p in layers[-1]]))
+    return [tuple(str(piece.get("role") or piece.get("id")) for piece in layer) for layer in layers]
+
+
+def _builder_layer_z_extra_values(args: argparse.Namespace | None) -> list[float]:
+    raw = getattr(args, "jimu_builder_layer_z_extra_m", "") if args is not None else ""
+    if raw in (None, ""):
+        return []
+    if isinstance(raw, (list, tuple)):
+        values = raw
+    else:
+        values = str(raw).replace(",", " ").split()
+    out: list[float] = []
+    for value in values:
+        try:
+            out.append(float(value))
+        except Exception:
+            continue
+    return out
+
+
+def _builder_role_layer_index(role: str | None) -> int:
+    name = str(role or "").strip()
+    if not name:
+        return 0
+    for idx, layer in enumerate(_JIMU_BUILDER_LAYER_ROLES, start=1):
+        if name in set(layer):
+            return idx
+    return 0
+
+
+def _builder_layer_increment_z_extra(role: str | None, args: argparse.Namespace | None) -> float:
+    values = _builder_layer_z_extra_values(args)
+    if not values:
+        return 0.0
+    layer_idx = _builder_role_layer_index(role)
+    if layer_idx <= 0:
+        return 0.0
+    return float(values[min(layer_idx - 1, len(values) - 1)])
+
+
+def _builder_layer_cumulative_z_extra(role: str | None, args: argparse.Namespace | None) -> float:
+    values = _builder_layer_z_extra_values(args)
+    if not values:
+        return 0.0
+    layer_idx = _builder_role_layer_index(role)
+    if layer_idx <= 0:
+        return 0.0
+    last = min(layer_idx, len(values))
+    total = float(sum(float(v) for v in values[:last]))
+    if layer_idx > len(values):
+        total += float(values[-1]) * float(layer_idx - len(values))
+    return total
+
+
+def _builder_apply_world_z_extra(T_world_piece: np.ndarray, extra_z: float) -> np.ndarray:
+    out = np.asarray(T_world_piece, dtype=np.float32).reshape(4, 4).copy()
+    if abs(float(extra_z)) > 1e-9:
+        out[:3, 3] += np.asarray([0.0, 0.0, float(extra_z)], dtype=np.float32)
+    return out.astype(np.float32)
+
+
+def _apply_builder_scene_roles(args: argparse.Namespace) -> None:
+    global JIMU_ROOF_TRIANGLE_ROLES, TRIANGLE_ROLE_SPECS, TRIANGLE_PARENT_ROLES
+    global _JIMU_BUILDER_SCENE_CACHE, _JIMU_BUILDER_ROLE_PIECES, _JIMU_BUILDER_LOCKED_PIECES, _JIMU_BUILDER_LAYER_ROLES
+
+    scene = _load_builder_scene(getattr(args, "jimu_builder_scene_json", ""))
+    if scene is None:
+        _JIMU_BUILDER_SCENE_CACHE = None
+        _JIMU_BUILDER_ROLE_PIECES = {}
+        _JIMU_BUILDER_LOCKED_PIECES = {}
+        _JIMU_BUILDER_LAYER_ROLES = []
+        return
+
+    print(
+        "[jimu-builder] builder options: "
+        f"outward_clearance={float(getattr(args, 'jimu_builder_outward_clearance_m', 0.0) or 0.0) * 1000.0:.1f}mm, "
+        f"outward_clearance_max_depth={int(getattr(args, 'jimu_builder_outward_clearance_max_depth', 0) or 0)}, "
+        f"layer_z_extra_m={_builder_layer_z_extra_values(args)}, "
+        f"canonicalize_outward_normals={bool(getattr(args, 'jimu_builder_canonicalize_outward_normals', False))}, "
+        f"use_design_parent_targets={bool(getattr(args, 'jimu_builder_use_design_parent_targets', False))}"
+    )
+    _apply_builder_canonical_outward_normals(scene, args)
+    _apply_builder_outward_clearance(scene, args)
+    pieces = _builder_task_pieces(scene)
+    locked_pieces = _builder_locked_pieces(scene)
+    role_pieces = {str(piece.get("role") or piece.get("id")): piece for piece in pieces}
+    locked_role_pieces = {str(piece.get("role") or piece.get("id")): piece for piece in locked_pieces}
+    layer_roles = _builder_group_layers(pieces)
+    task_roles = [role for layer in layer_roles for role in layer]
+    locked_roles = tuple(locked_role_pieces.keys())
+    triangle_roles = tuple(role for role in task_roles if str(role_pieces[role].get("type", "")).lower() == "triangle")
+    square_roles = tuple(
+        role for role in task_roles if str(role_pieces[role].get("type", "")).lower() in JIMU_BUILDER_SQUARE_FAMILY_TYPES
+    )
+
+    spare_roles = tuple(portable.JIMU_SPARE_TRAY_SLOT_ROLES[: max(0, 14 - len(task_roles))])
+    fallback_tray_roles = tuple(task_roles) + spare_roles
+    explicit_tray_roles = tuple(portable._split_names(getattr(args, "jimu_tray_slot_role_order", None)))
+    if explicit_tray_roles:
+        available_roles = set((*task_roles, *portable.JIMU_SPARE_TRAY_SLOT_ROLES))
+        unknown_tray_roles = [role for role in explicit_tray_roles if role not in available_roles]
+        if unknown_tray_roles:
+            raise RuntimeError(
+                "builder.tray_slot_role_order contains role(s) not present in the builder task or spare slots: "
+                f"{unknown_tray_roles}; available={sorted(available_roles)}"
+            )
+        tray_roles = explicit_tray_roles
+    else:
+        tray_roles = fallback_tray_roles
+    triangle_tray_spare_roles = tuple(
+        role
+        for idx, role in enumerate(tray_roles)
+        if idx >= 10 and role in set(portable.JIMU_SPARE_TRAY_SLOT_ROLES)
+    )
+    JIMU_ROOF_TRIANGLE_ROLES = (*triangle_roles, *triangle_tray_spare_roles)
+    TRIANGLE_ROLE_SPECS = {role: "red_triangle_front" for role in JIMU_ROOF_TRIANGLE_ROLES}
+    TRIANGLE_PARENT_ROLES = {role: str(role_pieces[role].get("parentId") or "") for role in triangle_roles}
+    for role in triangle_tray_spare_roles:
+        TRIANGLE_PARENT_ROLES[role] = ""
+    portable.JIMU_ROOF_TRIANGLE_ROLES = JIMU_ROOF_TRIANGLE_ROLES
+    portable.JIMU_PICK_ROLES = tuple(task_roles)
+    portable.JIMU_TRAY_SLOT_ROLES = tray_roles
+    portable.JIMU_BASE_SUPPORT_ROLES = locked_roles
+    portable.JIMU_BASE_ROLES = (portable.JIMU_FLOOR_ROLE, *locked_roles)
+    portable.JIMU_LEGACY_SCENE_ROLES = (portable.JIMU_FLOOR_ROLE, *portable.JIMU_PICK_ROLES)
+    portable.JIMU_SCENE_ROLES = (*portable.JIMU_BASE_ROLES, *portable.JIMU_TRAY_SLOT_ROLES)
+    portable.JIMU_DERIVED_ROLE_SET = set((*portable.JIMU_BASE_ROLES, *portable.JIMU_TRAY_SLOT_ROLES))
+
+    _apply_builder_apriltag_defaults(args, scene)
+    if _argv_has_option("--cycle-object-names"):
+        requested_roles = portable._split_names(getattr(args, "cycle_object_names", None))
+        unknown_roles = [role for role in requested_roles if role not in role_pieces]
+        if unknown_roles:
+            raise RuntimeError(
+                "--cycle-object-names contains role(s) not present in the builder scene: "
+                f"{unknown_roles}; available={task_roles}"
+            )
+        args.cycle_object_names = requested_roles or list(task_roles)
+    else:
+        args.cycle_object_names = list(task_roles)
+    if not _argv_has_option("--repeat-count"):
+        args.repeat_count = len(args.cycle_object_names)
+    if not _argv_has_option("--tracked-scene-object-names"):
+        args.tracked_scene_object_names = [portable.JIMU_FLOOR_ROLE, *locked_roles]
+    if not _argv_has_option("--jimu-scene-roles"):
+        args.jimu_scene_roles = [portable.JIMU_FLOOR_ROLE, *portable._jimu_tray_slot_role_order(args)]
+        if bool(getattr(args, "jimu_base_support_obstacles", True)):
+            args.jimu_scene_roles.extend(role for role in portable.JIMU_BASE_SUPPORT_ROLES if role not in args.jimu_scene_roles)
+    args.sam3_max_masks_per_item = max(int(getattr(args, "sam3_max_masks_per_item", 1) or 1), len(args.jimu_scene_roles))
+
+    _JIMU_BUILDER_SCENE_CACHE = scene
+    _JIMU_BUILDER_ROLE_PIECES = role_pieces
+    _JIMU_BUILDER_LOCKED_PIECES = locked_role_pieces
+    _JIMU_BUILDER_LAYER_ROLES = layer_roles
+    print(
+        "[jimu-builder] loaded target scene: "
+        f"{scene.get('_source_path')} roles={task_roles} "
+        f"squares={len(square_roles)} triangles={len(triangle_roles)} "
+        f"triangle_spares={list(triangle_tray_spare_roles)} "
+        f"locked_base={list(locked_roles)} layers={[list(layer) for layer in layer_roles]}"
+    )
+    print(f"[jimu-builder] tray slot role order: {portable._jimu_tray_slot_role_order(args)}")
+
+
+def _apply_builder_apriltag_defaults(args: argparse.Namespace, scene: dict[str, Any]) -> None:
+    apriltags = scene.get("apriltags") or {}
+    mounts = apriltags.get("mounts") or {}
+    attached = [item for item in list(apriltags.get("attached_tags") or []) if isinstance(item, dict)]
+
+    explicit_base_id = _argv_has_option("--jimu-apriltag-base-id")
+    base_tag = None
+    if explicit_base_id:
+        requested = int(getattr(args, "jimu_apriltag_base_id", 1))
+        base_tag = next((tag for tag in attached if int(tag.get("tag_id", -1)) == requested), None)
+    if base_tag is None:
+        base_tag = next((tag for tag in attached if str(tag.get("mount") or "base") == "base"), None)
+    if base_tag is None and isinstance(mounts.get("base"), dict):
+        base_tag = mounts.get("base")
+    tray_tag = mounts.get("tray") if isinstance(mounts.get("tray"), dict) else None
+
+    if isinstance(base_tag, dict):
+        if not explicit_base_id:
+            args.jimu_apriltag_base_id = int(base_tag.get("tag_id", getattr(args, "jimu_apriltag_base_id", 1)))
+        if not _argv_has_option("--jimu-apriltag-base-size-m"):
+            args.jimu_apriltag_base_size_m = float(
+                base_tag.get("tag_black_square_size_m", getattr(args, "jimu_apriltag_base_size_m", 0.052))
+            )
+        # The provider reads T_builder_tag from the JSON, so yaw is no longer a
+        # separate user-maintained calibration for attached builder tags.
+        if not _argv_has_option("--jimu-apriltag-base-yaw-deg"):
+            args.jimu_apriltag_base_yaw_deg = 0.0
+    if isinstance(tray_tag, dict):
+        if not _argv_has_option("--jimu-apriltag-tray-id"):
+            args.jimu_apriltag_tray_id = int(tray_tag.get("tag_id", getattr(args, "jimu_apriltag_tray_id", 0)))
+        if not _argv_has_option("--jimu-apriltag-tray-size-m"):
+            args.jimu_apriltag_tray_size_m = float(
+                tray_tag.get("tag_black_square_size_m", getattr(args, "jimu_apriltag_tray_size_m", 0.06))
+            )
+        if not _argv_has_option("--jimu-apriltag-tray-yaw-deg"):
+            args.jimu_apriltag_tray_yaw_deg = float(getattr(args, "jimu_apriltag_tray_yaw_deg", 90.0))
+    print(
+        "[jimu-builder] apriltag defaults: "
+        f"base_id={int(getattr(args, 'jimu_apriltag_base_id', 1))} "
+        f"base_size={float(getattr(args, 'jimu_apriltag_base_size_m', 0.052)):.3f}m, "
+        f"tray_id={int(getattr(args, 'jimu_apriltag_tray_id', 0))} "
+        f"tray_size={float(getattr(args, 'jimu_apriltag_tray_size_m', 0.06)):.3f}m"
+    )
+
+
+def _builder_scene_enabled(args: argparse.Namespace | None = None) -> bool:
+    if args is not None and _normalize_builder_scene_path(getattr(args, "jimu_builder_scene_json", "")):
+        return True
+    return bool(_JIMU_BUILDER_ROLE_PIECES)
+
+
+def _builder_floor_anchor_world_pose(demo, bridge_mod, scene_capture_cache, args) -> tuple[np.ndarray | None, str]:
+    if isinstance(scene_capture_cache, dict):
+        objects = scene_capture_cache.get("objects")
+        entry = objects.get(portable.JIMU_FLOOR_ROLE) if isinstance(objects, dict) else None
+        if isinstance(entry, dict):
+            stable = None
+            stable_source = ""
+            try:
+                if entry.get("T_cam_obj") is not None and scene_capture_cache.get("T_base_cam") is not None:
+                    object_args = entry.get("object_args")
+                    if object_args is None:
+                        object_args = args
+                    stable = bridge_mod.map_camera_pose_to_pick_world(
+                        np.asarray(entry["T_cam_obj"], dtype=np.float32).reshape(4, 4),
+                        np.asarray(scene_capture_cache["T_base_cam"], dtype=np.float32).reshape(4, 4),
+                        demo.env,
+                        object_args,
+                    )
+                    stable_source = "cache_floor_T_cam_obj"
+            except Exception as exc:
+                print(f"[jimu-builder] warning: failed to map stable floor anchor from cached T_cam_obj: {exc}")
+                stable = None
+            try:
+                if stable is None and entry.get("jimu_T_base_obj") is not None:
+                    stable = portable._jimu_base_pose_to_pick_world_no_table_clamp(demo, bridge_mod, args, entry)
+                    stable_source = "cache_floor_jimu_T_base_obj"
+            except Exception as exc:
+                print(f"[jimu-builder] warning: failed to map stable floor anchor from cached jimu_T_base_obj: {exc}")
+            if stable is None and entry.get("T_world_obj") is not None:
+                try:
+                    stable = np.asarray(entry["T_world_obj"], dtype=np.float32).reshape(4, 4)
+                    stable_source = "cache_floor_T_world_obj"
+                except Exception:
+                    stable = None
+            if stable is not None:
+                try:
+                    scene_pose = portable.direct.targeted._get_scene_object_world_transform(
+                        demo,
+                        bridge_mod,
+                        scene_capture_cache,
+                        portable.JIMU_FLOOR_ROLE,
+                    )
+                    if scene_pose is not None:
+                        delta = float(
+                            np.linalg.norm(
+                                np.asarray(scene_pose, dtype=np.float32).reshape(4, 4)[:3, 3]
+                                - np.asarray(stable, dtype=np.float32).reshape(4, 4)[:3, 3]
+                            )
+                        )
+                        if delta > 0.005:
+                            print(
+                                "[jimu-builder] stable floor anchor overrides scene obstacle pose: "
+                                f"delta={delta * 1000.0:.1f}mm, "
+                                f"stable_z={float(stable[2, 3]):.4f}, "
+                                f"scene_z={float(np.asarray(scene_pose, dtype=np.float32).reshape(4, 4)[2, 3]):.4f}"
+                            )
+                except Exception:
+                    pass
+                return np.asarray(stable, dtype=np.float32).reshape(4, 4), stable_source or "cache_floor_anchor"
+    fallback = portable.direct.targeted._get_scene_object_world_transform(
+        demo,
+        bridge_mod,
+        scene_capture_cache,
+        portable.JIMU_FLOOR_ROLE,
+    )
+    if fallback is None:
+        return None, "missing"
+    return np.asarray(fallback, dtype=np.float32).reshape(4, 4), "scene_object"
+
+
+def _builder_parent_world_pose(
+    demo,
+    bridge_mod,
+    scene_capture_cache,
+    parent_role: str | None,
+    args=None,
+) -> tuple[np.ndarray | None, str]:
+    parent_piece = _builder_piece_lookup(parent_role)
+    if parent_piece is None:
+        return None, "missing"
+    parent = _builder_piece_role(parent_piece)
+    if not parent:
+        return None, "not_builder_piece"
+    is_locked = _builder_is_locked_piece(parent_piece)
+    if not is_locked:
+        try:
+            if not portable._is_jimu_role_placed(scene_capture_cache, parent):
+                return None, "parent_not_placed"
+        except Exception:
+            return None, "parent_not_placed"
+        if bool(getattr(args, "jimu_builder_use_design_parent_targets", False) if args is not None else False):
+            T_world_floor, anchor_source = _builder_floor_anchor_world_pose(demo, bridge_mod, scene_capture_cache, args)
+            if T_world_floor is not None:
+                T_builder_parent = _builder_floor_relative_piece_matrix(parent_piece, args)
+                T_world_parent = (
+                    np.asarray(T_world_floor, dtype=np.float32).reshape(4, 4)
+                    @ np.asarray(T_builder_parent, dtype=np.float32).reshape(4, 4)
+                ).astype(np.float32)
+                T_world_parent = _builder_apply_world_z_extra(
+                    T_world_parent,
+                    _builder_layer_cumulative_z_extra(parent, args),
+                )
+                return (
+                    T_world_parent,
+                    f"design_parent:{anchor_source}",
+                )
+    T_world_parent = portable.direct.targeted._get_scene_object_world_transform(
+        demo,
+        bridge_mod,
+        scene_capture_cache,
+        parent,
+    )
+    if T_world_parent is None:
+        return None, "parent_pose_missing"
+    return np.asarray(T_world_parent, dtype=np.float32).reshape(4, 4), "locked_parent" if is_locked else "placed_parent"
+
+
+def _builder_target_pose_from_floor(demo, bridge_mod, scene_capture_cache, source_name: str | None, args) -> np.ndarray | None:
+    role = portable.direct.curobo_wrapper.normalize_object_name(source_name)
+    if not role or role not in _JIMU_BUILDER_ROLE_PIECES:
+        return None
+    piece = _JIMU_BUILDER_ROLE_PIECES[role]
+    parent_role = str(piece.get("parentId") or "").strip()
+    T_world_parent, parent_source = _builder_parent_world_pose(demo, bridge_mod, scene_capture_cache, parent_role, args)
+    parent_piece = _builder_piece_lookup(parent_role)
+    if T_world_parent is not None and isinstance(parent_piece, dict):
+        T_parent_piece = _builder_parent_relative_matrix(piece, parent_piece)
+        T_world_piece = (np.asarray(T_world_parent, dtype=np.float32).reshape(4, 4) @ T_parent_piece).astype(np.float32)
+        z_extra = _builder_layer_increment_z_extra(role, args)
+        T_world_piece = _builder_apply_world_z_extra(T_world_piece, z_extra)
+        print(
+            f"[jimu-builder] {role}: using parent-relative target "
+            f"parent={_builder_piece_role(parent_piece) or parent_role}, source={parent_source}, "
+            f"parent_z={float(T_world_parent[2, 3]):.4f}, layer_z_extra={z_extra * 1000.0:.1f}mm"
+        )
+        return T_world_piece
+
+    T_world_floor, anchor_source = _builder_floor_anchor_world_pose(demo, bridge_mod, scene_capture_cache, args)
+    if T_world_floor is None:
+        return None
+    T_builder_piece = _builder_floor_relative_piece_matrix(piece, args)
+    T_world_piece = (np.asarray(T_world_floor, dtype=np.float32).reshape(4, 4) @ T_builder_piece).astype(np.float32)
+    z_extra = _builder_layer_cumulative_z_extra(role, args)
+    T_world_piece = _builder_apply_world_z_extra(T_world_piece, z_extra)
+    if role and str(anchor_source) != "scene_object":
+        print(
+            f"[jimu-builder] {role}: using stable builder floor anchor "
+            f"source={anchor_source}, floor_z={float(T_world_floor[2, 3]):.4f}, "
+            f"layer_z_extra={z_extra * 1000.0:.1f}mm"
+        )
+    return T_world_piece
+
+
+def _builder_piece_extents(piece: dict[str, Any], args: argparse.Namespace | None = None) -> np.ndarray:
+    piece_type = str(piece.get("type") or "").strip().lower()
+    if piece_type == "triangle":
+        return _triangle_extents().astype(np.float32)
+    if piece_type == "half_square":
+        return portable.DEFAULT_JIMU_HALF_PHYSICAL_EXTENTS_M.copy().astype(np.float32)
+    return portable._load_scaled_jimu_extents(args).astype(np.float32)
+
+
+def _builder_edge_offset(piece: dict[str, Any], edge_name: str | None, args: argparse.Namespace | None = None) -> np.ndarray | None:
+    edge = str(edge_name or "").strip().lower()
+    extents = _builder_piece_extents(piece, args)
+    if edge == "top":
+        return np.asarray([0.0, 0.0, 0.5 * float(extents[2])], dtype=np.float32)
+    if edge == "bottom":
+        return np.asarray([0.0, 0.0, -0.5 * float(extents[2])], dtype=np.float32)
+    if edge == "right":
+        return np.asarray([0.5 * float(extents[0]), 0.0, 0.0], dtype=np.float32)
+    if edge == "left":
+        return np.asarray([-0.5 * float(extents[0]), 0.0, 0.0], dtype=np.float32)
+    if edge == "left_contact":
+        return np.asarray([-0.5 * float(extents[0]), 0.0, 0.0], dtype=np.float32)
+    if edge == "right_contact":
+        return np.asarray([0.5 * float(extents[0]), 0.0, 0.0], dtype=np.float32)
+    return None
+
+
+def _print_builder_parent_contact_diagnostic(
+    role: str,
+    T_world_floor: np.ndarray,
+    T_world_piece: np.ndarray,
+    args: argparse.Namespace | None = None,
+    T_world_parent_override: np.ndarray | None = None,
+) -> None:
+    piece = _builder_piece_lookup(role, locked=False)
+    if not isinstance(piece, dict):
+        return
+    parent_role = str(piece.get("parentId") or "").strip()
+    if not parent_role:
+        return
+    parent_piece = _builder_piece_lookup(parent_role)
+    if not isinstance(parent_piece, dict):
+        return
+    parent_edge = str(piece.get("parentEdge") or "").strip()
+    child_edge = str(piece.get("childAttachEdge") or "").strip()
+    parent_offset = _builder_edge_offset(parent_piece, parent_edge, args)
+    child_offset = _builder_edge_offset(piece, child_edge, args)
+    if parent_offset is None or child_offset is None:
+        return
+    if T_world_parent_override is not None:
+        T_world_parent = np.asarray(T_world_parent_override, dtype=np.float32).reshape(4, 4)
+        parent_source = "actual"
+    else:
+        T_world_parent = (
+            np.asarray(T_world_floor, dtype=np.float32).reshape(4, 4)
+            @ _builder_floor_relative_piece_matrix(parent_piece, args)
+        ).astype(np.float32)
+        parent_source = "builder_floor"
+    parent_edge_point = (T_world_parent @ np.asarray([*parent_offset.tolist(), 1.0], dtype=np.float32))[:3]
+    child_edge_point = (np.asarray(T_world_piece, dtype=np.float32).reshape(4, 4) @ np.asarray([*child_offset.tolist(), 1.0], dtype=np.float32))[:3]
+    gap = child_edge_point - parent_edge_point
+    print(
+        f"[jimu-builder][contact] {role} {child_edge or '?'} -> "
+        f"{_builder_piece_role(parent_piece) or parent_role} {parent_edge or '?'}: "
+        f"edge_gap_mm={float(np.linalg.norm(gap)) * 1000.0:.3f}, "
+        f"gap_vec_mm={np.round(gap * 1000.0, 3).tolist()}, "
+        f"parent_source={parent_source}"
+    )
+
+
+def _jimu_base_support_local_poses_builder(args: argparse.Namespace | None = None) -> dict[str, np.ndarray]:
+    if not _builder_scene_enabled(args):
+        return _ORIGINAL_BASE_SUPPORT_LOCAL_POSES(args)
+    return {
+        role: _builder_floor_relative_piece_matrix(piece, args)
+        for role, piece in _JIMU_BUILDER_LOCKED_PIECES.items()
+    }
 
 
 def _should_pre_enable_apriltag() -> bool:
@@ -112,6 +1094,197 @@ def _add_arg_if_missing(parser: argparse.ArgumentParser, *option_strings: str, *
     if any(option in parser._option_string_actions for option in option_strings):
         return
     parser.add_argument(*option_strings, **kwargs)
+
+
+def _parse_apriltag_task_ids(text: str | None) -> list[int]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    if raw.lower() in {"all", "a", "*"}:
+        return [-1]
+    out: list[int] = []
+    for part in raw.replace(";", ",").replace(" ", ",").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            tag_id = int(item)
+        except ValueError as exc:
+            raise ValueError(f"invalid AprilTag task id {item!r}") from exc
+        if tag_id not in out:
+            out.append(tag_id)
+    return out
+
+
+def _strip_cli_options(argv: list[str], value_options: set[str], bool_options: set[str]) -> list[str]:
+    cleaned = [argv[0]]
+    skip_next = False
+    for idx, item in enumerate(argv[1:]):
+        if skip_next:
+            skip_next = False
+            continue
+        option = str(item)
+        if option in bool_options:
+            continue
+        if option in value_options:
+            rest = argv[1:]
+            if idx + 1 < len(rest):
+                skip_next = True
+            continue
+        if any(option.startswith(f"{flag}=") for flag in value_options):
+            continue
+        cleaned.append(item)
+    return cleaned
+
+
+def _detect_apriltag_task_ids(args: argparse.Namespace) -> tuple[list[int], str | None]:
+    import jimu_sam6d_pose_provider as jimu_provider
+
+    max_attempts = max(
+        1,
+        int(getattr(args, "jimu_apriltag_task_select_attempts", DEFAULT_APRILTAG_TASK_SELECT_ATTEMPTS) or 1),
+    )
+    required_hint = int(getattr(args, "jimu_apriltag_tray_id", 0))
+    requested_task_ids = _parse_apriltag_task_ids(getattr(args, "jimu_apriltag_task_ids", ""))
+    requested_set = set() if requested_task_ids == [-1] else {int(v) for v in requested_task_ids}
+    print(f"[jimu-task-select] detecting AprilTags before task selection; attempts={max_attempts}")
+
+    offline = (
+        getattr(args, "rgb_path", None) is not None
+        or getattr(args, "depth_path", None) is not None
+        or getattr(args, "camera_path", None) is not None
+    )
+    best: tuple[int, dict, list[np.ndarray], list[int], Any] | None = None
+    if offline:
+        frame = jimu_provider.provider.load_offline_frame(args)
+        corners, ids = jimu_provider._detect_apriltag_markers(frame)
+        id_values = [] if ids is None else [int(v) for v in np.asarray(ids).reshape(-1).tolist()]
+        best = (len(id_values), frame, corners, id_values, ids)
+        print(f"[jimu-task-select] offline frame detected tag ids: {id_values}")
+    else:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                frame = jimu_provider.provider.capture_realsense_frame(args)
+            except RuntimeError as exc:
+                print(f"[jimu-task-select] attempt {attempt}/{max_attempts}: frame capture failed: {exc}")
+                continue
+            corners, ids = jimu_provider._detect_apriltag_markers(frame)
+            id_values = [] if ids is None else [int(v) for v in np.asarray(ids).reshape(-1).tolist()]
+            selectable_count = sum(1 for tag_id in id_values if tag_id != required_hint)
+            detected_set = set(id_values)
+            requested_hit_count = len(requested_set & detected_set)
+            score = (
+                100 * requested_hit_count
+                + 10 * selectable_count
+                + len(id_values)
+                + (1 if required_hint in detected_set else 0)
+            )
+            print(f"[jimu-task-select] attempt {attempt}/{max_attempts}: detected tag ids: {id_values}")
+            if best is None or score > best[0]:
+                best = (score, frame, corners, id_values, ids)
+            if requested_set:
+                if requested_set.issubset(detected_set):
+                    break
+            elif selectable_count > 0:
+                break
+    if best is None:
+        raise RuntimeError("failed to capture any frame for AprilTag task selection")
+
+    _score, frame, corners, id_values, _ids = best
+    output_root = Path(getattr(args, "sam6d_output_root", Path(__file__).resolve().parent / "sam6d_jimu_direct_runs")).expanduser()
+    scene_dir = output_root / f"{jimu_provider.provider._now_stamp()}_apriltag_task_select_pid{os.getpid()}"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    shared_frame_dir = scene_dir / "shared_frame"
+    shared_frame_dir.mkdir(parents=True, exist_ok=True)
+    jimu_provider.provider.save_sam6d_input_frame(frame, shared_frame_dir)
+    overlay_items = [
+        {
+            "tag_id": int(tag_id),
+            "image_corners_px": np.asarray(corner).reshape(4, 2).astype(float).tolist(),
+            "used": False,
+        }
+        for tag_id, corner in zip(id_values, corners)
+    ]
+    overlay_path = scene_dir / "apriltag_task_select_overlay.png"
+    jimu_provider._save_apriltag_overlay(frame, overlay_items, overlay_path)
+    result_path = scene_dir / "apriltag_task_select_result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "detected_tag_ids": id_values,
+                "tray_tag_id_hint": required_hint,
+                "overlay_path": str(overlay_path),
+                "frame_dir": str(shared_frame_dir),
+            },
+            indent=2,
+        )
+    )
+    print(f"[jimu-task-select] selected frame tag ids: {id_values}")
+    print(f"[jimu-task-select] overlay: {overlay_path}")
+    return id_values, str(overlay_path)
+
+
+def _select_apriltag_task_ids(args: argparse.Namespace, detected_ids: list[int]) -> list[int]:
+    tray_id = int(getattr(args, "jimu_apriltag_tray_id", 0))
+    explicit = _parse_apriltag_task_ids(getattr(args, "jimu_apriltag_task_ids", ""))
+    selectable = [tag_id for tag_id in detected_ids if tag_id != tray_id]
+    if explicit == [-1]:
+        selected = list(selectable)
+    elif explicit:
+        selected = explicit
+    else:
+        if not selectable:
+            raise RuntimeError(f"no selectable task tag was detected; detected={detected_ids}, tray_id={tray_id}")
+        print("[jimu-task-select] detected task tags:")
+        for tag_id in selectable:
+            label = "standard/base task" if tag_id == 1 else ("arc/base task" if tag_id == 2 else "custom tag task")
+            print(f"  tag {tag_id}: {label}")
+        choice = input("[jimu-task-select] choose task tag id(s), e.g. 1 / 2 / 1,2 / all / q: ").strip()
+        if choice.lower() in {"q", "quit", "exit"}:
+            raise SystemExit("[jimu-task-select] aborted by user")
+        parsed = _parse_apriltag_task_ids(choice)
+        selected = list(selectable) if parsed == [-1] else parsed
+    missing = [tag_id for tag_id in selected if tag_id not in set(detected_ids)]
+    if missing:
+        raise RuntimeError(f"selected tag id(s) were not detected: {missing}; detected={detected_ids}")
+    selected = [tag_id for tag_id in selected if tag_id != tray_id]
+    if not selected:
+        raise RuntimeError(f"no task tag selected after excluding tray tag id={tray_id}")
+    return selected
+
+
+def _run_selected_apriltag_tasks() -> None:
+    args = parse_args_triangle()
+    detected_ids, _overlay = _detect_apriltag_task_ids(args)
+    selected_ids = _select_apriltag_task_ids(args, detected_ids)
+    print(f"[jimu-task-select] running selected task tag id(s): {selected_ids}")
+
+    base_argv = _strip_cli_options(
+        list(sys.argv),
+        value_options={
+            "--jimu-apriltag-task-ids",
+            "--jimu-apriltag-task-select-attempts",
+            "--jimu-apriltag-base-id",
+        },
+        bool_options={
+            "--jimu-apriltag-task-select",
+            "--no-jimu-apriltag-task-select",
+        },
+    )
+    for index, tag_id in enumerate(selected_ids, start=1):
+        child_argv = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            *base_argv[1:],
+            "--jimu-apriltag-anchor-localization",
+            "--jimu-apriltag-base-id",
+            str(int(tag_id)),
+        ]
+        print(f"[jimu-task-select] task {index}/{len(selected_ids)}: base tag id={tag_id}")
+        print("[jimu-task-select] command:", " ".join(child_argv))
+        proc = subprocess.run(child_argv)
+        if proc.returncode != 0:
+            raise SystemExit(proc.returncode)
 
 
 def _triangle_profile_enabled(args: argparse.Namespace | None) -> bool:
@@ -749,28 +1922,32 @@ def _install_roof_role_constants() -> None:
 
 def _triangle_extents() -> np.ndarray:
     try:
-        spec = portable.object_specs.get_object_spec("red_triangle_front")
-        if spec is not None:
-            _, sim_scale = portable.object_specs.resolve_object_spec_scales(spec)
-            mesh_path = Path(spec.sim_asset_file or spec.mesh_file).expanduser()
-            if mesh_path.exists():
-                loaded = trimesh.load(mesh_path, force="scene")
-                bounds = np.asarray(loaded.bounds, dtype=np.float32)
-                extents = (bounds[1] - bounds[0]) * float(sim_scale)
-                if extents.shape == (3,) and np.all(np.isfinite(extents)) and float(np.min(extents)) > 1e-6:
-                    return extents.astype(np.float32)
+        mesh_path, sim_scale = _triangle_geometry_mesh_and_scale()
+        if mesh_path is not None and mesh_path.exists():
+            loaded = trimesh.load(mesh_path, force="scene")
+            bounds = np.asarray(loaded.bounds, dtype=np.float32)
+            extents = (bounds[1] - bounds[0]) * float(sim_scale)
+            if extents.shape == (3,) and np.all(np.isfinite(extents)) and float(np.min(extents)) > 1e-6:
+                return extents.astype(np.float32)
     except Exception as exc:
         print(f"[triangle-roof] warning: failed to resolve triangle extents, using fallback: {exc}")
     return DEFAULT_TRIANGLE_EXTENTS_M.copy()
 
 
+def _triangle_geometry_mesh_and_scale() -> tuple[Path | None, float]:
+    if DEMO_TRIANGLE_MESH.exists():
+        return DEMO_TRIANGLE_MESH, 1.0
+    spec = portable.object_specs.get_object_spec("red_triangle_front")
+    if spec is None:
+        return None, 1.0
+    _, sim_scale = portable.object_specs.resolve_object_spec_scales(spec)
+    return Path(spec.sim_asset_file or spec.mesh_file).expanduser(), float(sim_scale)
+
+
 def _triangle_tip_needs_local_y_flip() -> bool:
     try:
-        spec = portable.object_specs.get_object_spec("red_triangle_front")
-        if spec is None:
-            return False
-        mesh_path = Path(spec.sim_asset_file or spec.mesh_file).expanduser()
-        if not mesh_path.exists():
+        mesh_path, _ = _triangle_geometry_mesh_and_scale()
+        if mesh_path is None or not mesh_path.exists():
             return False
         loaded = trimesh.load(mesh_path, force="scene")
         vertices = [
@@ -815,6 +1992,23 @@ def _rot_z_deg(deg: float) -> np.ndarray:
         ],
         dtype=np.float32,
     )
+
+
+def _rot_rpy_deg(rpy_deg: Any) -> np.ndarray:
+    try:
+        roll, pitch, yaw = [float(v) for v in list(rpy_deg)[:3]]
+    except Exception:
+        return np.eye(3, dtype=np.float32)
+    rx = np.deg2rad(roll)
+    ry = np.deg2rad(pitch)
+    rz = np.deg2rad(yaw)
+    cx, sx = float(np.cos(rx)), float(np.sin(rx))
+    cy, sy = float(np.cos(ry)), float(np.sin(ry))
+    cz, sz = float(np.cos(rz)), float(np.sin(rz))
+    Rx = np.asarray([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float32)
+    Ry = np.asarray([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32)
+    Rz = np.asarray([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    return (Rz @ Ry @ Rx).astype(np.float32)
 
 
 def _triangle_tip_up_local_rpy_deg() -> tuple[float, float, float]:
@@ -868,6 +2062,66 @@ def _enable_roof_curobo_mesh_obstacles(args: argparse.Namespace) -> None:
 def install_jimu_object_specs_triangle(args: argparse.Namespace | None = None) -> None:
     _ORIGINAL_INSTALL_JIMU_OBJECT_SPECS(args)
     if not _triangle_profile_enabled(args):
+        return
+
+    if _builder_scene_enabled(args):
+        square_spec = portable.object_specs.get_object_spec(portable.JIMU_PROVIDER_OBJECT_NAME)
+        triangle_spec = _demo_triangle_spec("red_triangle_front")
+        if square_spec is None:
+            raise RuntimeError(f"Missing Jimu square object spec: {portable.JIMU_PROVIDER_OBJECT_NAME}")
+        if triangle_spec is None:
+            raise RuntimeError("Missing Jimu triangle object spec: red_triangle_front")
+        square_sim_asset = portable._jimu_sim_asset_file_override(args)
+        if square_sim_asset:
+            square_spec = replace(
+                square_spec,
+                sim_asset_file=str(square_sim_asset),
+                sim_asset_scale=1.0,
+            )
+        half_asset = getattr(portable, "PORTABLE_DEFAULT_HALF_SIM_ASSET_FILE", None)
+        half_spec = square_spec
+        if half_asset is not None:
+            half_spec = replace(
+                square_spec,
+                mesh_file=str(half_asset),
+                mesh_scale=1.0,
+                sim_asset_file=str(half_asset),
+                sim_asset_scale=1.0,
+            )
+        local_rotation_offset = portable._jimu_cad_to_sim_rpy_deg(args)
+        for role, piece in {**_JIMU_BUILDER_LOCKED_PIECES, **_JIMU_BUILDER_ROLE_PIECES}.items():
+            piece_type = str(piece.get("type") or "").strip().lower()
+            if piece_type == "triangle":
+                base_spec = triangle_spec
+                prompt = "red isosceles triangle building panel."
+                obstacle_scale = _roof_scene_obstacle_box_scale(args)
+            elif piece_type == "half_square":
+                base_spec = half_spec
+                prompt = "small rectangular half-size plastic building plate."
+                obstacle_scale = getattr(base_spec, "scene_obstacle_box_scale", None)
+            else:
+                base_spec = square_spec
+                prompt = "small square plastic building block."
+                obstacle_scale = getattr(base_spec, "scene_obstacle_box_scale", None)
+            portable.object_specs.OBJECT_SPECS[role] = replace(
+                base_spec,
+                name=role,
+                grounding_prompt=prompt,
+                foundationpose_local_rotation_offset_deg=local_rotation_offset,
+                scene_obstacle_box_scale=obstacle_scale,
+            )
+            portable.object_specs.OBJECT_NAME_ALIASES[role] = role
+        for role in TRIANGLE_ROLE_SPECS:
+            if role in _JIMU_BUILDER_LOCKED_PIECES or role in _JIMU_BUILDER_ROLE_PIECES:
+                continue
+            portable.object_specs.OBJECT_SPECS[role] = replace(
+                triangle_spec,
+                name=role,
+                grounding_prompt="red isosceles triangle building panel.",
+                foundationpose_local_rotation_offset_deg=local_rotation_offset,
+                scene_obstacle_box_scale=_roof_scene_obstacle_box_scale(args),
+            )
+            portable.object_specs.OBJECT_NAME_ALIASES[role] = role
         return
 
     for triangle_name in set(TRIANGLE_ROLE_SPECS.values()):
@@ -970,6 +2224,35 @@ def _jimu_roof_triangle_target_pose_from_floor(
 
 
 def _jimu_floor_anchor_second_layer_and_roof_plans(plans, demo, bridge_mod, scene_capture_cache, source_name: str | None, args) -> list:
+    builder_target = _builder_target_pose_from_floor(demo, bridge_mod, scene_capture_cache, source_name, args)
+    if builder_target is not None:
+        anchored = [portable._jimu_rebuild_place_plan_for_target(plan, builder_target) for plan in list(plans or [])]
+        print(
+            f"[jimu-builder] {source_name}: target anchored from builder scene, "
+            f"target_xyz={np.round(builder_target[:3, 3], 6).tolist()}, "
+            f"axis_yaw_deg={portable._format_axis_yaws_deg(builder_target)}"
+        )
+        T_world_floor, _ = _builder_floor_anchor_world_pose(demo, bridge_mod, scene_capture_cache, args)
+        if T_world_floor is not None:
+            parent_role = ""
+            parent_world = None
+            try:
+                piece = _builder_piece_lookup(
+                    portable.direct.curobo_wrapper.normalize_object_name(source_name) or str(source_name)
+                )
+                if isinstance(piece, dict):
+                    parent_role = str(piece.get("parentId") or "").strip()
+                    parent_world, _ = _builder_parent_world_pose(demo, bridge_mod, scene_capture_cache, parent_role, args)
+            except Exception:
+                parent_world = None
+            _print_builder_parent_contact_diagnostic(
+                portable.direct.curobo_wrapper.normalize_object_name(source_name) or str(source_name),
+                np.asarray(T_world_floor, dtype=np.float32).reshape(4, 4),
+                builder_target,
+                args,
+                T_world_parent_override=parent_world,
+            )
+        return anchored
     if source_name in set(JIMU_ROOF_TRIANGLE_ROLES):
         target = _jimu_roof_triangle_target_pose_from_floor(demo, bridge_mod, scene_capture_cache, source_name, args)
         if target is None:
@@ -986,6 +2269,29 @@ def _jimu_floor_anchor_second_layer_and_roof_plans(plans, demo, bridge_mod, scen
 def install_jimu_place_rules_triangle(args: argparse.Namespace | None = None) -> None:
     _ORIGINAL_INSTALL_JIMU_PLACE_RULES(args)
     if not _triangle_profile_enabled(args):
+        return
+    if _builder_scene_enabled(args):
+        for role, piece in _JIMU_BUILDER_ROLE_PIECES.items():
+            is_triangle = str(piece.get("type") or "").strip().lower() == "triangle"
+            hover_height = float(
+                getattr(args, "jimu_roof_hover_height" if is_triangle else "jimu_wall_hover_height", 0.08)
+                if args is not None
+                else 0.08
+            )
+            release_retreat_height = float(
+                getattr(args, "jimu_roof_release_retreat_height" if is_triangle else "jimu_wall_release_retreat_height", 0.08)
+                if args is not None
+                else 0.08
+            )
+            portable.place_rules.PLACE_RULES[role] = portable.place_rules.PlaceRule(
+                source_object_name=role,
+                target_object_name=portable.JIMU_FLOOR_ROLE,
+                primitive="jimu_relative_pose",
+                hover_height=hover_height,
+                release_retreat_height=release_retreat_height,
+                preserve_long_axis_vertical=True,
+                object_pose_local=portable.place_rules.LocalPoseSpec(position=(0.0, 0.0, 0.0)),
+            )
         return
     hover_height = float(
         getattr(
@@ -1029,6 +2335,31 @@ def _jimu_layer_filtered_target_pool_triangle(
         for item in list(pool or [])
     ]
     normalized_pool = [item for item in normalized_pool if item is not None]
+    if _builder_scene_enabled(base_args):
+        if not any(role in _JIMU_BUILDER_ROLE_PIECES for role in normalized_pool):
+            return pool, []
+        pool_set = set(normalized_pool)
+        for idx, layer in enumerate(_JIMU_BUILDER_LAYER_ROLES, start=1):
+            layer_pending = [
+                role
+                for role in layer
+                if role in pool_set and not portable._is_jimu_role_placed(scene_capture_cache, role)
+            ]
+            global_pending = [
+                role
+                for role in layer
+                if not portable._is_jimu_role_placed(scene_capture_cache, role)
+            ]
+            if global_pending:
+                if layer_pending:
+                    return layer_pending, []
+                deferred = [role for role in normalized_pool if role in _JIMU_BUILDER_ROLE_PIECES]
+                print(
+                    f"[jimu-builder] holding later builder layers until layer {idx} is complete: "
+                    f"pending={global_pending}, candidates={deferred}"
+                )
+                return [], deferred
+        return pool, []
     if not any(role in set(portable.JIMU_PICK_ROLES) for role in normalized_pool):
         return pool, []
     pool_set = set(normalized_pool)
@@ -1056,6 +2387,23 @@ def _jimu_tray_slot_local_poses_triangle(args: argparse.Namespace | None = None)
     poses = _ORIGINAL_TRAY_SLOT_LOCAL_POSES(args)
     if not _triangle_profile_enabled(args):
         return poses
+    manifest = _JIMU_TASK_MANIFEST_CACHE if isinstance(_JIMU_TASK_MANIFEST_CACHE, dict) else {}
+    tray_cfg = manifest.get("tray") if isinstance(manifest.get("tray"), dict) else {}
+    layout = tray_cfg.get("slot_layout")
+    role_slot_cfg = {
+        str(item.get("role") or "").strip(): item
+        for item in list(layout or [])
+        if isinstance(item, dict) and str(item.get("role") or "").strip()
+    }
+    for role, item in role_slot_cfg.items():
+        if role not in poses:
+            continue
+        rpy = item.get("tray_local_rpy_deg")
+        if rpy in (None, ""):
+            continue
+        T = np.asarray(poses[role], dtype=np.float32).reshape(4, 4).copy()
+        T[:3, :3] = (T[:3, :3] @ _rot_rpy_deg(rpy)).astype(np.float32)
+        poses[role] = T
 
     tip_rotation = _triangle_tip_up_local_rotation()
     yaw_offset_deg = float(
@@ -1173,125 +2521,6 @@ def _roof_normalize_vec(vec) -> np.ndarray | None:
     return (arr / norm).astype(np.float32)
 
 
-def _roof_hover_variant_specs(args) -> list[dict]:
-    try:
-        max_variants = max(1, int(getattr(args, "jimu_roof_hover_variants_per_source", 6) or 6))
-    except Exception:
-        max_variants = 6
-    low_height = float(max(getattr(args, "jimu_roof_hover_low_height", 0.03), 0.0))
-    outward_distance = float(max(getattr(args, "jimu_roof_hover_outward_distance", 0.035), 0.0))
-    outward_up = float(max(getattr(args, "jimu_roof_hover_outward_up_m", 0.02), 0.0))
-    original_extra = float(max(getattr(args, "jimu_roof_hover_original_extra_m", 0.03), 0.0))
-    if _roof_uniform_preplace_height_enabled(args):
-        return [{"kind": "world_z", "label": "roof_world_z"}]
-    specs = [
-        {"kind": "world_z", "label": "roof_world_z"},
-        {"kind": "release_direct", "label": "roof_release_direct"},
-        {"kind": "original", "label": "roof_tcp_axis"},
-    ]
-    if low_height > 1e-6:
-        specs.append({"kind": "world_z_height", "height": low_height, "label": f"roof_world_z_{int(round(low_height * 1000.0))}mm"})
-    if original_extra > 1e-6:
-        specs.append(
-            {
-                "kind": "original_extend",
-                "extra": original_extra,
-                "label": f"roof_tcp_axis_plus_{int(round(original_extra * 1000.0))}mm",
-            }
-        )
-    if outward_distance > 1e-6:
-        specs.append(
-            {
-                "kind": "object_y",
-                "sign": 1.0,
-                "distance": outward_distance,
-                "up": outward_up,
-                "label": f"roof_obj_y_plus_{int(round(outward_distance * 1000.0))}mm",
-            }
-        )
-        specs.append(
-            {
-                "kind": "object_y",
-                "sign": -1.0,
-                "distance": outward_distance,
-                "up": outward_up,
-                "label": f"roof_obj_y_minus_{int(round(outward_distance * 1000.0))}mm",
-            }
-        )
-    return specs[:max_variants]
-
-
-def _roof_hover_pose_for_variant(
-    item: dict,
-    release_pose,
-    original_hover_pose,
-    args,
-    rule,
-    variant: dict | None,
-):
-    variant = dict(variant or {"kind": "world_z", "label": "roof_world_z"})
-    kind = str(variant.get("kind", "world_z") or "world_z")
-    release_p = _roof_pose_position(release_pose)
-    if kind == "release_direct":
-        if _roof_uniform_preplace_height_enabled(args):
-            return _roof_force_uniform_preplace_height(release_pose, release_pose, args, rule)
-        return release_pose
-    if kind == "world_z":
-        return _roof_force_uniform_preplace_height(
-            _roof_world_z_hover_from_release(release_pose, args, rule),
-            release_pose,
-            args,
-            rule,
-        )
-    if kind == "world_z_height":
-        height = float(max(variant.get("height", 0.0) or 0.0, 0.0))
-        if height <= 1e-8:
-            return release_pose
-        return _roof_force_uniform_preplace_height(
-            _roof_make_pose_with_position(release_pose, release_p + np.asarray([0.0, 0.0, height], dtype=np.float32)),
-            release_pose,
-            args,
-            rule,
-        )
-    if kind == "original" and original_hover_pose is not None:
-        return _roof_force_uniform_preplace_height(original_hover_pose, release_pose, args, rule)
-    if kind == "original_extend" and original_hover_pose is not None:
-        try:
-            hover_pose = portable.direct._extend_hover_pose_along_release_approach(
-                release_pose,
-                original_hover_pose,
-                float(max(variant.get("extra", 0.0) or 0.0, 0.0)),
-            )
-            return _roof_force_uniform_preplace_height(hover_pose, release_pose, args, rule)
-        except Exception:
-            return _roof_force_uniform_preplace_height(original_hover_pose, release_pose, args, rule)
-    if kind == "object_y":
-        try:
-            T_world_obj = np.asarray(item.get("T_world_obj_desired"), dtype=np.float32).reshape(4, 4)
-            axis = _roof_normalize_vec(T_world_obj[:3, 1])
-        except Exception:
-            axis = None
-        if axis is not None:
-            sign = 1.0 if float(variant.get("sign", 1.0) or 1.0) >= 0.0 else -1.0
-            distance = float(max(variant.get("distance", 0.0) or 0.0, 0.0))
-            up = float(max(variant.get("up", 0.0) or 0.0, 0.0))
-            return _roof_force_uniform_preplace_height(
-                _roof_make_pose_with_position(
-                    release_pose,
-                    release_p + axis * sign * distance + np.asarray([0.0, 0.0, up], dtype=np.float32),
-                ),
-                release_pose,
-                args,
-                rule,
-            )
-    return _roof_force_uniform_preplace_height(
-        _roof_world_z_hover_from_release(release_pose, args, rule),
-        release_pose,
-        args,
-        rule,
-    )
-
-
 def _roof_post_place_retreat_m(args) -> float:
     if (
         _argv_has_option("--jimu-roof-post-place-tilt-retreat-m")
@@ -1312,180 +2541,6 @@ def _roof_post_place_retreat_m(args) -> float:
     )
 
 
-def _roof_tilt_axis_retreat_from_release(release_pose, args):
-    retreat_m = _roof_post_place_retreat_m(args)
-    if retreat_m <= 1e-8:
-        return release_pose
-    release_p = _roof_pose_position(release_pose)
-    try:
-        T_world_tcp = portable.direct._pose_to_matrix_from_pose_obj(release_pose).astype(np.float32)
-        axes_world = T_world_tcp[:3, :3]
-        z_dots = axes_world.T @ np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-        axis_idx = int(np.argmax(np.abs(z_dots)))
-        sign = 1.0 if float(z_dots[axis_idx]) >= 0.0 else -1.0
-        retreat_dir = _roof_normalize_vec(axes_world[:, axis_idx] * sign)
-    except Exception:
-        retreat_dir = None
-    if retreat_dir is None:
-        retreat_dir = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-    return _roof_make_pose_with_position(release_pose, release_p + retreat_dir * retreat_m)
-
-
-def _roof_post_place_plane_basis(item: dict, release_pose, hover_pose):
-    release_p = _roof_pose_position(release_pose)
-    plane_normal = None
-    plane_x = None
-    plane_z = None
-    try:
-        T_world_obj = np.asarray(item.get("T_world_obj_desired"), dtype=np.float32).reshape(4, 4)
-        R_world_obj = T_world_obj[:3, :3].astype(np.float32)
-        # Jimu plates and triangle panels use local Y as the thin axis, so the
-        # broad placement face is the local X/Z plane.
-        plane_x = _roof_normalize_vec(R_world_obj[:, 0])
-        plane_normal = _roof_normalize_vec(R_world_obj[:, 1])
-        plane_z = _roof_normalize_vec(R_world_obj[:, 2])
-    except Exception:
-        plane_x = None
-        plane_normal = None
-        plane_z = None
-
-    main_dir = None
-    if hover_pose is not None:
-        raw_dir = _roof_normalize_vec(_roof_pose_position(hover_pose) - release_p)
-        if raw_dir is not None and plane_normal is not None:
-            projected = raw_dir - plane_normal * float(np.dot(raw_dir, plane_normal))
-            main_dir = _roof_normalize_vec(projected)
-        elif raw_dir is not None:
-            main_dir = raw_dir
-    if main_dir is None and plane_z is not None:
-        z_dot = float(np.dot(plane_z, np.asarray([0.0, 0.0, 1.0], dtype=np.float32)))
-        main_dir = _roof_normalize_vec(plane_z * (1.0 if z_dot >= 0.0 else -1.0))
-    if main_dir is None and plane_x is not None:
-        main_dir = plane_x
-    if main_dir is None:
-        main_dir = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-
-    if plane_normal is not None:
-        perp_dir = _roof_normalize_vec(np.cross(plane_normal, main_dir))
-    else:
-        perp_dir = _roof_normalize_vec(np.cross(main_dir, np.asarray([0.0, 0.0, 1.0], dtype=np.float32)))
-    if perp_dir is None and plane_x is not None:
-        perp_dir = plane_x
-    if perp_dir is None:
-        perp_dir = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
-
-    # Re-orthogonalize main inside the panel plane after choosing perp.
-    if plane_normal is not None:
-        reorthogonalized_main = _roof_normalize_vec(np.cross(perp_dir, plane_normal))
-        if reorthogonalized_main is not None:
-            main_dir = reorthogonalized_main
-        if hover_pose is not None:
-            hover_dir = _roof_normalize_vec(_roof_pose_position(hover_pose) - release_p)
-            if hover_dir is not None and float(np.dot(main_dir, hover_dir)) < 0.0:
-                main_dir = -main_dir
-                perp_dir = -perp_dir
-    return main_dir.astype(np.float32), perp_dir.astype(np.float32), plane_normal
-
-
-def _roof_post_place_translation_retreat_candidates(item: dict, release_pose, hover_pose, args) -> list[dict]:
-    retreat_m = _roof_post_place_retreat_m(args)
-    if retreat_m <= 1e-8:
-        return [{"label": "retreat_zero", "pose": release_pose}]
-    release_p = _roof_pose_position(release_pose)
-    main_dir, perp_dir, plane_normal = _roof_post_place_plane_basis(item, release_pose, hover_pose)
-    world_up = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-
-    lateral = float(max(getattr(args, "jimu_roof_post_place_retreat_lateral_step_m", 0.006), 0.0))
-    forward_extra = float(max(getattr(args, "jimu_roof_post_place_retreat_forward_extra_m", 0.010), 0.0))
-    up_ratio = float(max(getattr(args, "jimu_roof_post_place_retreat_up_ratio", DEFAULT_ROOF_POST_PLACE_RETREAT_UP_RATIO), 0.0))
-    up_m = float(min(retreat_m * up_ratio, 0.025))
-    followup_up_m = float(max(getattr(args, "jimu_roof_post_place_followup_up_m", DEFAULT_ROOF_POST_PLACE_FOLLOWUP_UP_M), 0.0))
-    followup_side_m = float(
-        max(getattr(args, "jimu_roof_post_place_followup_side_m", DEFAULT_ROOF_POST_PLACE_FOLLOWUP_SIDE_M), 0.0)
-    )
-    try:
-        max_count = max(1, int(getattr(args, "jimu_roof_post_place_retreat_candidate_count", 16) or 16))
-    except Exception:
-        max_count = 16
-    allow_free_motiongen = bool(getattr(args, "jimu_roof_post_place_free_motiongen_fallback", False))
-
-    far_m = float(retreat_m + max(forward_extra, 4.0 * lateral, 0.025))
-    specs = []
-    for level_label, dist in (("near", retreat_m), ("far", far_m)):
-        diag = float(dist / max(2.0 ** 0.5, 1e-6))
-        specs.extend(
-            [
-                (f"plane_main_p_{level_label}_up", dist, 0.0, up_m),
-                (f"plane_main_m_{level_label}_up", -dist, 0.0, up_m),
-                (f"plane_perp_p_{level_label}_up", 0.0, dist, up_m),
-                (f"plane_perp_m_{level_label}_up", 0.0, -dist, up_m),
-                (f"plane_diag_pp_{level_label}_up", diag, diag, up_m),
-                (f"plane_diag_pm_{level_label}_up", diag, -diag, up_m),
-                (f"plane_diag_mp_{level_label}_up", -diag, diag, up_m),
-                (f"plane_diag_mm_{level_label}_up", -diag, -diag, up_m),
-            ]
-        )
-    candidates = []
-    for label, main_offset, perp_offset, up_offset in specs[:max_count]:
-        delta = (
-            main_dir * float(main_offset)
-            + perp_dir * float(perp_offset)
-            + world_up * float(up_offset)
-        )
-        candidate_pose = _roof_make_pose_with_position(release_pose, release_p + delta)
-        plane_normal_error = 0.0
-        if plane_normal is not None:
-            plane_normal_error = float(np.dot(delta, plane_normal))
-        candidate = {
-            "label": f"roof_post_{label}",
-            "pose": candidate_pose,
-            "plane_main_m": float(main_offset),
-            "plane_perp_m": float(perp_offset),
-            "world_z_m": float(up_offset),
-            "retreat_up_ratio": float(up_ratio),
-            "retreat_delta_norm_m": float(np.linalg.norm(delta)),
-            "plane_normal_error_m": plane_normal_error,
-            "allow_post_place_free_motiongen": allow_free_motiongen,
-            "post_place_endpoint_ik_first": True,
-        }
-        if followup_up_m > 1e-6:
-            candidate_p = release_p + delta
-            side_sign = 1.0 if float(perp_offset) >= 0.0 else -1.0
-            followup_specs = [
-                ("follow_world_z", 0.0, 0.0, followup_up_m),
-                ("follow_world_z_short", 0.0, 0.0, 0.75 * followup_up_m),
-                ("follow_same_side_up", 0.0, side_sign * followup_side_m, followup_up_m),
-                ("follow_opposite_side_up", 0.0, -side_sign * followup_side_m, followup_up_m),
-                ("follow_world_z_long", 0.0, 0.0, 1.25 * followup_up_m),
-            ]
-            followups = []
-            for follow_label, follow_main, follow_perp, follow_up in followup_specs:
-                follow_delta = (
-                    main_dir * float(follow_main)
-                    + perp_dir * float(follow_perp)
-                    + world_up * float(follow_up)
-                )
-                followups.append(
-                    {
-                        "label": f"roof_post_{label}_{follow_label}",
-                        "pose": _roof_make_pose_with_position(release_pose, candidate_p + follow_delta),
-                        "plane_main_m": float(main_offset + follow_main),
-                        "plane_perp_m": float(perp_offset + follow_perp),
-                        "world_z_m": float(up_offset + follow_up),
-                        "followup_plane_main_m": float(follow_main),
-                        "followup_plane_perp_m": float(follow_perp),
-                        "followup_world_z_m": float(follow_up),
-                        "followup_delta_norm_m": float(np.linalg.norm(follow_delta)),
-                        "allow_post_place_free_motiongen": allow_free_motiongen,
-                        "post_place_endpoint_ik_first": True,
-                    }
-                )
-            candidate["followup_retreat_pose_candidates"] = followups
-            candidate["require_followup_retreat"] = False
-        candidates.append(candidate)
-    return candidates
-
-
 def _make_jimu_parallel_grasp_place_candidate_triangle(
     grasp_candidate: dict,
     place_candidate: dict,
@@ -1500,38 +2555,22 @@ def _make_jimu_parallel_grasp_place_candidate_triangle(
     release_pose = item.get("release_pose", item.get("place_pose"))
     if release_pose is None:
         return item
-    original_hover_pose = item.get("hover_pose", item.get("pose"))
-    hover_variant = dict(place_candidate.get("_jimu_roof_hover_variant") or item.get("_jimu_roof_hover_variant") or {})
-    hover_pose = _roof_hover_pose_for_variant(item, release_pose, original_hover_pose, args, rule, hover_variant)
-    item["pose"] = hover_pose
-    item["hover_pose"] = hover_pose
-    item["pre_place_pose"] = hover_pose
+    hover_pose = item.get("hover_pose", item.get("pose"))
     item["place_pose"] = release_pose
     item["release_pose"] = release_pose
-    retreat_candidates = _roof_post_place_translation_retreat_candidates(item, release_pose, hover_pose, args)
-    item["retreat_pose_candidates"] = retreat_candidates
-    item["retreat_pose"] = retreat_candidates[0]["pose"] if retreat_candidates else _roof_tilt_axis_retreat_from_release(release_pose, args)
-    if str(hover_variant.get("kind", "")) == "release_direct":
-        item["place_mode"] = "drop_place"
-        item["jimu_roof_direct_release_hover"] = True
-    elif str(item.get("place_mode", "vertical_place") or "vertical_place") == "drop_place":
+    if str(item.get("place_mode", "vertical_place") or "vertical_place") == "drop_place":
         item["place_mode"] = "vertical_place"
+    item = portable._jimu_apply_post_place_retreat_candidates(item, args)
     item["jimu_roof_exact_release_drop"] = False
     item["force_replan_post_place_clearance"] = True
-    item["jimu_roof_post_place_retreat_mode"] = "preplace_diagonal_world_z_candidates"
+    item["jimu_roof_post_place_retreat_mode"] = item.get("jimu_post_place_retreat_mode", "generic_world_z_first_16way")
     item["jimu_roof_post_place_retreat_m"] = _roof_post_place_retreat_m(args)
     item["jimu_roof_post_place_retreat_up_ratio"] = float(
-        max(getattr(args, "jimu_roof_post_place_retreat_up_ratio", DEFAULT_ROOF_POST_PLACE_RETREAT_UP_RATIO), 0.0)
+        max(getattr(args, "jimu_post_place_retreat_up_ratio", 1.0), 0.0)
     )
-    item["jimu_roof_post_place_retreat_candidate_count"] = len(retreat_candidates)
-    item["jimu_roof_hover_variant"] = dict(hover_variant or {"kind": "world_z", "label": "roof_world_z"})
-    item["jimu_roof_hover_variant_label"] = str(item["jimu_roof_hover_variant"].get("label", "roof_world_z") or "roof_world_z")
-    item["jimu_roof_world_z_hover"] = str(item["jimu_roof_hover_variant"].get("kind", "world_z")) in {"world_z", "world_z_height"}
+    item["jimu_roof_post_place_retreat_candidate_count"] = int(item.get("jimu_post_place_retreat_candidate_count", 0) or 0)
+    item["jimu_roof_world_z_hover"] = True
     item["jimu_roof_world_z_hover_height_m"] = _roof_world_z_hover_height(args, rule)
-    base_label = str(item.get("label", "transport_hover") or "transport_hover")
-    label_suffix = item["jimu_roof_hover_variant_label"]
-    if label_suffix not in base_label:
-        item["label"] = f"{base_label}_{label_suffix}"
     return item
 
 
@@ -1607,31 +2646,32 @@ def _select_jimu_parallel_place_source_candidates_triangle(place_candidates, arg
         )
     except Exception:
         max_expanded = DEFAULT_ROOF_MAX_HOVER_CANDIDATES_PER_GRASP
-    variants = _roof_hover_variant_specs(args)
+    profile_count = 1
+    if bool(getattr(args, "jimu_final_contact_fallbacks", True)):
+        if bool(getattr(args, "jimu_final_contact_low_hover_fallback", True)):
+            profile_count += 1
+        if bool(getattr(args, "jimu_final_contact_side_push_fallback", True)):
+            profile_count += 2
+    max_after_target_variants = max(1, max_expanded // max(1, profile_count))
     expanded: list[dict] = []
     seen_variant: set[tuple] = set()
     for base in selected_bases:
         for target_suffix, target_base in _roof_target_pose_variants_for_place_candidate(base, args):
             base_label = str(target_base.get("label", "transport_hover") or "transport_hover")
-            for variant in variants:
-                label = str(variant.get("label", "roof_world_z") or "roof_world_z")
-                full_label = label if not target_suffix else f"{target_suffix}_{label}"
-                item = dict(target_base)
-                item["_jimu_roof_hover_variant"] = dict(variant)
-                item["_jimu_roof_hover_variant_label"] = full_label
-                item["label"] = f"{base_label}_{full_label}" if full_label not in base_label else base_label
-                key = (
-                    portable.direct._pose_dedupe_key(base.get("pose")),
-                    portable.direct._pose_dedupe_key(base.get("release_pose", base.get("place_pose"))),
-                    target_suffix,
-                    label,
-                )
-                if key in seen_variant:
-                    continue
-                seen_variant.add(key)
-                expanded.append(item)
-                if len(expanded) >= max_expanded:
-                    return expanded
+            label = target_suffix or "target_face_primary"
+            item = dict(target_base)
+            item["label"] = f"{base_label}_{label}" if target_suffix and target_suffix not in base_label else base_label
+            key = (
+                portable.direct._pose_dedupe_key(base.get("pose")),
+                portable.direct._pose_dedupe_key(base.get("release_pose", base.get("place_pose"))),
+                target_suffix,
+            )
+            if key in seen_variant:
+                continue
+            seen_variant.add(key)
+            expanded.append(item)
+            if len(expanded) >= max_after_target_variants:
+                return expanded
     return expanded
 
 
@@ -1659,6 +2699,96 @@ def build_arg_parser_triangle() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Force this wrapper to use the local AprilTag assembly-anchor localization path.",
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-apriltag-task-select",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Before running the build, detect visible tag25h9 ids and ask which detected base tag id(s) "
+            "should be used as task anchors. Multiple ids are run sequentially."
+        ),
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-apriltag-task-ids",
+        type=str,
+        default="",
+        help="Non-interactive task tag selection for --jimu-apriltag-task-select, e.g. '1', '2', '1,2', or 'all'.",
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-apriltag-task-select-attempts",
+        type=int,
+        default=DEFAULT_APRILTAG_TASK_SELECT_ATTEMPTS,
+        help="Maximum RealSense frames to try while detecting tags for interactive task selection.",
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-builder-scene-json",
+        type=str,
+        default="",
+        help=(
+            "Frontend-exported jimu_builder_scene_v1 JSON. When set, unlocked pieces become the build roles "
+            "and their exported center/u/n/v matrices override the normal four-wall/roof target poses."
+        ),
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-task-dir",
+        type=str,
+        default="",
+        help=(
+            "Directory containing manifest.json for a Jimu task, e.g. jimu_tasks/tag1_standard_three_layer. "
+            "The manifest can provide builder_scene_json, fixed scene JSON, and AprilTag defaults."
+        ),
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-builder-outward-clearance-m",
+        type=float,
+        default=0.0,
+        help=(
+            "Task-specific clearance for frontend builder targets. Each unlocked piece is offset from its "
+            "parent by this distance along the outward face-normal direction in the builder X/Z plane."
+        ),
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-builder-outward-clearance-max-depth",
+        type=int,
+        default=0,
+        help=(
+            "Limit builder outward clearance to this many unlocked parent depths. "
+            "0 applies to every unlocked piece relation; 1 only offsets the first build layer."
+        ),
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-builder-layer-z-extra-m",
+        default="",
+        help=(
+            "Comma/space separated per-layer extra world-Z offset increments for frontend builder targets. "
+            "Example: '0,0.002,0.002' leaves the first layer unchanged and raises later layers cumulatively."
+        ),
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-builder-canonicalize-outward-normals",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For frontend builder scenes, flip symmetric panel axes so each unlocked wall/roof local Y faces outside.",
+    )
+    _add_arg_if_missing(
+        parser,
+        "--jimu-builder-use-design-parent-targets",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For frontend builder scenes, compute child target poses from the exported design parent pose "
+            "instead of chaining from the simulated released parent pose."
+        ),
     )
     _add_arg_if_missing(parser, "--jimu-demo-triangle-relation-slots", type=int, default=DEFAULT_RELATION_SLOTS)
     _add_arg_if_missing(parser, "--jimu-demo-triangle-fixed-batch-size", type=int, default=DEFAULT_FIXED_BATCH_SIZE)
@@ -1903,7 +3033,7 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
     args.jimu_roof_triangle_profile = True
     args.jimu_second_layer_triangle_profile = False
     args.jimu_localization_mode = "assembly"
-    explicit_fixed_scene = _has_explicit_fixed_scene_arg()
+    explicit_fixed_scene = _has_explicit_fixed_scene_arg() or bool(getattr(args, "_jimu_task_manifest_fixed_scene", False))
     explicit_live_apriltag = _argv_has_option("--jimu-apriltag-anchor-localization")
     if explicit_fixed_scene and not explicit_live_apriltag:
         fixed_scene_file = str(getattr(args, "sam6d_fixed_scene_result_file", "") or "").strip()
@@ -1936,6 +3066,8 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
         args.repeat_count = len(list(args.cycle_object_names))
     args.sam3_full_scene_keep_multi_instances = True
     args.sam3_max_masks_per_item = max(int(getattr(args, "sam3_max_masks_per_item", 1) or 1), len(args.jimu_scene_roles))
+
+    _apply_builder_scene_roles(args)
 
     relation_slots = max(1, int(getattr(args, "jimu_demo_triangle_relation_slots", DEFAULT_RELATION_SLOTS) or DEFAULT_RELATION_SLOTS))
     fixed_batch_size = 16
@@ -2107,6 +3239,30 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
         and not _argv_has_option("--no-short-linear-endpoint-ik-first")
     ):
         args.short_linear_endpoint_ik_first = False
+    if (
+        hasattr(args, "final_contact_constrained_num_trajopt_seeds")
+        and not _argv_has_option("--final-contact-constrained-num-trajopt-seeds")
+    ):
+        args.final_contact_constrained_num_trajopt_seeds = max(
+            int(getattr(args, "final_contact_constrained_num_trajopt_seeds", 1) or 1),
+            4,
+        )
+    if (
+        hasattr(args, "final_contact_constrained_max_attempts")
+        and not _argv_has_option("--final-contact-constrained-max-attempts")
+    ):
+        args.final_contact_constrained_max_attempts = max(
+            int(getattr(args, "final_contact_constrained_max_attempts", 2) or 2),
+            4,
+        )
+    if (
+        hasattr(args, "final_contact_constrained_timeout")
+        and not _argv_has_option("--final-contact-constrained-timeout")
+    ):
+        args.final_contact_constrained_timeout = max(
+            float(getattr(args, "final_contact_constrained_timeout", 5.0) or 5.0),
+            8.0,
+        )
     if not _argv_has_option("--skip-post-place-clearance"):
         # Wall panels should retreat along the validated final-contact path
         # instead of replanning a new clearance motion that can rotate the wrist.
@@ -2155,7 +3311,11 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
     args.empty_grasp_check_after_lift = False
     args.empty_grasp_relocalize_target = False
     args.empty_grasp_max_relocalize_retries = 0
-    args.jimu_enforce_layer_order = True
+    if not (
+        _argv_has_option("--jimu-enforce-layer-order")
+        or _argv_has_option("--no-jimu-enforce-layer-order")
+    ):
+        args.jimu_enforce_layer_order = True
     args.joint_search_validate_final_contact = True
     args.validate_post_place_clearance_return_to_start = bool(
         getattr(args, "jimu_validate_post_place_return", True)
@@ -2250,13 +3410,12 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
         f"roof_hover_max={int(getattr(args, 'jimu_roof_max_hover_candidates_per_grasp', DEFAULT_ROOF_MAX_HOVER_CANDIDATES_PER_GRASP))}, "
         f"roof_uniform_preplace_z={_roof_uniform_preplace_height_enabled(args)}"
         f"/{_roof_uniform_preplace_height_m(args, None):.3f}m, "
-        f"roof_post_retreat={_roof_post_place_retreat_m(args):.3f}m/"
-        f"{int(getattr(args, 'jimu_roof_post_place_retreat_candidate_count', 16) or 16)}pts, "
+        f"final_contact_low_z={float(getattr(args, 'jimu_final_contact_low_hover_height_m', 0.0) or 0.0):.3f}m, "
+        f"generic_post_retreat={_roof_post_place_retreat_m(args):.3f}m/"
+        f"{int(getattr(args, 'jimu_post_place_retreat_candidate_count', 16) or 16)}pts, "
         f"roof_box_scale={_roof_scene_obstacle_box_scale(args):.2f}, "
         f"roof_mesh_obstacles={_roof_curobo_mesh_obstacles_enabled(args)}, "
-        f"roof_post_up_ratio={float(getattr(args, 'jimu_roof_post_place_retreat_up_ratio', DEFAULT_ROOF_POST_PLACE_RETREAT_UP_RATIO) or 0.0):.2f}, "
-        f"roof_post_followup={float(getattr(args, 'jimu_roof_post_place_followup_up_m', DEFAULT_ROOF_POST_PLACE_FOLLOWUP_UP_M) or 0.0):.3f}m, "
-        f"roof_post_free_motiongen_fallback={bool(getattr(args, 'jimu_roof_post_place_free_motiongen_fallback', False))}, "
+        f"generic_post_up_ratio={float(getattr(args, 'jimu_post_place_retreat_up_ratio', 1.0) or 0.0):.2f}, "
         f"roof_skip_return={bool(getattr(args, 'jimu_skip_return_to_cycle_start_after_roof_place', False))}, "
         f"validate_post_return={bool(getattr(args, 'validate_post_place_clearance_return_to_start', False))}, "
         "roof_grasp_tilt_only=True, "
@@ -2289,8 +3448,8 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
     )
     print(
         "[triangle-roof] first/second layers use square plates; roof roles use red_triangle specs; "
-        "roof grasp is tilt-only by default, roof pre-place uses a single world-Z hover, "
-        "and post-place retreat keeps release orientation while trying side+world-Z diagonal endpoints; "
+        "roof grasp is tilt-only by default, roof pre-place/retreat now use the generic Jimu route "
+        "(vertical first, low-Z/side-high fallback, world-Z retreat first plus 16-way endpoints); "
         "planner/execution still delegates to rm75_jimu_four_wall_portable.py"
     )
     return args
@@ -2298,7 +3457,7 @@ def _apply_demo_triangle_defaults(args: argparse.Namespace) -> argparse.Namespac
 
 def parse_args_triangle() -> argparse.Namespace:
     if not _should_pre_enable_apriltag():
-        return _apply_demo_triangle_defaults(_ORIGINAL_PARSE_ARGS())
+        return _apply_demo_triangle_defaults(_apply_jimu_task_manifest_defaults(_ORIGINAL_PARSE_ARGS()))
 
     original_argv = list(sys.argv)
     sys.argv = [*original_argv, "--jimu-apriltag-anchor-localization"]
@@ -2306,7 +3465,7 @@ def parse_args_triangle() -> argparse.Namespace:
         args = _ORIGINAL_PARSE_ARGS()
     finally:
         sys.argv = original_argv
-    return _apply_demo_triangle_defaults(args)
+    return _apply_demo_triangle_defaults(_apply_jimu_task_manifest_defaults(args))
 
 
 def install_patches() -> None:
@@ -2320,6 +3479,7 @@ def install_patches() -> None:
     portable._jimu_floor_anchor_second_layer_plans = _jimu_floor_anchor_second_layer_and_roof_plans
     portable._jimu_layer_filtered_target_pool = _jimu_layer_filtered_target_pool_triangle
     portable._jimu_tray_slot_local_poses = _jimu_tray_slot_local_poses_triangle
+    portable._jimu_base_support_local_poses = _jimu_base_support_local_poses_builder
     portable._jimu_validate_linear_joint_path = _jimu_validate_linear_joint_path_triangle
     portable._jimu_choose_next_tray_source_role = _choose_next_tray_source_role_triangle
     portable._make_jimu_parallel_grasp_place_candidate = _make_jimu_parallel_grasp_place_candidate_triangle
@@ -2330,6 +3490,9 @@ def install_patches() -> None:
 
 def main() -> None:
     install_patches()
+    if _argv_has_option("--jimu-apriltag-task-select"):
+        _run_selected_apriltag_tasks()
+        return
     portable.main()
 
 

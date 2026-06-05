@@ -33,8 +33,13 @@ BASE_WORLD_OFFSET_X_M = 0.0
 BASE_WORLD_OFFSET_Y_M = 0.0
 TRAY_WORLD_OFFSET_X_M = 0.0
 TRAY_WORLD_OFFSET_Y_M = 0.0
-PLATE_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "red_jimu_plate_74x6x74.glb"
+PLATE_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "red_jimu_plate_74x6p5x74.glb"
 BASE_ASSEMBLY_MESH_FILE = PORTABLE_REPRO_DIR / "assets" / "jimu_base_assembly_5plates.glb"
+BUILDER_PLATE_DIMS_M = {
+    "square": (0.074, 0.0065, 0.074),
+    "half_square": (0.037, 0.0065, 0.074),
+    "triangle": (0.074, 0.0065, 0.135),
+}
 
 
 def _resolve_loaded_tray_mesh() -> tuple[Path, float]:
@@ -263,6 +268,7 @@ def _pop_apriltag_config() -> dict:
         "base_world_offset_y_m": _pop_custom_arg("--jimu-apriltag-base-world-offset-y-m", BASE_WORLD_OFFSET_Y_M, float),
         "tray_world_offset_x_m": _pop_custom_arg("--jimu-apriltag-tray-world-offset-x-m", TRAY_WORLD_OFFSET_X_M, float),
         "tray_world_offset_y_m": _pop_custom_arg("--jimu-apriltag-tray-world-offset-y-m", TRAY_WORLD_OFFSET_Y_M, float),
+        "builder_scene_json": _pop_custom_arg("--jimu-builder-scene-json", "", str),
     }
 
 
@@ -611,14 +617,195 @@ def _save_tabletop_anchor_overlay(frame: dict, mask: np.ndarray, box: list[float
     cv2.imwrite(str(out_path), canvas)
 
 
+def _matrix_from_json(value) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float32).reshape(4, 4)
+    except Exception:
+        return None
+    if not np.all(np.isfinite(arr)):
+        return None
+    return arr
+
+
+def _tag_corners_from_pose(
+    T_object_tag: np.ndarray,
+    tag_size_m: float,
+    *,
+    mirror_u: bool = False,
+    mirror_v: bool = False,
+) -> np.ndarray:
+    T_object_tag = np.asarray(T_object_tag, dtype=np.float32).reshape(4, 4)
+    half = 0.5 * float(tag_size_m)
+    center = T_object_tag[:3, 3].astype(np.float32)
+    marker_right = T_object_tag[:3, 0].astype(np.float32)
+    marker_up = T_object_tag[:3, 2].astype(np.float32)
+    marker_right = marker_right / max(float(np.linalg.norm(marker_right)), 1e-6)
+    marker_up = marker_up - float(np.dot(marker_up, marker_right)) * marker_right
+    marker_up = marker_up / max(float(np.linalg.norm(marker_up)), 1e-6)
+    if mirror_u:
+        marker_right = -marker_right
+    if mirror_v:
+        marker_up = -marker_up
+    return np.asarray(
+        [
+            center - half * marker_right + half * marker_up,
+            center + half * marker_right + half * marker_up,
+            center + half * marker_right - half * marker_up,
+            center - half * marker_right - half * marker_up,
+        ],
+        dtype=np.float32,
+    )
+
+
+def _builder_piece_lookup(payload: dict, key: str | None) -> dict | None:
+    name = provider.normalize_object_name(key)
+    if not name:
+        return None
+    for piece in list(payload.get("pieces") or []):
+        if not isinstance(piece, dict):
+            continue
+        if name in {str(piece.get("id") or "").strip(), str(piece.get("role") or "").strip()}:
+            return piece
+    return None
+
+
+def _builder_piece_matrix(piece: dict) -> np.ndarray | None:
+    try:
+        u = np.asarray(piece.get("u"), dtype=np.float32).reshape(3)
+        n = np.asarray(piece.get("n"), dtype=np.float32).reshape(3)
+        center = np.asarray(piece.get("center"), dtype=np.float32).reshape(3)
+    except Exception:
+        return None
+    x = u / max(float(np.linalg.norm(u)), 1e-8)
+    y = n - float(np.dot(n, x)) * x
+    y = y / max(float(np.linalg.norm(y)), 1e-8)
+    z = np.cross(x, y)
+    z = z / max(float(np.linalg.norm(z)), 1e-8)
+    y = np.cross(z, x)
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = np.column_stack([x, y, z]).astype(np.float32)
+    T[:3, 3] = center
+    return T
+
+
+def _normalize_builder_locked_top_surfaces(payload: dict) -> None:
+    # Keep the exported builder frame untouched.  The tag mount data and child
+    # piece transforms are defined relative to the locked piece axes as saved.
+    return
+
+
+def _builder_attached_tag_pose(payload: dict, tag: dict) -> np.ndarray | None:
+    piece = _builder_piece_lookup(payload, tag.get("attached_to_piece_id")) or _builder_piece_lookup(
+        payload,
+        tag.get("attached_to_role"),
+    )
+    if piece is None:
+        return None
+    T_builder_piece = _builder_piece_matrix(piece)
+    if T_builder_piece is None:
+        return None
+    piece_type = str(piece.get("type") or "square").strip().lower()
+    dims = BUILDER_PLATE_DIMS_M.get(piece_type, BUILDER_PLATE_DIMS_M["square"])
+    try:
+        piece_n = np.asarray(piece.get("n"), dtype=np.float32).reshape(3)
+    except Exception:
+        piece_n = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+    normal_sign = 1.0 if float(piece_n[1]) >= 0.0 else -1.0
+    center = np.asarray(tag.get("local_center_m") or [0.0, 0.0, 0.0], dtype=np.float32).reshape(3)
+    if str(tag.get("attached_surface") or "") == "piece_top":
+        center[1] = normal_sign * 0.5 * float(dims[1])
+    yaw = math.radians(float(tag.get("local_yaw_deg") or 0.0))
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    u = np.asarray([c, 0.0, s], dtype=np.float32)
+    n = np.asarray([0.0, normal_sign, 0.0], dtype=np.float32)
+    v = np.cross(u, n).astype(np.float32)
+    v = v / max(float(np.linalg.norm(v)), 1e-8)
+    T_piece_tag = np.eye(4, dtype=np.float32)
+    T_piece_tag[:3, :3] = np.column_stack([u, n, v]).astype(np.float32)
+    T_piece_tag[:3, 3] = center
+    return (T_builder_piece @ T_piece_tag).astype(np.float32)
+
+
+def _builder_scene_tag_corners(
+    builder_scene_json: str,
+    object_name: str,
+    tag_id: int,
+    tag_size_m: float,
+) -> tuple[np.ndarray | None, dict]:
+    if not builder_scene_json:
+        return None, {}
+    if provider.normalize_object_name(object_name) != "jimu_base_assembly":
+        return None, {}
+    scene_path = Path(str(builder_scene_json)).expanduser()
+    if not scene_path.exists():
+        raise FileNotFoundError(f"builder scene JSON not found for AprilTag localization: {scene_path}")
+    payload = json.loads(scene_path.read_text(encoding="utf-8"))
+    if payload.get("schema") != "jimu_builder_scene_v1":
+        raise ValueError(f"{scene_path} is not a jimu_builder_scene_v1 JSON")
+    _normalize_builder_locked_top_surfaces(payload)
+    apriltags = payload.get("apriltags") or {}
+    for tag in list(apriltags.get("attached_tags") or []):
+        if int(tag.get("tag_id", -1)) != int(tag_id):
+            continue
+        T_builder_tag = _builder_attached_tag_pose(payload, tag)
+        if T_builder_tag is None:
+            T_builder_tag = _matrix_from_json(tag.get("T_builder_tag"))
+        if T_builder_tag is None:
+            continue
+        size = float(tag.get("tag_black_square_size_m") or tag_size_m)
+        mirror_u = bool(tag.get("texture_mirror_u", False))
+        mirror_v = bool(tag.get("texture_mirror_v", False))
+        return _tag_corners_from_pose(T_builder_tag, size, mirror_u=mirror_u, mirror_v=mirror_v), {
+            "builder_scene_json": str(scene_path),
+            "builder_tag_source": "attached_tags",
+            "builder_tag_name": tag.get("name"),
+            "builder_tag_attached_to_role": tag.get("attached_to_role"),
+            "builder_tag_size_m": size,
+            "builder_tag_texture_mirror_u": mirror_u,
+            "builder_tag_texture_mirror_v": mirror_v,
+            "T_object_tag": T_builder_tag.astype(float).tolist(),
+        }
+    mount = (apriltags.get("mounts") or {}).get("base")
+    if isinstance(mount, dict) and int(mount.get("tag_id", -1)) == int(tag_id):
+        local_pose = mount.get("local_pose") or {}
+        center = np.asarray(local_pose.get("center_m", [0.0, BASE_APRILTAG_TOP_Y_M, 0.0]), dtype=np.float32).reshape(3)
+        u = np.asarray(local_pose.get("u", [1.0, 0.0, 0.0]), dtype=np.float32).reshape(3)
+        n = np.asarray(local_pose.get("n", [0.0, 1.0, 0.0]), dtype=np.float32).reshape(3)
+        v = np.asarray(local_pose.get("v", [0.0, 0.0, -1.0]), dtype=np.float32).reshape(3)
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = np.column_stack([u, n, v]).astype(np.float32)
+        T[:3, 3] = center
+        size = float(mount.get("tag_black_square_size_m") or tag_size_m)
+        return _tag_corners_from_pose(T, size), {
+            "builder_scene_json": str(scene_path),
+            "builder_tag_source": "mounts.base",
+            "builder_tag_size_m": size,
+            "T_object_tag": T.astype(float).tolist(),
+        }
+    return None, {"builder_scene_json": str(scene_path), "builder_tag_source": "not_found"}
+
+
 def _tag_corners_in_anchor_object(
     object_name: str,
     tag_size_m: float,
     tag_yaw_deg: float,
     *,
     tray_center_offset_xy_m: tuple[float, float] = (0.0, 0.0),
+    tag_id: int | None = None,
+    builder_scene_json: str = "",
 ) -> np.ndarray:
     object_name = provider.normalize_object_name(object_name) or str(object_name)
+    builder_points, _builder_debug = _builder_scene_tag_corners(
+        builder_scene_json,
+        object_name,
+        -1 if tag_id is None else int(tag_id),
+        float(tag_size_m),
+    )
+    if builder_points is not None:
+        return builder_points
     half = 0.5 * float(tag_size_m)
     theta = math.radians(float(tag_yaw_deg))
     c = math.cos(theta)
@@ -720,7 +907,9 @@ def _solve_anchor_from_tag(
     tag_size_m: float,
     tag_yaw_deg: float,
     *,
+    tag_id: int | None = None,
     tray_center_offset_xy_m: tuple[float, float] = (0.0, 0.0),
+    builder_scene_json: str = "",
 ) -> tuple[np.ndarray, dict]:
     cv2 = provider.cv2
     K = np.asarray(frame["K"], dtype=np.float32).reshape(3, 3)
@@ -730,6 +919,8 @@ def _solve_anchor_from_tag(
         tag_size_m,
         tag_yaw_deg,
         tray_center_offset_xy_m=tray_center_offset_xy_m,
+        tag_id=tag_id,
+        builder_scene_json=builder_scene_json,
     )
     pnp_flags: list[tuple[str, int]] = []
     for flag_name in ("SOLVEPNP_SQPNP", "SOLVEPNP_ITERATIVE", "SOLVEPNP_IPPE"):
@@ -772,6 +963,14 @@ def _solve_anchor_from_tag(
         "solve_pnp_reprojection_error_px": float(mean_error),
         "solve_pnp_point_errors_px": np.asarray(point_errors, dtype=np.float32).astype(float).tolist(),
     }
+    builder_points, builder_debug = _builder_scene_tag_corners(
+        builder_scene_json,
+        object_name,
+        -1 if tag_id is None else int(tag_id),
+        float(tag_size_m),
+    )
+    if builder_points is not None or builder_debug:
+        debug["builder_scene_tag"] = builder_debug
     return T_cam_obj, debug
 
 
@@ -993,7 +1192,9 @@ def _run_apriltag_anchor_provider(config: dict) -> None:
                 corner,
                 float(spec["tag_size_m"]),
                 float(spec["tag_yaw_deg"]),
+                tag_id=tag_id,
                 tray_center_offset_xy_m=tuple(spec.get("tray_center_offset_xy_m", (0.0, 0.0))),
+                builder_scene_json=str(config.get("builder_scene_json", "") or ""),
             )
             T_cam_obj, world_offset_debug = _apply_world_xy_offset_to_cam_pose(
                 args,
