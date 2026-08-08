@@ -23,6 +23,11 @@ PICKPLACE_BACKENDS: dict[str, PickPlaceBackend] = {
         module="rm75_app.runtime.sam6d_pick_place",
         description="SAM3/SAM6D scene-aware pick-place",
     ),
+    "rrtrack": PickPlaceBackend(
+        mode="rrtrack",
+        module="rm75_app.runtime.rrtrack_pose_tracking",
+        description="Recoverable CUTIE + 6D closed-loop perception for pick-place",
+    ),
     "wrist": PickPlaceBackend(
         mode="wrist",
         module="rm75_app.runtime.wrist_refined_pick_place",
@@ -63,4 +68,3 @@ def command_for_mode(mode: str | None, args: list[str] | tuple[str, ...] = (), *
         argv=(python, "-m", backend.module, *tuple(str(arg) for arg in args)),
         description=backend.description,
     )
-

@@ -11,10 +11,10 @@ class PickPlaceTask(TaskAdapterBase):
         title="通用 Pick-Place",
         family="pick_place",
         description="以 RM75 直接抓取、搬运、放置为主流程的通用物体任务。",
-        capabilities=("single_object", "multi_object_cycle", "sam3", "sam6d", "curobo", "wrist_refine"),
-        modes=("direct", "sam6d", "wrist", "tabletop-refine"),
+        capabilities=("single_object", "multi_object_cycle", "sam3", "sam6d", "rrtrack", "cutie", "curobo", "wrist_refine"),
+        modes=("direct", "sam6d", "rrtrack", "wrist", "tabletop-refine"),
         default_mode="direct",
-        aliases=("pick-place", "pick_place", "pick", "grasp-place", "direct", "sam6d", "wrist"),
+        aliases=("pick-place", "pick_place", "pick", "grasp-place", "direct", "sam6d", "rrtrack", "wrist"),
         stages=(
             PipelineStage.TASK_INPUT,
             PipelineStage.SCENE_CAPTURE,
@@ -30,7 +30,7 @@ class PickPlaceTask(TaskAdapterBase):
     mode_aliases = PICKPLACE_MODE_ALIASES
 
     def normalize_request(self, request: TaskRequest) -> TaskRequest:
-        task_alias_modes = {"direct": "direct", "sam6d": "sam6d", "wrist": "wrist"}
+        task_alias_modes = {"direct": "direct", "sam6d": "sam6d", "rrtrack": "rrtrack", "wrist": "wrist"}
         mode = request.mode
         if mode is None:
             mode = task_alias_modes.get(normalize_token(request.task))

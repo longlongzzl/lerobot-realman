@@ -107,6 +107,12 @@ def main(argv: list[str] | None = None) -> int:
     p_sam6d = sub.add_parser("sam6d", help="Run the SAM3/SAM6D pick-place entrypoint")
     p_sam6d.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the SAM6D module")
 
+    p_rrtrack = sub.add_parser("rrtrack", help="Run recoverable CUTIE + 6D object tracking")
+    p_rrtrack.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the RRTrack perception module")
+
+    p_rrtrack_bank = sub.add_parser("rrtrack-build-bank", help="Build a DINOv2 offline recovery bank from SAM6D templates")
+    p_rrtrack_bank.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the bank builder")
+
     p_tabletop_refine = sub.add_parser(
         "tabletop-refine",
         help="Refine a SAM6D full-scene result for tabletop objects by optimizing x/y/yaw only",
@@ -134,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     p_pickplace = sub.add_parser("pickplace", help="Run the canonical pick-place mainline")
     p_pickplace.add_argument(
         "--mode",
-        choices=["direct", "sam6d", "wrist", "tabletop-refine"],
+        choices=["direct", "sam6d", "rrtrack", "wrist", "tabletop-refine"],
         default="direct",
         help="Pick-place backend selected by the mainline runner",
     )
@@ -225,6 +231,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_registered_pickplace("direct", _split_passthrough(ns.args))
     if ns.cmd == "sam6d":
         return _run_registered_pickplace("sam6d", _split_passthrough(ns.args))
+    if ns.cmd == "rrtrack":
+        return _run_registered_pickplace("rrtrack", _split_passthrough(ns.args))
+    if ns.cmd == "rrtrack-build-bank":
+        return run_app_module("rm75_app.runtime.rrtrack_build_bank", _split_passthrough(ns.args))
     if ns.cmd == "tabletop-refine":
         return _run_registered_pickplace("tabletop-refine", _split_passthrough(ns.args))
     if ns.cmd == "wrist":

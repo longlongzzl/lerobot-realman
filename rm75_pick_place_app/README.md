@@ -13,7 +13,7 @@ rm75_pick_place_app/
     pickplace/     # pick-place 默认配置、后端选择、层级绑定和 runner
     legacy/        # 尚未迁移的 Jimu/Lego 旧后端路径
     runtime/       # direct pick-place、SAM6D pick-place、FoundationPose scene pipeline
-    perception/    # SAM3 mask provider、SAM6D pose provider、resident worker
+    perception/    # SAM3/SAM6D providers、RRTrack closed-loop tracker
     planning/      # cuRobo planner、full-chain helper、fast-chain notes
     execution/     # 真机/仿真桥接执行脚本
     placement/     # 放置规则
@@ -57,7 +57,7 @@ rm75_pick_place_app/
 - `tasks/` 只描述任务差异。抓取放置、Jimu 装配、Lego snap 都通过同一套阶段契约接入。
 - `perception/`、`planning/`、`execution/` 是可替换能力层；任务层不应该直接导入旧的超大运行脚本。
 - `pickplace/` 是 pick-place 的主线编排边界；`runtime/` 保留具体的 direct/SAM6D 运行实现，避免 CLI、任务定义和重型依赖互相混在一起。
-- `direct`、`sam6d`、`wrist` 已经通过 `pickplace` 适配器和 runner 选择后端；direct/SAM6D 的运行源码不再从外层 `pick_jiaobang` 加载。
+- `direct`、`sam6d`、`rrtrack`、`wrist` 已经通过 `pickplace` 适配器和 runner 选择后端；direct/SAM6D 的运行源码不再从外层 `pick_jiaobang` 加载。
 - Jimu 和 Lego 现在是明确标记为 `compatibility` 的适配器：统一入口已经在主线，具体旧执行器还没有搬进来，避免把旧耦合伪装成完成迁移。
 
 查看任务注册表和编译后的兼容命令：
@@ -82,6 +82,7 @@ python -m rm75_app --help
 python -m rm75_app pickplace --mode direct -- --help
 python -m rm75_app direct -- --help
 python -m rm75_app sam6d -- --help
+python -m rm75_app rrtrack -- --help
 python -m rm75_app tabletop-refine -- --help
 python -m rm75_app roof -- --help
 python -m rm75_app web -- --host 127.0.0.1 --port 7860
@@ -89,6 +90,77 @@ python -m rm75_app llm -- --help
 python -m rm75_app print-command sam6d --execute-real
 python -m rm75_app verify
 ```
+
+## RRTrack 风格可恢复感知入口
+
+`rrtrack` 是独立的新感知入口，不替换原有 `sam6d`。它依据 RRTrack 论文公开方法实现：
+
+```text
+SAM3 + SAM6D 初始化
+        ↓
+CUTIE mask 传播（先预测、禁止未验证写回）
+        ↓
+FoundationPose 局部 6D refine
+        ↓
+观测 mask / CAD 渲染 mask 的 P、S 一致性门控
+        ├─ 局部漂移：mask 中心 + 中值深度 snap，再 refine
+        ├─ 稳定：分别更新 CUTIE 短期/有界长期记忆和在线 DINO 库
+        └─ 丢失/停滞：DINOv2 离线+在线双库各 Top-3
+                       → FoundationPose 批量 refine + ranker 选优 → P 验收
+                       ├─ CUTIE 无 mask：SAM3 全图多候选后走同一身份/几何验收
+                       └─ 无候选：FoundationPose 球面注册
+```
+
+实时入口会先用现有 SAM3/SAM6D 获取初始 mask 和位姿，再接管 RealSense 视频：
+
+```bash
+python -m rm75_app rrtrack -- --object-name carriot
+```
+
+整桌多物体只在开始时做一次全局初始化；之后只有被抓对象进入 CUTIE/6D 连续跟踪，其他实例保存在本次运行的 `scene_registry.json` 中。相同类别用 `--active-instance-index` 选择：
+
+```bash
+python -m rm75_app rrtrack -- \
+  --object-name redcube \
+  --active-instance-index 1 \
+  --scene-object-names redcube redcube tennis carriot
+```
+
+复用已经生成的 SAM6D 初始结果：
+
+```bash
+python -m rm75_app rrtrack -- \
+  --object-name carriot \
+  --init-result-json <sam6d_pose_result.json>
+```
+
+离线 RGB-D 序列要求 `rgb/`、`depth/` 和 `camera.json`；深度已经是米时保持默认 scale，uint16 毫米深度使用 `--sequence-depth-scale 0.001`：
+
+```bash
+python -m rm75_app rrtrack -- \
+  --object-name carriot \
+  --init-result-json <sam6d_pose_result.json> \
+  --sequence-dir <sequence_dir> \
+  --sequence-depth-scale 0.001
+```
+
+RRTrack 论文使用 256 个全球离线模板（128 个视角加 180° 平面内增强）。入口默认从本次 SAM-6D 的 `templates/` 自动建立并缓存该库，后续直接复用。也可以手工建立或通过 `--offline-bank` 固定指定：
+
+```bash
+python -m rm75_app rrtrack-build-bank -- \
+  --templates-dir <sam6d_run/templates> \
+  --output runtime_data/rrtrack_banks/carriot_dinov2_vits14.npz
+
+python -m rm75_app rrtrack -- \
+  --object-name carriot \
+  --offline-bank runtime_data/rrtrack_banks/carriot_dinov2_vits14.npz
+```
+
+CUTIE 是外部模型依赖，不提交进项目源码；当前机器的官方 MIT 版本位于被忽略的 `runtime_data/third_party/Cutie`，也可通过 `--cutie-root` 指定其他安装目录。入口只需要官方 `cutie-base-mega.pth`，默认从 `<cutie-root>/weights/` 加载，也可用 `--cutie-weights` 指定。DINOv2 默认优先使用本机 torch hub 缓存。SAM3 只在 CUTIE 持续空 mask 时按需启动，可用 `--disable-sam3-recovery` 关闭。论文没有公开所有门控阈值，未公开项集中在 `rm75_app/perception/rrtrack/config.py`，先使用保守项目默认值，再只用稳定跟踪帧做 EMA–MAD 自适应。
+
+当前 `pickplace --mode rrtrack` 指向这条感知入口，输出 `trajectory.jsonl`、`latest_pose.json`、`scene_registry.json` 和 `run_config.json`；它暂不自动触发机械臂运动，只有经过门控的 `latest_pose.json` 才应交给规划层。
+
+阈值或状态策略可通过 `--rrtrack-config <json>` 覆盖，运行目录中的 `run_config.json` 会保存最终生效配置，便于按真实遮挡序列回放调参。
 
 常用真机 SAM6D 命令可直接生成：
 
