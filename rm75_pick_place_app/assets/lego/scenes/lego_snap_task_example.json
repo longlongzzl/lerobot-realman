@@ -1,0 +1,33 @@
+{
+  "name": "two_layer_snap_smoke",
+  "version": 1,
+  "steps": [
+    {
+      "action": "assemble",
+      "brick": "b2x4",
+      "grid_x": 14,
+      "grid_y": 14,
+      "layer": 1,
+      "orientation": 0,
+      "pivot_edge": "auto"
+    },
+    {
+      "action": "assemble",
+      "brick": "b1x4",
+      "grid_x": 14,
+      "grid_y": 14,
+      "layer": 2,
+      "orientation": 0,
+      "pivot_edge": "auto"
+    },
+    {
+      "action": "disassemble",
+      "brick": "b1x4",
+      "grid_x": 14,
+      "grid_y": 14,
+      "layer": 2,
+      "orientation": 0,
+      "pivot_edge": "auto"
+    }
+  ]
+}

@@ -1,0 +1,201 @@
+{
+  "schema": "rm75_tingzi_clean_table_scene_cache_v1",
+  "units": "meters",
+  "coordinate_frame": "robot_base_world",
+  "mesh_root": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs",
+  "table_top_z": 0.0,
+  "assembly_policy": {
+    "initial_layout": "all five pavilion parts lie on the clean XY tabletop, axis-aligned",
+    "allowed_yaw_deg": [0.0, 90.0, 180.0, 270.0],
+    "base_target": "clean_table",
+    "pillar_grasp": "long_axis_with_tilt",
+    "recommended_sequence": [
+      "tingzi_base",
+      "tingzi_pillar_front_left",
+      "tingzi_pillar_front_right",
+      "tingzi_pillar_back_left",
+      "tingzi_pillar_back_right"
+    ]
+  },
+  "virtual_targets": {
+    "clean_table": {
+      "name": "clean_table",
+      "type": "virtual_table_frame",
+      "label": "clean tabletop placement frame.",
+      "T_world_obj": [
+        [1.0, 0.0, 0.0, -0.06],
+        [0.0, 0.0, -1.0, -0.08],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "notes": "Virtual only: not rendered and not added as a planner obstacle. Local +Y is world +Z."
+    }
+  },
+  "build_geometry": {
+    "base_name": "tingzi_base",
+    "base_initial_xyz": [-0.18, -0.23, 0.006],
+    "base_target_on_clean_table_local_xyz": [0.0, 0.006, 0.0],
+    "pillar_mesh": "tingzi_pillar1.obj",
+    "pillar_initial_long_axis_world": [1.0, 0.0, 0.0],
+    "pillar_socket_local_xyz": {
+      "front_left": [-0.0248, -0.0248, 0.014],
+      "front_right": [0.0248, -0.0248, 0.014],
+      "back_left": [-0.0248, 0.0248, 0.014],
+      "back_right": [0.0248, 0.0248, 0.014]
+    },
+    "pillar_insert_axis_local": [0.0, 0.0, 1.0]
+  },
+  "objects": {
+    "tingzi_base": {
+      "name": "tingzi_base",
+      "type": "mesh",
+      "category": "tingzi_part",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_base.obj",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_base.obj",
+      "sim_asset_scale": 1.0,
+      "pose": [-0.18, -0.23, 0.006, 1.0, 0.0, 0.0, 0.0],
+      "T_world_obj": [
+        [1.0, 0.0, 0.0, -0.18],
+        [0.0, 1.0, 0.0, -0.23],
+        [0.0, 0.0, 1.0, 0.006],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "label": "small square pavilion base.",
+      "placed": false,
+      "score": 1.0
+    },
+    "tingzi_pillar_front_left": {
+      "name": "tingzi_pillar_front_left",
+      "type": "mesh",
+      "category": "tingzi_part",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_pillar1.obj",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_pillar1.obj",
+      "sim_asset_scale": 1.0,
+      "pose": [-0.09, -0.26, 0.0065, 0.5, 0.5, 0.5, 0.5],
+      "T_world_obj": [
+        [0.0, 0.0, 1.0, -0.09],
+        [1.0, 0.0, 0.0, -0.26],
+        [0.0, 1.0, 0.0, 0.0065],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "label": "small pavilion pillar, horizontal on the table.",
+      "placed": false,
+      "score": 1.0
+    },
+    "tingzi_pillar_front_right": {
+      "name": "tingzi_pillar_front_right",
+      "type": "mesh",
+      "category": "tingzi_part",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_pillar1.obj",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_pillar1.obj",
+      "sim_asset_scale": 1.0,
+      "pose": [-0.03, -0.26, 0.0065, 0.5, 0.5, 0.5, 0.5],
+      "T_world_obj": [
+        [0.0, 0.0, 1.0, -0.03],
+        [1.0, 0.0, 0.0, -0.26],
+        [0.0, 1.0, 0.0, 0.0065],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "label": "small pavilion pillar, horizontal on the table.",
+      "placed": false,
+      "score": 1.0
+    },
+    "tingzi_pillar_back_left": {
+      "name": "tingzi_pillar_back_left",
+      "type": "mesh",
+      "category": "tingzi_part",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_pillar1.obj",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_pillar1.obj",
+      "sim_asset_scale": 1.0,
+      "pose": [-0.09, -0.215, 0.0065, 0.5, 0.5, 0.5, 0.5],
+      "T_world_obj": [
+        [0.0, 0.0, 1.0, -0.09],
+        [1.0, 0.0, 0.0, -0.215],
+        [0.0, 1.0, 0.0, 0.0065],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "label": "small pavilion pillar, horizontal on the table.",
+      "placed": false,
+      "score": 1.0
+    },
+    "tingzi_pillar_back_right": {
+      "name": "tingzi_pillar_back_right",
+      "type": "mesh",
+      "category": "tingzi_part",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_pillar1.obj",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/tingzi_pillar1.obj",
+      "sim_asset_scale": 1.0,
+      "pose": [-0.03, -0.215, 0.0065, 0.5, 0.5, 0.5, 0.5],
+      "T_world_obj": [
+        [0.0, 0.0, 1.0, -0.03],
+        [1.0, 0.0, 0.0, -0.215],
+        [0.0, 1.0, 0.0, 0.0065],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "label": "small pavilion pillar, horizontal on the table.",
+      "placed": false,
+      "score": 1.0
+    }
+  },
+  "targeted_place_rules": {
+    "tingzi_base": {
+      "primitive": "place_on_slots",
+      "target": "clean_table",
+      "slot": "tingzi_base_center",
+      "allowed_yaw_deg": [0.0, 90.0, 180.0, 270.0]
+    },
+    "tingzi_pillar_front_left": {
+      "primitive": "insert_vertical",
+      "target": "tingzi_base",
+      "socket": "front_left",
+      "allowed_spin_deg": [0.0, 90.0, 180.0, 270.0]
+    },
+    "tingzi_pillar_front_right": {
+      "primitive": "insert_vertical",
+      "target": "tingzi_base",
+      "socket": "front_right",
+      "allowed_spin_deg": [0.0, 90.0, 180.0, 270.0]
+    },
+    "tingzi_pillar_back_left": {
+      "primitive": "insert_vertical",
+      "target": "tingzi_base",
+      "socket": "back_left",
+      "allowed_spin_deg": [0.0, 90.0, 180.0, 270.0]
+    },
+    "tingzi_pillar_back_right": {
+      "primitive": "insert_vertical",
+      "target": "tingzi_base",
+      "socket": "back_right",
+      "allowed_spin_deg": [0.0, 90.0, 180.0, 270.0]
+    }
+  },
+  "recommended_args": [
+    "--skip-foundationpose",
+    "--fixed-scene-pose-file",
+    "assets/test_scenes/rm75_tingzi_assembly_scene.json",
+    "--render-mode",
+    "human",
+    "--repeat-count",
+    "5"
+  ],
+  "notes": [
+    "Clean-table sim-only pavilion assembly scene. No desk mesh is loaded; clean_table is a virtual placement frame only.",
+    "Initial objects are axis-aligned on the XY tabletop. Pillars lie horizontally with their long local +Z axis along world +X.",
+    "The pavilion build sequence is base first, then front-left/front-right/back-left/back-right. This alternates columns so inserted pillars do not close the next insertion corridor."
+  ]
+}

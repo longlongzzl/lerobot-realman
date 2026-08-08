@@ -1,0 +1,505 @@
+{
+  "seed": 20260426,
+  "count": 60,
+  "base_scenes": [
+    "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+    "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json"
+  ],
+  "output_dir": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001",
+  "modes": [
+    "yaw_only",
+    "jitter_yaw",
+    "same_class_swap_jitter"
+  ],
+  "count_per_mode": 20,
+  "movable_objects": [
+    "bi",
+    "carriot",
+    "gluestick",
+    "hongshupian",
+    "lvmukuai",
+    "shuazi",
+    "tennis"
+  ],
+  "fixed_obstacles": [
+    "bitong",
+    "desk"
+  ],
+  "workspace_xy": [
+    -0.58,
+    0.08,
+    -0.34,
+    0.2
+  ],
+  "clearance_m": 0.01,
+  "yaw_step_deg": 15.0,
+  "dimensions_m": {
+    "bi": [
+      0.023023188353856257,
+      0.138,
+      0.02304255018223018
+    ],
+    "carriot": [
+      0.034999999999999996,
+      0.034999999999999996,
+      0.21
+    ],
+    "gluestick": [
+      0.030000000000000006,
+      0.11000000000000001,
+      0.030000000000000006
+    ],
+    "hongshupian": [
+      0.06999999999999999,
+      0.15,
+      0.06999999999999999
+    ],
+    "lvmukuai": [
+      0.06,
+      0.0284361608775039,
+      0.03214349428873121
+    ],
+    "shuazi": [
+      0.105,
+      0.06647593719834485,
+      0.05154225089590424
+    ],
+    "tennis": [
+      0.07,
+      0.07,
+      0.07
+    ],
+    "bitong": [
+      0.06333333239013114,
+      0.095,
+      0.06333333239013114
+    ],
+    "desk": [
+      0.43,
+      0.1,
+      0.24
+    ]
+  },
+  "scenes": [
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_00.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_000",
+      "attempt": 17
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_01.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_001",
+      "attempt": 11
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_02.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_002",
+      "attempt": 1
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_03.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_003",
+      "attempt": 30
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_04.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_004",
+      "attempt": 22
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_05.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_005",
+      "attempt": 8
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_06.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_006",
+      "attempt": 4
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_07.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_007",
+      "attempt": 27
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_08.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_008",
+      "attempt": 3
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_current_table_00_09.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_yaw_only_current_table_009",
+      "attempt": 11
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_00.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_010",
+      "attempt": 1
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_01.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_011",
+      "attempt": 1
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_02.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_012",
+      "attempt": 4
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_03.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_013",
+      "attempt": 23
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_04.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_014",
+      "attempt": 16
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_05.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_015",
+      "attempt": 12
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_06.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_016",
+      "attempt": 15
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_07.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_017",
+      "attempt": 7
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_08.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_018",
+      "attempt": 5
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/yaw_only_gluestick_desk_regression_01_09.json",
+      "mode": "yaw_only",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_yaw_only_gluestick_desk_regression_019",
+      "attempt": 6
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_00.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_000",
+      "attempt": 1
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_01.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_001",
+      "attempt": 5
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_02.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_002",
+      "attempt": 22
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_03.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_003",
+      "attempt": 8
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_04.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_004",
+      "attempt": 33
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_05.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_005",
+      "attempt": 11
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_06.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_006",
+      "attempt": 11
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_07.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_007",
+      "attempt": 54
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_08.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_008",
+      "attempt": 48
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_current_table_00_09.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_jitter_yaw_current_table_009",
+      "attempt": 13
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_00.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_010",
+      "attempt": 6
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_01.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_011",
+      "attempt": 2
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_02.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_012",
+      "attempt": 19
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_03.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_013",
+      "attempt": 3
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_04.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_014",
+      "attempt": 3
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_05.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_015",
+      "attempt": 5
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_06.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_016",
+      "attempt": 26
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_07.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_017",
+      "attempt": 18
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_08.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_018",
+      "attempt": 4
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/jitter_yaw_gluestick_desk_regression_01_09.json",
+      "mode": "jitter_yaw",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_jitter_yaw_gluestick_desk_regression_019",
+      "attempt": 1
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_00.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_000",
+      "attempt": 45
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_01.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_001",
+      "attempt": 29
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_02.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_002",
+      "attempt": 35
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_03.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_003",
+      "attempt": 91
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_04.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_004",
+      "attempt": 63
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_05.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_005",
+      "attempt": 33
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_06.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_006",
+      "attempt": 29
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_07.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_007",
+      "attempt": 43
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_08.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_008",
+      "attempt": 53
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_current_table_00_09.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/current_table.json",
+      "scene_name": "random_same_class_swap_jitter_current_table_009",
+      "attempt": 45
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_00.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_010",
+      "attempt": 18
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_01.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_011",
+      "attempt": 32
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_02.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_012",
+      "attempt": 7
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_03.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_013",
+      "attempt": 51
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_04.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_014",
+      "attempt": 9
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_05.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_015",
+      "attempt": 32
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_06.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_016",
+      "attempt": 3
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_07.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_017",
+      "attempt": 18
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_08.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_018",
+      "attempt": 17
+    },
+    {
+      "file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/generated_random_batch_001/same_class_swap_jitter_gluestick_desk_regression_01_09.json",
+      "mode": "same_class_swap_jitter",
+      "base_scene": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/test_scenes/gluestick_desk_regression.json",
+      "scene_name": "random_same_class_swap_jitter_gluestick_desk_regression_019",
+      "attempt": 1
+    }
+  ]
+}

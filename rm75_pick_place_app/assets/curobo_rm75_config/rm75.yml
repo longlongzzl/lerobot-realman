@@ -1,0 +1,163 @@
+robot_cfg:
+  kinematics:
+    use_usd_kinematics: False
+    usd_path: ""
+    usd_robot_root: "/robot"
+    isaac_usd_path: ""
+    usd_flip_joints: {}
+    usd_flip_joint_limits: []
+
+    urdf_path: "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/robot_models/RM75_gripper/RM75-B/urdf/RM75-B.urdf"
+    asset_root_path: "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/robot_models/RM75_gripper/RM75-B"
+
+    base_link: "base_link"
+    ee_link: "gripper_tcp"
+    link_names:
+      [
+        "gripper_tcp",
+        "gripper_base_link",
+        "gripper_Left_1_Link",
+        "gripper_Left_Support_Link",
+        "gripper_Left_2_Link",
+        "gripper_Right_1_Link",
+        "gripper_Right_Support_Link",
+        "gripper_Right_2_Link",
+        "left_pad",
+        "right_pad",
+      ]
+    lock_joints:
+      {
+        "gripper_Left_1_Joint": 0.6,
+        "gripper_Left_Support_Joint": 0.6,
+        "gripper_Left_2_Joint": 0.6,
+        "gripper_Right_1_Joint": 0.6,
+        "gripper_Right_Support_Joint": 0.6,
+        "gripper_Right_2_Joint": 0.6,
+      }
+
+    extra_links:
+      {
+        "attached_object":
+          {
+            "parent_link_name": "gripper_tcp",
+            "link_name": "attached_object",
+            "fixed_transform": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            "joint_type": "FIXED",
+            "joint_name": "attach_joint",
+          },
+      }
+
+    collision_link_names:
+      [
+        "base_link",
+        "link_1",
+        "link_2",
+        "link_3",
+        "link_4",
+        "link_5",
+        "link_6",
+        "link_7",
+        "gripper_base_link",
+        "gripper_Left_1_Link",
+        "gripper_Left_Support_Link",
+        "gripper_Left_2_Link",
+        "gripper_Right_1_Link",
+        "gripper_Right_Support_Link",
+        "gripper_Right_2_Link",
+        "left_pad",
+        "right_pad",
+        "attached_object",
+      ]
+    collision_spheres: "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/curobo_rm75_config/spheres/rm75_rough.yml"
+    collision_sphere_buffer: 0.0025
+    extra_collision_spheres: {"attached_object": 6}
+
+    self_collision_ignore:
+      {
+        "base_link": ["link_1", "link_2", "attached_object"],
+        "link_1": ["link_2", "link_3"],
+        "link_2": ["link_3", "link_4"],
+        "link_3": ["link_4", "link_5"],
+        "link_4": ["link_5", "link_6"],
+        "link_5": ["link_6", "link_7", "gripper_base_link"],
+        "link_6": ["link_7"],
+        "link_7":
+          [
+            "gripper_base_link",
+          ],
+        "gripper_base_link":
+          [
+            "gripper_Left_1_Link",
+            "gripper_Left_Support_Link",
+            "gripper_Left_2_Link",
+            "gripper_Right_1_Link",
+            "gripper_Right_Support_Link",
+            "gripper_Right_2_Link",
+            "left_pad",
+            "right_pad",
+            "attached_object",
+          ],
+        "gripper_Left_1_Link": ["gripper_Left_Support_Link", "gripper_Left_2_Link", "left_pad", "attached_object"],
+        "gripper_Left_Support_Link": ["gripper_Left_2_Link", "left_pad", "attached_object"],
+        "gripper_Left_2_Link": ["gripper_Right_2_Link", "left_pad", "attached_object"],
+        "gripper_Right_1_Link": ["gripper_Right_Support_Link", "gripper_Right_2_Link", "right_pad", "attached_object"],
+        "gripper_Right_Support_Link": ["gripper_Right_2_Link", "right_pad", "attached_object"],
+        "gripper_Right_2_Link": ["right_pad", "attached_object"],
+        "left_pad": ["right_pad", "attached_object"],
+        "right_pad": ["attached_object"],
+      }
+
+    self_collision_buffer:
+      {
+        "base_link": 0.04,
+        "link_1": 0.03,
+        "link_2": 0.015,
+        "link_3": 0.015,
+        "link_4": 0.015,
+        "link_5": 0.01,
+        "link_6": 0.01,
+        "link_7": 0.01,
+        "gripper_base_link": 0.008,
+        "gripper_Left_1_Link": 0.004,
+        "gripper_Left_Support_Link": 0.004,
+        "gripper_Left_2_Link": 0.004,
+        "gripper_Right_1_Link": 0.004,
+        "gripper_Right_Support_Link": 0.004,
+        "gripper_Right_2_Link": 0.004,
+        "left_pad": 0.003,
+        "right_pad": 0.003,
+        "attached_object": 0.0,
+      }
+
+    use_global_cumul: True
+    mesh_link_names:
+      [
+        "base_link",
+        "link_1",
+        "link_2",
+        "link_3",
+        "link_4",
+        "link_5",
+        "link_6",
+        "link_7",
+        "gripper_base_link",
+        "gripper_Left_1_Link",
+        "gripper_Left_Support_Link",
+        "gripper_Left_2_Link",
+        "gripper_Right_1_Link",
+        "gripper_Right_Support_Link",
+        "gripper_Right_2_Link",
+        "left_pad",
+        "right_pad",
+      ]
+    external_asset_path: null
+
+    cspace:
+      joint_names:
+        ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7"]
+      retract_config:
+        [1.5707964, 0.0, 0.0, -1.5707964, 0.0, -1.5707964, 1.0471976]
+      null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      max_acceleration: 12.0
+      max_jerk: 500.0

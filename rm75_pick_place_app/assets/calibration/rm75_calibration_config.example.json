@@ -1,0 +1,81 @@
+{
+  "realman_settings": {
+    "id": "realman_home",
+    "robot_ip": "192.168.101.20",
+    "robot_port": 8080,
+    "joint_names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7"],
+    "calibration_offset": {},
+    "urdf_path": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/robot_models/RM75_gripper/RM75-B/urdf/RM75-B.urdf",
+    "ee_link_name": "gripper_tcp",
+    "camera": {
+      "serial_number_or_name": "342522073637",
+      "width": 1280,
+      "height": 720,
+      "fps": 15
+    },
+    "base_camera": {
+      "serial_number_or_name": "342522073637",
+      "width": 1280,
+      "height": 720,
+      "fps": 15
+    },
+    "wrist_camera": {
+      "serial_number_or_name": "260322278131",
+      "width": 1280,
+      "height": 720,
+      "fps": 15,
+      "auto_exposure": false,
+      "exposure_us": 16000,
+      "gain": 16
+    },
+    "initial_extrinsic_guess": {
+      "xyz": [-0.4, 0.1, 0.5],
+      "rpy_deg": [0.0, 45.0, -36.0]
+    },
+    "joint_limits_deg": [
+      [-170, 170],
+      [-120, 120],
+      [-170, 170],
+      [-120, 120],
+      [-170, 170],
+      [-120, 120],
+      [-170, 170]
+    ],
+    "wrist_seed_qpos_deg": [90, 0, 0, -90, 0, -90, 60],
+    "wrist_joint_jitter_deg": [10, 12, 14, 12, 16, 18, 10],
+    "wrist_visual_refine_links": ["base_link", "link_1", "link_2", "link_3"],
+    "charuco_board": {
+      "squares_x": 7,
+      "squares_y": 5,
+      "square_length_m": 0.02,
+      "marker_length_m": 0.015,
+      "dictionary": "DICT_5X5_50",
+      "min_corners": 8,
+      "marker_id_layout": [
+        [4, 9, 14],
+        [1, 6, 11, 16],
+        [3, 8, 13],
+        [0, 5, 10, 15],
+        [2, 7, 12]
+      ],
+      "enable_chessboard_inner_corners": true,
+      "max_orientation_error_px": 3.0
+    },
+    "base_reference_qpos_deg": [
+      [90, 0, 0, -90, 0, -90, 60],
+      [70, -12, 20, -82, 10, -105, 60],
+      [110, -8, -18, -96, -12, -78, 60]
+    ],
+    "wrist_reference_qpos_deg": [
+      [90, 0, 0, -90, 0, -90, 60],
+      [80, -18, 18, -78, 15, -115, 60],
+      [100, -15, -18, -102, -15, -70, 60],
+      [75, 10, 25, -110, 8, -95, 60],
+      [105, 8, -25, -70, -8, -85, 60]
+    ],
+    "check_reference_qpos_deg": [
+      [88, -5, 12, -85, 10, -100, 60],
+      [102, 5, -12, -95, -10, -80, 60]
+    ]
+  }
+}

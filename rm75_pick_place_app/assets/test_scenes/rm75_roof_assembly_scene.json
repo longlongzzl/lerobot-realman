@@ -1,0 +1,819 @@
+{
+  "schema": "rm75_roof_assembly_scene_cache_v1",
+  "units": "meters",
+  "coordinate_frame": "robot_base_world",
+  "mesh_root": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs",
+  "table_top_z": 0.0,
+  "roof_geometry": {
+    "roof_cube_name": "red_bricks_cube",
+    "roof_cube_center": [
+      -0.05,
+      0.0,
+      0.0525
+    ],
+    "roof_cube_size_m": 0.105,
+    "roof_cube_top_z": 0.105,
+    "roof_height_m": 0.08,
+    "roof_triangle_tip_local": [
+      0.0,
+      0.06,
+      0.0
+    ],
+    "roof_triangle_base_center_local": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "roof_triangle_local_edge_axis": [
+      1.0,
+      0.0,
+      0.0
+    ],
+    "roof_triangle_local_up_axis": [
+      0.0,
+      1.0,
+      0.0
+    ]
+  },
+  "objects": {
+    "red_bricks_cube": {
+      "name": "red_bricks_cube",
+      "type": "mesh",
+      "category": "fixed_obstacle",
+      "fixed": true,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_bricks_cube.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_bricks_cube.glb",
+      "sim_asset_scale": 1.0,
+      "size_m": [
+        0.105,
+        0.105,
+        0.105
+      ],
+      "pose": [
+        -0.05,
+        0.0,
+        0.0525,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          -0.05
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0525
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "curobo_obstacle": true,
+      "foundationpose_target": "red brick cube"
+    },
+    "red_triangle_front": {
+      "name": "red_triangle_front",
+      "type": "mesh",
+      "category": "roof_triangle",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "pose": [
+        -0.19,
+        -0.19,
+        0.002,
+        0.7071067811865476,
+        0.7071067811865475,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          -0.19
+        ],
+        [
+          0.0,
+          0.0,
+          -1.0,
+          -0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "roof_side": "front",
+      "foundationpose_target": "red triangle panel",
+      "curobo_obstacle": false,
+      "note": "Active source object for one roof-assembly cycle. Name contains front/back/left/right so --roof-side auto can infer side."
+    },
+    "red_triangle_back": {
+      "name": "red_triangle_back",
+      "type": "mesh",
+      "category": "roof_triangle",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "pose": [
+        0.09,
+        -0.19,
+        0.002,
+        0.7071067811865476,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.09
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          -0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "roof_side": "back",
+      "foundationpose_target": "red triangle panel",
+      "curobo_obstacle": false,
+      "note": "Active source object for one roof-assembly cycle. Name contains front/back/left/right so --roof-side auto can infer side."
+    },
+    "red_triangle_left": {
+      "name": "red_triangle_left",
+      "type": "mesh",
+      "category": "roof_triangle",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "pose": [
+        -0.19,
+        0.19,
+        0.002,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          -0.19
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "roof_side": "left",
+      "foundationpose_target": "red triangle panel",
+      "curobo_obstacle": false,
+      "note": "Active source object for one roof-assembly cycle. Name contains front/back/left/right so --roof-side auto can infer side."
+    },
+    "red_triangle_right": {
+      "name": "red_triangle_right",
+      "type": "mesh",
+      "category": "roof_triangle",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "pose": [
+        0.09,
+        0.19,
+        0.002,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.09
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "roof_side": "right",
+      "foundationpose_target": "red triangle panel",
+      "curobo_obstacle": false,
+      "note": "Active source object for one roof-assembly cycle. Name contains front/back/left/right so --roof-side auto can infer side."
+    }
+  },
+  "scene_objects": {
+    "red_bricks_cube": {
+      "name": "red_bricks_cube",
+      "type": "mesh",
+      "category": "fixed_obstacle",
+      "fixed": true,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_bricks_cube.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_bricks_cube.glb",
+      "sim_asset_scale": 1.0,
+      "size_m": [
+        0.105,
+        0.105,
+        0.105
+      ],
+      "pose": [
+        -0.05,
+        0.0,
+        0.0525,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          -0.05
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0525
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "curobo_obstacle": true,
+      "foundationpose_target": "red brick cube"
+    },
+    "red_triangle_front": {
+      "name": "red_triangle_front",
+      "type": "mesh",
+      "category": "roof_triangle",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "pose": [
+        -0.19,
+        -0.19,
+        0.002,
+        0.7071067811865476,
+        0.7071067811865475,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          -0.19
+        ],
+        [
+          0.0,
+          0.0,
+          -1.0,
+          -0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "roof_side": "front",
+      "foundationpose_target": "red triangle panel",
+      "curobo_obstacle": false,
+      "note": "Active source object for one roof-assembly cycle. Name contains front/back/left/right so --roof-side auto can infer side."
+    },
+    "red_triangle_back": {
+      "name": "red_triangle_back",
+      "type": "mesh",
+      "category": "roof_triangle",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "pose": [
+        0.09,
+        -0.19,
+        0.002,
+        0.7071067811865476,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.09
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          -0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "roof_side": "back",
+      "foundationpose_target": "red triangle panel",
+      "curobo_obstacle": false,
+      "note": "Active source object for one roof-assembly cycle. Name contains front/back/left/right so --roof-side auto can infer side."
+    },
+    "red_triangle_left": {
+      "name": "red_triangle_left",
+      "type": "mesh",
+      "category": "roof_triangle",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "pose": [
+        -0.19,
+        0.19,
+        0.002,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          -0.19
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "roof_side": "left",
+      "foundationpose_target": "red triangle panel",
+      "curobo_obstacle": false,
+      "note": "Active source object for one roof-assembly cycle. Name contains front/back/left/right so --roof-side auto can infer side."
+    },
+    "red_triangle_right": {
+      "name": "red_triangle_right",
+      "type": "mesh",
+      "category": "roof_triangle",
+      "fixed": false,
+      "collision": true,
+      "visual": true,
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "pose": [
+        0.09,
+        0.19,
+        0.002,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.09
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "roof_side": "right",
+      "foundationpose_target": "red triangle panel",
+      "curobo_obstacle": false,
+      "note": "Active source object for one roof-assembly cycle. Name contains front/back/left/right so --roof-side auto can infer side."
+    }
+  },
+  "active_objects_order": [
+    "red_triangle_front",
+    "red_triangle_back",
+    "red_triangle_left",
+    "red_triangle_right"
+  ],
+  "object_specs": {
+    "red_triangle_front": {
+      "object_name": "red_triangle_front",
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "groundingdino_target": "red triangle panel",
+      "initial_pose": [
+        -0.19,
+        -0.19,
+        0.002,
+        0.7071067811865476,
+        0.7071067811865475,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          -0.19
+        ],
+        [
+          0.0,
+          0.0,
+          -1.0,
+          -0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "selected_obstacles": [
+        "red_bricks_cube"
+      ],
+      "roof_side": "front",
+      "grasp_mode": "topdown"
+    },
+    "red_triangle_back": {
+      "object_name": "red_triangle_back",
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "groundingdino_target": "red triangle panel",
+      "initial_pose": [
+        0.09,
+        -0.19,
+        0.002,
+        0.7071067811865476,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.09
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          -0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "selected_obstacles": [
+        "red_bricks_cube"
+      ],
+      "roof_side": "back",
+      "grasp_mode": "topdown"
+    },
+    "red_triangle_left": {
+      "object_name": "red_triangle_left",
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "groundingdino_target": "red triangle panel",
+      "initial_pose": [
+        -0.19,
+        0.19,
+        0.002,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          -0.19
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "selected_obstacles": [
+        "red_bricks_cube"
+      ],
+      "roof_side": "left",
+      "grasp_mode": "topdown"
+    },
+    "red_triangle_right": {
+      "object_name": "red_triangle_right",
+      "mesh_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_file": "/home/zhangzhao/Desktop/lerobot/rm75_pick_place_app/assets/meshs/red_triangle.glb",
+      "sim_asset_scale": 1.0,
+      "groundingdino_target": "red triangle panel",
+      "initial_pose": [
+        0.09,
+        0.19,
+        0.002,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "T_world_obj": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.09
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.19
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.002
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "selected_obstacles": [
+        "red_bricks_cube"
+      ],
+      "roof_side": "right",
+      "grasp_mode": "topdown"
+    }
+  },
+  "targeted_place_rules": {
+    "red_triangle_front": {
+      "primitive": "roof_assembly",
+      "target": "red_bricks_cube",
+      "roof_side": "front",
+      "selected_obstacles": [
+        "red_bricks_cube"
+      ]
+    },
+    "red_triangle_back": {
+      "primitive": "roof_assembly",
+      "target": "red_bricks_cube",
+      "roof_side": "back",
+      "selected_obstacles": [
+        "red_bricks_cube"
+      ]
+    },
+    "red_triangle_left": {
+      "primitive": "roof_assembly",
+      "target": "red_bricks_cube",
+      "roof_side": "left",
+      "selected_obstacles": [
+        "red_bricks_cube"
+      ]
+    },
+    "red_triangle_right": {
+      "primitive": "roof_assembly",
+      "target": "red_bricks_cube",
+      "roof_side": "right",
+      "selected_obstacles": [
+        "red_bricks_cube"
+      ]
+    }
+  },
+  "recommended_args": [
+    "--roof-assembly",
+    "--roof-cube-name",
+    "red_bricks_cube",
+    "--roof-cube-size-m",
+    "0.105000",
+    "--roof-height-m",
+    "0.080000",
+    "--roof-triangle-tip-local",
+    "0",
+    "0.060",
+    "0",
+    "--roof-triangle-base-center-local",
+    "0",
+    "0",
+    "0",
+    "--roof-triangle-local-edge-axis",
+    "1",
+    "0",
+    "0",
+    "--roof-triangle-local-up-axis",
+    "0",
+    "1",
+    "0",
+    "--roof-tip-grasp-world-offset",
+    "0",
+    "0",
+    "0.010",
+    "--roof-preplace-outward-offset-m",
+    "0.055",
+    "--roof-hover-extra-z-m",
+    "0.030",
+    "--roof-release-outward-offset-m",
+    "0.006"
+  ],
+  "notes": [
+    "This file is intentionally compatible with the roof wrapper's fallback lookup: scene_capture_cache['objects'][name]['T_world_obj'] and ['pose'] are both present.",
+    "If your loader only accepts a minimal scene_capture_cache, it can ignore object_specs/targeted_place_rules/recommended_args.",
+    "If your table top is not z=0, change table_top_z and regenerate/adjust all z values.",
+    "If red_triangle.glb local frame differs, tune the four --roof-triangle-* calibration args in recommended_args."
+  ]
+}
