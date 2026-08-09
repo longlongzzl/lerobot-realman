@@ -7,11 +7,8 @@ from pathlib import Path
 from .commands import (
     calibration_command,
     direct_pick_command,
-    roof_assembly_pick_command,
-    sam6d_pick_command,
     shell_join,
     web_command,
-    wrist_refined_pick_command,
 )
 from .launch import run_app_module
 
@@ -101,11 +98,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="RM75 refactored launcher")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_direct = sub.add_parser("direct", help="Run the FoundationPose/direct pick-place entrypoint")
-    p_direct.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the direct module")
+    p_direct = sub.add_parser("direct", help="Compatibility alias for the layered Curobo2 pick-place entrypoint")
+    p_direct.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the Curobo2 module")
 
-    p_sam6d = sub.add_parser("sam6d", help="Run the SAM3/SAM6D pick-place entrypoint")
-    p_sam6d.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the SAM6D module")
+    p_sam6d = sub.add_parser("sam6d", help="Run SAM3/SAM6D pose perception only")
+    p_sam6d.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the SAM6D pose provider")
 
     p_rrtrack = sub.add_parser("rrtrack", help="Run recoverable CUTIE + 6D object tracking")
     p_rrtrack.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the RRTrack perception module")
@@ -113,23 +110,26 @@ def main(argv: list[str] | None = None) -> int:
     p_rrtrack_bank = sub.add_parser("rrtrack-build-bank", help="Build a DINOv2 offline recovery bank from SAM6D templates")
     p_rrtrack_bank.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the bank builder")
 
+    p_rrtrack_all_banks = sub.add_parser("rrtrack-build-all-banks", help="Build DINOv2 recovery banks for all known objects")
+    p_rrtrack_all_banks.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the all-object bank builder")
+
+    p_openworld = sub.add_parser("openworld-geometry", aliases=["openworld"], help="Build/update unseen-object collision geometry")
+    p_openworld.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the dynamic geometry module")
+
+    p_curobo2 = sub.add_parser("curobo2-pickplace", aliases=["curobo2"], help="Run the layered Curobo2 pick-place pipeline")
+    p_curobo2.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the Curobo2 pipeline")
+
+    p_curobo2_sim = sub.add_parser("curobo2-sim-replay", help="Replay a portable Curobo2 trajectory package in ManiSkill")
+    p_curobo2_sim.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the ManiSkill replay module")
+
     p_tabletop_refine = sub.add_parser(
         "tabletop-refine",
         help="Refine a SAM6D full-scene result for tabletop objects by optimizing x/y/yaw only",
     )
     p_tabletop_refine.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the tabletop refinement module")
 
-    p_wrist = sub.add_parser("wrist", help="Run direct pick-place with wrist-camera held-object refinement enabled")
-    p_wrist.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the wrist-refined direct module")
-
     p_wrist_live = sub.add_parser("wrist-live-overlay", help="Live wrist RGB / simulated wrist view / overlay alignment viewer")
     p_wrist_live.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the wrist live overlay module")
-
-    p_roof = sub.add_parser("roof", help="Run pavilion assembly pick-place with wrist-camera held-object refinement enabled")
-    p_roof.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the pavilion assembly module")
-
-    p_tingzi = sub.add_parser("tingzi", help="Alias for roof: run pavilion base + pillar assembly")
-    p_tingzi.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the pavilion assembly module")
 
     p_web = sub.add_parser("web", help="Run the web control panel")
     p_web.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the web module")
@@ -140,8 +140,8 @@ def main(argv: list[str] | None = None) -> int:
     p_pickplace = sub.add_parser("pickplace", help="Run the canonical pick-place mainline")
     p_pickplace.add_argument(
         "--mode",
-        choices=["direct", "sam6d", "rrtrack", "wrist", "tabletop-refine"],
-        default="direct",
+        choices=["curobo2", "rrtrack", "openworld-geometry", "tabletop-refine"],
+        default="curobo2",
         help="Pick-place backend selected by the mainline runner",
     )
     p_pickplace.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the selected pick-place backend")
@@ -198,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     p_calib_joint.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the calibration module")
 
     p_cmd = sub.add_parser("print-command", help="Print common commands without running them")
-    p_cmd.add_argument("kind", choices=["direct", "wrist", "roof", "tingzi", "sam6d", "tabletop-refine", "web", "calib-base", "calib-board-anchor", "calib-wrist", "calib-wrist-anchor", "calib-dual-board", "calib-wrist-visual", "calib-check", "calib-base-point-check", "calib-joint-board"])
+    p_cmd.add_argument("kind", choices=["direct", "tabletop-refine", "web", "calib-base", "calib-board-anchor", "calib-wrist", "calib-wrist-anchor", "calib-dual-board", "calib-wrist-visual", "calib-check", "calib-base-point-check", "calib-joint-board"])
     p_cmd.add_argument("--execute-real", action="store_true")
     p_cmd.add_argument("--render-mode", default="human")
     p_cmd.add_argument("--host", default="127.0.0.1")
@@ -228,23 +228,25 @@ def main(argv: list[str] | None = None) -> int:
     if ns.cmd == "pickplace":
         return _run_registered_pickplace(ns.mode, _split_passthrough(ns.args))
     if ns.cmd == "direct":
-        return _run_registered_pickplace("direct", _split_passthrough(ns.args))
+        return _run_registered_pickplace("curobo2", _split_passthrough(ns.args))
     if ns.cmd == "sam6d":
-        return _run_registered_pickplace("sam6d", _split_passthrough(ns.args))
+        return run_app_module("rm75_app.perception.sam6d_pose_provider", _split_passthrough(ns.args))
     if ns.cmd == "rrtrack":
         return _run_registered_pickplace("rrtrack", _split_passthrough(ns.args))
     if ns.cmd == "rrtrack-build-bank":
         return run_app_module("rm75_app.runtime.rrtrack_build_bank", _split_passthrough(ns.args))
+    if ns.cmd == "rrtrack-build-all-banks":
+        return run_app_module("rm75_app.runtime.rrtrack_build_all_banks", _split_passthrough(ns.args))
+    if ns.cmd in {"openworld-geometry", "openworld"}:
+        return _run_registered_pickplace("openworld-geometry", _split_passthrough(ns.args))
+    if ns.cmd in {"curobo2-pickplace", "curobo2"}:
+        return run_app_module("rm75_app.runtime.curobo2_pick_place", _split_passthrough(ns.args))
+    if ns.cmd == "curobo2-sim-replay":
+        return run_app_module("rm75_app.runtime.curobo2_sim_replay", _split_passthrough(ns.args))
     if ns.cmd == "tabletop-refine":
         return _run_registered_pickplace("tabletop-refine", _split_passthrough(ns.args))
-    if ns.cmd == "wrist":
-        return _run_registered_pickplace("wrist", _split_passthrough(ns.args))
     if ns.cmd == "wrist-live-overlay":
         return run_app_module("rm75_app.runtime.wrist_live_overlay", _split_passthrough(ns.args))
-    if ns.cmd == "roof":
-        return run_app_module("rm75_app.runtime.roof_assembly_pick_place", _split_passthrough(ns.args))
-    if ns.cmd == "tingzi":
-        return run_app_module("rm75_app.runtime.roof_assembly_pick_place", _split_passthrough(ns.args))
     if ns.cmd == "web":
         return run_app_module("rm75_app.web.control_panel", _split_passthrough(ns.args))
     if ns.cmd == "llm":
@@ -270,12 +272,6 @@ def main(argv: list[str] | None = None) -> int:
     if ns.cmd == "print-command":
         if ns.kind == "direct":
             print(shell_join(direct_pick_command(render_mode=ns.render_mode, execute_real=ns.execute_real)))
-        elif ns.kind == "wrist":
-            print(shell_join(wrist_refined_pick_command(render_mode=ns.render_mode, execute_real=ns.execute_real)))
-        elif ns.kind in {"roof", "tingzi"}:
-            print(shell_join(roof_assembly_pick_command(render_mode=ns.render_mode, execute_real=ns.execute_real)))
-        elif ns.kind == "sam6d":
-            print(shell_join(sam6d_pick_command(render_mode=ns.render_mode, execute_real=ns.execute_real)))
         elif ns.kind == "tabletop-refine":
             print(shell_join(["python", "-m", "rm75_app.runtime.tabletop_pose_refine"]))
         elif ns.kind == "calib-base":

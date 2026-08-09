@@ -19,6 +19,26 @@ def _load_module(name: str, path: Path):
     return module
 
 
+def foundationpose_compatible_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Normalize modern GLB PBR textures for FoundationPose's legacy loader."""
+    compatible = mesh.copy()
+    visual = compatible.visual
+    if not isinstance(visual, trimesh.visual.texture.TextureVisuals):
+        return compatible
+    material = visual.material
+    if getattr(material, "image", None) is not None:
+        return compatible
+    image = getattr(material, "baseColorTexture", None)
+    if image is not None:
+        compatible.visual = trimesh.visual.texture.TextureVisuals(
+            uv=np.asarray(visual.uv).copy(),
+            material=trimesh.visual.material.SimpleMaterial(image=image),
+        )
+        return compatible
+    compatible.visual = visual.to_color()
+    return compatible
+
+
 class FoundationPoseRefiner:
     """Frozen FoundationPose local refiner with candidate re-initialization."""
 
@@ -39,6 +59,7 @@ class FoundationPoseRefiner:
         estimater = _load_module("rm75_rrtrack_foundationpose_estimater", root / "estimater.py")
         self._module = estimater
         glctx = estimater.dr.RasterizeCudaContext()
+        mesh = foundationpose_compatible_mesh(mesh)
         self.estimator = estimater.FoundationPose(
             model_pts=np.asarray(mesh.vertices),
             model_normals=np.asarray(mesh.vertex_normals),

@@ -119,6 +119,7 @@ class SAM3ResidentWorker:
             select_box=None,
             min_mask_area=int(payload.get("min_mask_area") or 64),
             morph_kernel=int(payload.get("morph_kernel") or 3),
+            sam3_max_masks_per_item=int(payload.get("sam3_max_masks_per_item") or 1),
             device=device,
         )
         amp_ctx = (

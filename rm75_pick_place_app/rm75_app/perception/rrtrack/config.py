@@ -42,7 +42,8 @@ class RRTrackConfig:
     stagnation_rotation_deg: float = 1.0
     stagnation_translation_m: float = 0.004
     lost_patience_frames: int = 2
-    recovery_retry_interval: int = 3
+    recovery_retry_interval: int = 1
+    global_register_after_retrieval_failures: int = 3
     sam3_recovery_after_frames: int = 4
     long_memory_interval: int = 20
     max_long_anchors: int = 6
@@ -76,6 +77,7 @@ class RRTrackConfig:
             "min_track_area_px",
             "stagnation_window",
             "lost_patience_frames",
+            "global_register_after_retrieval_failures",
             "max_long_anchors",
             "sam3_recovery_after_frames",
         ):

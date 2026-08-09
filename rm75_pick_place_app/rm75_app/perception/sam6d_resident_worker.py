@@ -59,6 +59,7 @@ def _apply_payload_args(args: argparse.Namespace, payload: dict) -> argparse.Nam
         "camera_extrinsic_opencv_path",
         "use_direct_camera_extrinsic",
         "sam3_full_scene_mask_confirm",
+        "sam3_full_scene_keep_multi_instances",
         "sam3_require_full_scene_masks",
         "sam3_show_full_scene_mask_window",
         "sam3_max_masks_per_item",
@@ -281,22 +282,35 @@ class SAM6DResidentWorker:
         detector_cache = {"sam3_text_results": result_map, "sam3_text_full_scene_attempted": True}
         results = []
         t0 = time.perf_counter()
-        for index, name in enumerate(object_names):
-            item_args = copy.copy(args)
-            item_args.object_name = name
-            safe_name = provider.normalize_object_name(name) or provider._safe_cache_name(name)
-            item_dir = scene_dir / f"{index + 1:02d}_{safe_name}"
-            try:
-                result = provider._run_single_object_pose(item_args, frame, sam6d_root, item_dir, detector_cache=detector_cache)
-                result["ok"] = True
-            except Exception as exc:
-                result = {"object_name": name, "ok": False, "error": repr(exc), "run_dir": str(item_dir)}
-                print(f"[sam6d-resident] object={name} failed: {exc!r}")
-            results.append(result)
+        attempt_index = 0
+        for name in object_names:
+            normalized_name = provider.normalize_object_name(name) or str(name)
+            precomputed = result_map.get(normalized_name)
+            instance_count = len(precomputed) if isinstance(precomputed, list) else 1
+            for instance_index in range(instance_count):
+                attempt_index += 1
+                item_args = copy.copy(args)
+                item_args.object_name = name
+                item_args.sam3_instance_index = instance_index
+                safe_name = provider.normalize_object_name(name) or provider._safe_cache_name(name)
+                item_dir = scene_dir / f"{attempt_index:02d}_{safe_name}_i{instance_index:02d}"
+                try:
+                    result = provider._run_single_object_pose(item_args, frame, sam6d_root, item_dir, detector_cache=detector_cache)
+                    result["ok"] = True
+                except Exception as exc:
+                    result = {
+                        "object_name": name,
+                        "sam3_instance_index": instance_index,
+                        "ok": False,
+                        "error": repr(exc),
+                        "run_dir": str(item_dir),
+                    }
+                    print(f"[sam6d-resident] object={name} instance={instance_index} failed: {exc!r}")
+                results.append(result)
 
         summary = {
             "scene_dir": str(scene_dir),
-            "object_count": len(object_names),
+            "object_count": len(results),
             "ok_count": sum(1 for item in results if item.get("ok")),
             "results": results,
             "sam3_mask_overlay": str(vis_path),

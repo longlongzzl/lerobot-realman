@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import time
 from typing import Callable
 
 import numpy as np
@@ -60,6 +61,7 @@ class RRTracker:
         self.last_recovery_attempt = -10**9
         self.last_relocalization_attempt = -10**9
         self.recovery_frames = 0
+        self.retrieval_failure_streak = 0
         self.pose_history: deque[np.ndarray] = deque(maxlen=self.config.stagnation_window + 1)
 
     def initialize(
@@ -80,6 +82,7 @@ class RRTracker:
         self.pose_history.clear()
         self.pose_history.append(self.pose.copy())
         self.recovery_frames = 0
+        self.retrieval_failure_streak = 0
         self._observe_stable(agreement)
         bank_updated = self._maybe_update_online_bank(frame, observed, agreement, force=True)
         return RRTrackOutput(
@@ -259,6 +262,7 @@ class RRTracker:
         self.pose_history.append(self.pose.copy())
         self.lost_streak = 0
         self.recovery_frames = 0
+        self.retrieval_failure_streak = 0
         self.state = TrackerState.TRACKING
         self.segmenter.clear_non_permanent_memory()
         self.segmenter.inject(frame.rgb, rendered, long_term=True)
@@ -288,11 +292,13 @@ class RRTracker:
         prediction: SegmentationPrediction,
     ) -> tuple[PoseEstimate | None, Agreement, np.ndarray | None, str | None, dict]:
         candidates: list[TemplateCandidate] = []
-        metadata: dict = {"retrieved": []}
+        metadata: dict = {"retrieved": [], "timing_ms": {}}
         feature = None
         if self.descriptor is not None:
             try:
+                started = time.perf_counter()
                 feature = self.descriptor.encode(frame.rgb, mask)
+                metadata["timing_ms"]["descriptor"] = (time.perf_counter() - started) * 1000.0
                 for bank, threshold in (
                     (self.offline_bank, self.config.similarity_offline),
                     (self.online_bank, self.config.similarity_online),
@@ -332,7 +338,9 @@ class RRTracker:
         refine_many = getattr(self.pose_refiner, "refine_candidates", None)
         if proposals and callable(refine_many):
             try:
+                started = time.perf_counter()
                 estimates = refine_many(frame, mask, proposals)
+                metadata["timing_ms"]["candidate_batch_refine"] = (time.perf_counter() - started) * 1000.0
                 ranked_estimates = list(zip(estimates, proposal_candidates))
             except Exception as exc:
                 metadata["candidate_batch_refine_error"] = str(exc)
@@ -367,12 +375,28 @@ class RRTracker:
                 "foundationpose_ranker_score": float(estimate.score),
             }
             if agreement.precision >= self._precision_track():
+                self.retrieval_failure_streak = 0
                 self.thresholds.observe(f"similarity_{candidate.source}", candidate.similarity)
                 return estimate, agreement, rendered, candidate.source, metadata
 
+            self.retrieval_failure_streak += 1
+            metadata["retrieval_failure_streak"] = self.retrieval_failure_streak
+            if self.retrieval_failure_streak < self.config.global_register_after_retrieval_failures:
+                return estimate, agreement, rendered, f"{candidate.source}_rejected", metadata
+        else:
+            self.retrieval_failure_streak += 1
+            metadata["retrieval_failure_streak"] = self.retrieval_failure_streak
+            if (
+                self.descriptor is not None
+                and self.retrieval_failure_streak < self.config.global_register_after_retrieval_failures
+            ):
+                return None, Agreement(0.0, 0.0, 1.0, int(np.count_nonzero(mask)), 0, 0), None, "retrieval_deferred", metadata
+
         # Paper fallback: full-sphere pose search when retrieval has no accepted candidate.
         try:
+            started = time.perf_counter()
             estimate = self.pose_refiner.global_register(frame, mask)
+            metadata["timing_ms"]["global_register"] = (time.perf_counter() - started) * 1000.0
             if estimate is not None:
                 rendered = self.renderer.render(estimate.T_cam_obj, frame.K, frame.depth_m.shape)
                 agreement = rendered_mask_agreement(mask, rendered, prediction.foreground_probability)
@@ -393,6 +417,7 @@ class RRTracker:
     ) -> RRTrackOutput:
         if self.state is not TrackerState.LOST:
             self.recovery_frames = 0
+            self.retrieval_failure_streak = 0
         self.state = TrackerState.LOST
         observed = np.asarray(prediction.mask, dtype=bool)
         agreement = agreement or Agreement(0.0, 0.0, 1.0, int(np.count_nonzero(observed)), 0, 0)

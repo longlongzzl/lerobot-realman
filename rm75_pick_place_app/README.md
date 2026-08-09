@@ -1,6 +1,6 @@
 # RM75 Pick-Place App
 
-这个目录现在是独立运行工程：pick-place 的 direct/SAM6D 主链、核心源码、mesh、cuRobo 配置、测试场景、机器人 URDF、相机标定副本和运行输出都在本目录内，不再从外层旧工程目录加载代码或资产。
+这个目录现在是独立运行工程：pick-place 默认主线已切换为分层 Curobo2，感知、动态几何、候选生成、批量 IK/TrajOpt、状态编排和执行适配均有独立边界。旧 direct/SAM6D 单体流程只保留兼容，不再是默认主线。
 
 ## 目录结构
 
@@ -14,8 +14,8 @@ rm75_pick_place_app/
     legacy/        # 尚未迁移的 Jimu/Lego 旧后端路径
     runtime/       # direct pick-place、SAM6D pick-place、FoundationPose scene pipeline
     perception/    # SAM3/SAM6D providers、RRTrack closed-loop tracker
-    planning/      # cuRobo planner、full-chain helper、fast-chain notes
-    execution/     # 真机/仿真桥接执行脚本
+    planning/      # planner-independent contracts + Curobo2 batch backend
+    execution/     # 可移植轨迹包和真机/仿真执行适配器
     placement/     # 放置规则
     assets/        # object specs
     llm/           # LLM pick-place orchestrator
@@ -50,14 +50,16 @@ rm75_pick_place_app/
                  ↓
  perception → candidate/place policy → planning → execution → validation
                  ↓
-       仿真 / 真机 / 旧脚本兼容后端
+       Curobo2 规划 / ManiSkill 回放 / 可替换执行器
 ```
 
 - `core/` 只定义任务请求、阶段、计划、命令和结果，不导入 NumPy、ManiSkill、cuRobo 或硬件 SDK。
 - `tasks/` 只描述任务差异。抓取放置、Jimu 装配、Lego snap 都通过同一套阶段契约接入。
-- `perception/`、`planning/`、`execution/` 是可替换能力层；任务层不应该直接导入旧的超大运行脚本。
-- `pickplace/` 是 pick-place 的主线编排边界；`runtime/` 保留具体的 direct/SAM6D 运行实现，避免 CLI、任务定义和重型依赖互相混在一起。
-- `direct`、`sam6d`、`rrtrack`、`wrist` 已经通过 `pickplace` 适配器和 runner 选择后端；direct/SAM6D 的运行源码不再从外层 `pick_jiaobang` 加载。
+- `perception/`、`planning/`、`execution/` 是可替换能力层；新主线不导入旧的超大运行脚本。
+- `pickplace/coordinator.py` 显式管理 approach、grasp、attach、lift、preplace、place、detach 和 retreat；Curobo2 张量不会越过 `planning/` 边界。
+- 可提前求解的抓取/放置候选 IK 按批处理；attach/detach 改变碰撞世界，因此对应轨迹优化仍保持顺序边界。
+- 1.0.24 已删除旧的 2 万行 direct 单体执行器及其 cuRobo v1/targeted/SAM6D/wrist 包装链；历史实现仍可从 Git 提交 `8aa9fae` 恢复。
+- `direct` 只作为 `curobo2` 的命令别名；`sam6d` 现在只运行位姿感知，不再隐式启动旧抓取执行器。
 - Jimu 和 Lego 现在是明确标记为 `compatibility` 的适配器：统一入口已经在主线，具体旧执行器还没有搬进来，避免把旧耦合伪装成完成迁移。
 
 查看任务注册表和编译后的兼容命令：
@@ -66,10 +68,10 @@ rm75_pick_place_app/
 python -m rm75_app tasks list
 python -m rm75_app tasks info pickplace
 python -m rm75_app tasks info jimu
-python -m rm75_app tasks command pickplace --mode sam6d -- --help
+python -m rm75_app tasks command pickplace --mode curobo2 -- --help
 python -m rm75_app tasks command jimu --mode four-wall
 python -m rm75_app tasks command lego --mode dry-run
-python -m rm75_app pickplace --mode direct -- --help
+python -m rm75_app pickplace --mode curobo2 -- --help
 ```
 
 完整的边界和迁移顺序见 `docs/TASK_ARCHITECTURE.md`。
@@ -79,17 +81,51 @@ python -m rm75_app pickplace --mode direct -- --help
 ```bash
 cd /home/zhangzhao/Desktop/lerobot/rm75_pick_place_app
 python -m rm75_app --help
-python -m rm75_app pickplace --mode direct -- --help
-python -m rm75_app direct -- --help
-python -m rm75_app sam6d -- --help
+python -m rm75_app pickplace -- --help
+python -m rm75_app curobo2-pickplace -- --cached-pose-result <sam6d_pose_result.json>
+python -m rm75_app curobo2-sim-replay -- --manifest <run_dir/execution.json>
+python -m rm75_app direct -- --help  # curobo2 compatibility alias
+python -m rm75_app sam6d -- --help  # perception only
 python -m rm75_app rrtrack -- --help
+python -m rm75_app openworld-geometry -- --help
 python -m rm75_app tabletop-refine -- --help
-python -m rm75_app roof -- --help
 python -m rm75_app web -- --host 127.0.0.1 --port 7860
 python -m rm75_app llm -- --help
-python -m rm75_app print-command sam6d --execute-real
 python -m rm75_app verify
 ```
+
+本机 Curobo2 与 ManiSkill 依赖位于不同 Python 环境。规划器输出小型 `execution.json` 清单和每阶段压缩 NPZ，仿真/真机进程只消费这个可移植轨迹包，不加载 Curobo2。Web 控制台提供“Curobo2 缓存全链路”和“仿真回放最新规划”两个入口。
+
+## 场景工作台
+
+Web 默认首页现在是开放世界场景工作台。启动后访问 `http://127.0.0.1:7860`：
+
+```bash
+python -m rm75_app web -- --host 127.0.0.1 --port 7860
+```
+
+“扫描桌面并定位”在同一张 RGB-D 帧上运行两路感知：
+
+```text
+ObjectSpec prompts → SAM3 多实例 mask → SAM6D pose → 已见/不确定
+桌面物体通用 prompt → SAM3 类别无关候选 ─┘ mask 去重 → 未见
+```
+
+扫描结果持久化到 `runtime_data/scene_workbench/state.json`。每个动作绑定
+`snapshot_id + scene_version + instance_id`；计划校验通过后快照被冻结，避免重新扫描后静默串号。
+
+- 已见：资产和 6D 位姿均可用，可以加入 pick-place 动作。
+- 不确定：分割存在但位姿未通过，或人工指定了资产候选；必须重新扫描验证。
+- 未见：通用桌面候选未与已知资产 mask 匹配，只能先生成几何处理任务。
+- 忽略：保留在快照中，但不参与计划。
+
+未见任务包包含初始 `rgb.png`、`depth.png`、`camera.json` 和 `mask.png`。页面可以直接启动
+`observed` 或 `RaySt3R` 几何入口；只有任务变为 `geometry_ready` 后，未知实例才允许通过动作计划校验。
+RaySt3R 会占用 GPU，启动前页面要求先停止 SAM3/SAM6D 常驻模型。几何更新仍只在下一次 replan
+边界交给 cuRobo，不会在正在执行的轨迹中修改碰撞世界。
+
+当前低层 pick-place 执行器仍按资产名寻址，因此工作台会阻止同一资产的多个实例同时进入可执行计划；
+场景清单和 SAM6D 初始化已经保留多实例，后续只需把执行契约升级为 `instance_id`，无需再改扫描层。
 
 ## RRTrack 风格可恢复感知入口
 
@@ -144,17 +180,22 @@ python -m rm75_app rrtrack -- \
   --sequence-depth-scale 0.001
 ```
 
-RRTrack 论文使用 256 个全球离线模板（128 个视角加 180° 平面内增强）。入口默认从本次 SAM-6D 的 `templates/` 自动建立并缓存该库，后续直接复用。也可以手工建立或通过 `--offline-bank` 固定指定：
+RRTrack 论文使用 256 个全球离线模板（128 个视角加 180° 平面内增强）。当前标准 SAM-6D renderer 实际生成 level0 的 42 个视角，因此项目使用与图片严格匹配的 `cam_poses_level0.npy`，生成 84 个有效条目；不能用 level2 姿态错误地解释这 42 张图。入口默认按对象名从 `runtime_data/rrtrack_banks/` 复用离线库，也可以手工建立或通过 `--offline-bank` 固定指定：
 
 ```bash
 python -m rm75_app rrtrack-build-bank -- \
   --templates-dir <sam6d_run/templates> \
   --output runtime_data/rrtrack_banks/carriot_dinov2_vits14.npz
 
+# 为 ObjectSpec 中所有已知物体批量生成；共用 mesh+缩放的对象只渲染一次
+python -m rm75_app rrtrack-build-all-banks
+
 python -m rm75_app rrtrack -- \
   --object-name carriot \
   --offline-bank runtime_data/rrtrack_banks/carriot_dinov2_vits14.npz
 ```
+
+批量结果记录在 `runtime_data/rrtrack_banks/manifest.json`。当前 24 个 ObjectSpec 按 mesh+真实缩放去重为 18 套模板，所有对象名各有一个可自动发现的 `<object>_dinov2_vits14.npz`。
 
 CUTIE 是外部模型依赖，不提交进项目源码；当前机器的官方 MIT 版本位于被忽略的 `runtime_data/third_party/Cutie`，也可通过 `--cutie-root` 指定其他安装目录。入口只需要官方 `cutie-base-mega.pth`，默认从 `<cutie-root>/weights/` 加载，也可用 `--cutie-weights` 指定。DINOv2 默认优先使用本机 torch hub 缓存。SAM3 只在 CUTIE 持续空 mask 时按需启动，可用 `--disable-sam3-recovery` 关闭。论文没有公开所有门控阈值，未公开项集中在 `rm75_app/perception/rrtrack/config.py`，先使用保守项目默认值，再只用稳定跟踪帧做 EMA–MAD 自适应。
 
@@ -162,11 +203,19 @@ CUTIE 是外部模型依赖，不提交进项目源码；当前机器的官方 M
 
 阈值或状态策略可通过 `--rrtrack-config <json>` 覆盖，运行目录中的 `run_config.json` 会保存最终生效配置，便于按真实遮挡序列回放调参。
 
-常用真机 SAM6D 命令可直接生成：
+## 未见物体动态几何入口
+
+`openworld-geometry` 为没有 CAD 的刚体建立 RaySt3R 生成先验，并用后续腕带 RGB-D 新视角动态覆盖、融合和版本化重建。它输出独立的 visual mesh 与保守 collision mesh；规划仍由现有 cuRobo 完成，不引入另一套 grasp/motion planner。
 
 ```bash
-python -m rm75_app print-command sam6d --execute-real
+python -m rm75_app openworld-geometry -- \
+  --instance-id unknown_01 \
+  --initial-frame-dir <rgbd_mask_frame> \
+  --initial-T-base-camera <T_base_camera.npy> \
+  --updates-manifest <wrist_frames.json>
 ```
+
+详细的数据格式、抓取后运动学预测位姿和 cuRobo 重规划交接见 `docs/OPENWORLD_DYNAMIC_GEOMETRY.md`。
 
 ## 桌面物体位姿精修
 
@@ -182,10 +231,10 @@ python -m rm75_app tabletop-refine -- --sam6d-result <full_scene_pose_results.js
 runtime_data/tabletop_pose_refine_runs/<timestamp>_tabletop_refine/tabletop_refined_scene_results.json
 ```
 
-输出仍保留 `results[].T_cam_obj` 字段，因此可以作为新的固定场景结果继续传给 SAM6D 抓取入口：
+输出仍保留 `results[].T_cam_obj` 字段，因此可以继续作为 Curobo2 缓存场景输入：
 
 ```bash
-python -m rm75_app sam6d -- --sam6d-fixed-scene-result-file <tabletop_refined_scene_results.json>
+python -m rm75_app curobo2 -- --cached-pose-result <tabletop_refined_scene_results.json>
 ```
 
 常用调参：
@@ -198,25 +247,8 @@ python -m rm75_app tabletop-refine -- --sam6d-result <full_scene_pose_results.js
 
 ## 腕带相机抓取后精修
 
-腕带相机的持物关系估计适配层在 `rm75_app/perception/wrist_relation.py`，新入口是：
-
-```bash
-python -m rm75_app wrist -- --execute-real
-```
-
-它等价于 direct pick-place，但默认打开 `--wrist-relation-refine-after-grasp`。抓爪闭合后会异步运行腕带 RGB-D 定位；进入 targeted place/pre_place 规划前，如果结果可用，就更新当前 `T_tcp_obj` 并重新生成放置候选。旧的 `direct`、`sam6d`、LLM/batch 入口默认不启用这个 hook。
-
-## 盖亭子入口
-
-亭子底座加四根柱子的独立入口是：
-
-```bash
-python -m rm75_app roof -- --execute-real
-# 等价别名
-python -m rm75_app tingzi -- --execute-real
-```
-
-它复用 direct pick-place 主流程，但默认按顺序执行 `tingzi_base`、`tingzi_pillar_front_left/right`、`tingzi_pillar_back_left/right`。第一步把底座放到桌面中心附近；后四步共用 `tingzi_pillar1.obj`，把四根柱子按底座本地坐标的四个角插入。入口默认启用腕带相机抓取后 `T_tcp_obj` 精修；原来的 `direct`、`sam6d` 和 batch/LLM 入口不会自动启用这套亭子参数。
+腕带相机的持物 6D 精调目前保留为默认关闭的接口，见
+`docs/HELD_OBJECT_6D_REFINEMENT.md`。1.0.24 不包含真实腕带采集、夹爪遮挡处理或腕带执行入口。
 
 ## 相机标定入口
 

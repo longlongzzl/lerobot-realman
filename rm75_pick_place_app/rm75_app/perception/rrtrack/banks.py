@@ -118,10 +118,19 @@ class DinoV2Descriptor:
         masked = image.copy()
         masked[~support] = 0
         crop = cv2.resize(masked[y1:y2, x1:x2], (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
-        tensor = self.torch.from_numpy(crop).permute(2, 0, 1).float().div_(255.0)
-        mean = self.torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = self.torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        tensor = ((tensor - mean) / std).unsqueeze(0).to(self.device)
+        # FoundationPose changes PyTorch's global default tensor type to CUDA.
+        # Keep every preprocessing tensor explicit so recovery remains valid
+        # regardless of which model ran first in this process.
+        tensor = self.torch.from_numpy(crop).permute(2, 0, 1).to(
+            device=self.device, dtype=self.torch.float32
+        ).div_(255.0)
+        mean = self.torch.tensor(
+            [0.485, 0.456, 0.406], device=self.device, dtype=self.torch.float32
+        ).view(3, 1, 1)
+        std = self.torch.tensor(
+            [0.229, 0.224, 0.225], device=self.device, dtype=self.torch.float32
+        ).view(3, 1, 1)
+        tensor = ((tensor - mean) / std).unsqueeze(0)
         with self.torch.inference_mode():
             feature = self.model(tensor)
         if isinstance(feature, dict):

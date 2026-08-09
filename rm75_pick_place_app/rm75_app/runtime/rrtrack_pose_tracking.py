@@ -31,7 +31,7 @@ DEFAULT_CUTIE_ROOT = str(RUNTIME_DIR / "third_party" / "Cutie")
 DEFAULT_DINOV2_ROOT = "/home/zhangzhao/.cache/torch/hub/facebookresearch_dinov2_main"
 DEFAULT_CAM_POSES = (
     "/home/zhangzhao/PycharmProjects/SAM-6D/SAM-6D/"
-    "Instance_Segmentation_Model/utils/poses/predefined_poses/cam_poses_level2.npy"
+    "Instance_Segmentation_Model/utils/poses/predefined_poses/cam_poses_level0.npy"
 )
 DEFAULT_SAM3_PYTHON = "/home/zhangzhao/anaconda3/envs/sam3/bin/python"
 DEFAULT_SAM3_CHECKPOINT = "/home/zhangzhao/Downloads/sam3.pt"

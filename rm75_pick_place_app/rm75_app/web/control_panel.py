@@ -21,7 +21,9 @@ from typing import Any
 import psutil
 from flask import Flask, Response, jsonify, request, send_file
 
+from rm75_app.assets.object_specs import ASSET_DIR, OBJECT_SPECS
 from rm75_app.paths import APP_ROOT, DEFAULT_CAMERA_EXTRINSIC, DEFAULT_CUROBO_CFG, RUNTIME_DIR, TEST_SCENE_DIR
+from rm75_app.web.scene_workbench import SceneWorkbench
 
 
 ROOT = APP_ROOT
@@ -31,15 +33,40 @@ DEFAULT_FOUNDATIONPOSE_PYTHON = "/home/zhangzhao/anaconda3/envs/foundationpose31
 DEFAULT_SAM3_CHECKPOINT = "/home/zhangzhao/Downloads/sam3.pt"
 DEFAULT_CAMERA_EXTRINSIC_OPENCV = str(DEFAULT_CAMERA_EXTRINSIC)
 DEFAULT_LLM_SCENE_FILE = TEST_SCENE_DIR / "current_table.json"
-SAM6D_PICK_MODULE = "rm75_app.runtime.sam6d_pick_place"
-DIRECT_PICK_MODULE = "rm75_app.runtime.direct_pre_place"
+SAM6D_PICK_MODULE = "rm75_app.runtime.curobo2_pick_place"
+DIRECT_PICK_MODULE = "rm75_app.runtime.curobo2_pick_place"
 SAM6D_PROVIDER_SCRIPT = Path(__file__).resolve().parents[1] / "perception" / "sam6d_pose_provider.py"
 SAM3_PROVIDER_SCRIPT = Path(__file__).resolve().parents[1] / "perception" / "sam3_mask_provider.py"
 SAM3_RESIDENT_WORKER_SCRIPT = Path(__file__).resolve().parents[1] / "perception" / "sam3_resident_worker.py"
 SAM6D_RESIDENT_WORKER_SCRIPT = Path(__file__).resolve().parents[1] / "perception" / "sam6d_resident_worker.py"
+CUROBO2_PYTHON = Path("/home/zhangzhao/anaconda3/envs/curobo2/bin/python")
+FOUNDATIONPOSE_PYTHON = Path("/home/zhangzhao/anaconda3/envs/foundationpose310/bin/python")
+DEFAULT_CUROBO2_CACHED_RESULT = RUNTIME_DIR / "rrtrack_manual_init/20260808_203311_carriot_pid1169281/sam6d_pose_result.json"
 DEFAULT_GRASP_OBJECTS = ["lvmukuai", "carriot", "shuazi", "hongshupian", "gluestick", "bi", "tennis"]
 DEFAULT_TRACKED_OBJECTS = ["desk", "bitong"]
 DEFAULT_OBJECTS = DEFAULT_GRASP_OBJECTS + DEFAULT_TRACKED_OBJECTS
+
+
+def _canonical_known_scan_objects() -> list[str]:
+    """One semantic scan target per shared geometry to avoid alias collisions."""
+    selected: list[str] = []
+    seen: set[tuple[str, str, float | None, float | None]] = set()
+    for name in sorted(OBJECT_SPECS):
+        spec = OBJECT_SPECS[name]
+        key = (
+            str(Path(spec.mesh_file).expanduser().resolve()),
+            str(spec.grounding_prompt).strip().lower(),
+            spec.mesh_scale,
+            spec.real_longest_axis_m,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(name)
+    return selected
+
+
+KNOWN_SCAN_OBJECTS = _canonical_known_scan_objects()
 SERVER_STARTED_AT = time.time()
 latest_perception_result: dict[str, Any] = {}
 latest_llm_result: dict[str, Any] = {}
@@ -126,70 +153,25 @@ def _source_slot_map_tokens(value) -> list[str]:
 
 def build_grasp_command(config: dict[str, Any] | None = None) -> list[str]:
     config = dict(config or {})
-    config["reuse_latest_perception"] = True
-    objects = _as_names(config.get("objects"), DEFAULT_GRASP_OBJECTS, DEFAULT_GRASP_OBJECTS)
-    tracked = _as_names(config.get("tracked_objects"), DEFAULT_TRACKED_OBJECTS, DEFAULT_TRACKED_OBJECTS)
-    slot_order = _slot_order_tokens(config.get("slot_order"))
-    source_slot_map = _source_slot_map_tokens(config.get("source_slot_map"))
-    if not objects:
-        raise ValueError("至少选择一个抓取目标")
     fixed_scene_result = config.get("sam6d_fixed_scene_result_file")
-    if fixed_scene_result is None and bool(config.get("reuse_latest_perception", False)):
+    if fixed_scene_result is None:
         fixed_scene_result = latest_perception_result.get("result_path")
-    if fixed_scene_result is not None:
-        fixed_scene_result = str(Path(str(fixed_scene_result)).expanduser())
-        if not Path(fixed_scene_result).exists():
-            raise ValueError(f"最新分割定位结果不存在: {fixed_scene_result}")
-    if fixed_scene_result and bool(config.get("reuse_latest_perception", False)):
-        available_objects = list(latest_perception_result.get("pose_found_objects") or latest_perception_result.get("mask_found_objects") or [])
-        if available_objects:
-            available_set = set(str(name) for name in available_objects)
-            requested_objects = list(objects)
-            objects = [name for name in objects if name in available_set]
-            if not objects:
-                raise ValueError(
-                    "选择的抓取目标都没有被最近一次 SAM3/SAM6D 成功定位；"
-                    f"requested={requested_objects}, available={sorted(available_set)}"
-                )
-            source_slot_map = [token for token in source_slot_map if token.split(":", 1)[0] in set(objects)]
+    if fixed_scene_result is None:
+        raise ValueError("请先完成一次 SAM3/SAM6D 场景定位")
+    fixed_scene_result = str(Path(str(fixed_scene_result)).expanduser())
+    if not Path(fixed_scene_result).exists():
+        raise ValueError(f"最新分割定位结果不存在: {fixed_scene_result}")
+    if bool(config.get("execute_real", False)):
+        raise ValueError("1.0.24 已移除旧真机执行器；请先使用 Curobo2 规划/回放入口")
     cmd = [
-        DEFAULT_FOUNDATIONPOSE_PYTHON,
+        str(CUROBO2_PYTHON),
         "-m",
         SAM6D_PICK_MODULE,
-        "--curobo-rm75-robot-cfg",
-        str(DEFAULT_CUROBO_CFG),
-        "--trajectory-preview-sleep",
-        "0.08",
-        "--cycle-object-names",
-        *objects,
-        "--tracked-scene-object-names",
-        *tracked,
-        "--render-mode",
-        str(config.get("render_mode") or "human"),
-        "--auto-execute",
-        "--dry-run-motion-window-scale",
-        "1.0",
-        "--real-control-hz",
-        str(int(config.get("real_control_hz") or 30)),
-        "--real-max-delta-per-step",
-        str(float(config.get("real_max_delta_per_step") or 0.1)),
+        "--cached-pose-result",
+        fixed_scene_result,
     ]
-    if bool(config.get("disable_empty_grasp_relocalize", False)):
-        cmd.extend(["--no-empty-grasp-relocalize-target", "--empty-grasp-max-relocalize-retries", "0"])
-    if bool(config.get("random_targets", False)):
-        cmd.extend(["--random-cycle-targets", "--target-selection-order", "random"])
-    else:
-        cmd.extend(["--target-selection-order", "cycle"])
-    if bool(config.get("execute_real", True)):
-        cmd.append("--execute-real")
-    if slot_order:
-        cmd.extend(["--targeted-place-slot-order", *slot_order])
-    if source_slot_map:
-        cmd.extend(["--targeted-place-source-slot-map", *source_slot_map])
-    if not bool(config.get("confirm_segmentation", True)):
-        cmd.append("--no-sam6d-confirm-segmentation")
-    if fixed_scene_result:
-        cmd.extend(["--sam6d-fixed-scene-result-file", fixed_scene_result])
+    if bool(config.get("smoke_place", False)):
+        cmd.append("--smoke-place")
     return cmd
 
 
@@ -206,7 +188,7 @@ def placement_mapping_text(config: dict[str, Any] | None = None) -> str:
 
 def build_perception_command(config: dict[str, Any] | None = None) -> list[str]:
     config = dict(config or {})
-    object_names = _as_names(config.get("object_names"), DEFAULT_OBJECTS, DEFAULT_OBJECTS)
+    object_names = _as_names(config.get("object_names"), sorted(OBJECT_SPECS), DEFAULT_OBJECTS)
     if not object_names:
         raise ValueError("至少选择一个分割定位对象")
     cmd = [
@@ -262,10 +244,18 @@ def build_perception_command(config: dict[str, Any] | None = None) -> list[str]:
     return cmd
 
 
-DEFAULT_GRASP_COMMAND = shell_join(build_grasp_command({"random_targets": True, "execute_real": True}))
+DEFAULT_GRASP_COMMAND = "Curobo2 grasp requires a completed SAM3/SAM6D scene result"
 
 
 app = Flask(__name__)
+scene_workbench = SceneWorkbench(
+    RUNTIME_DIR / "scene_workbench",
+    asset_names=OBJECT_SPECS,
+    asset_dir=ASSET_DIR,
+    bank_root=RUNTIME_DIR / "rrtrack_banks",
+    python_executable=sys.executable,
+    initial_camera_transform=DEFAULT_CAMERA_EXTRINSIC,
+)
 log_history: deque[dict[str, Any]] = deque(maxlen=1000)
 gpu_history: deque[dict[str, Any]] = deque(maxlen=900)
 event_clients: list[queue.Queue] = []
@@ -647,6 +637,7 @@ class ResidentProcess(ManagedProcess):
 grasp_process = ManagedProcess("抓取流程")
 llm_process = ManagedProcess("LLM执行")
 perception_process = ManagedProcess("分割定位")
+geometry_process = ManagedProcess("未见物体几何")
 sam3_worker = ResidentProcess("SAM3 常驻")
 sam6d_worker = ResidentProcess("SAM6D 常驻")
 perception_task_lock = threading.Lock()
@@ -669,6 +660,37 @@ perception_task: dict[str, Any] = {
     "pose_found_objects": [],
     "pose_missing_objects": [],
 }
+active_geometry_job_id: str | None = None
+
+
+def _reconcile_geometry_job() -> None:
+    global active_geometry_job_id
+    job_id = active_geometry_job_id
+    if not job_id or geometry_process.is_running():
+        return
+    status = geometry_process.status()
+    returncode = status.get("returncode")
+    if returncode is None:
+        return
+    try:
+        job = scene_workbench.job(job_id)
+        manifest = Path(job["frame_dir"]).parent / "geometry" / job["instance_id"] / "latest_curobo_obstacle.json"
+        if int(returncode) == 0 and manifest.exists():
+            scene_workbench.update_job(
+                job_id,
+                status="geometry_ready",
+                reason="几何重建和碰撞体导出完成，可在下一次replan前接入规划世界",
+                geometry_manifest=str(manifest.resolve()),
+            )
+            emit("summary", f"未见物体：{job['instance_id']} 几何已就绪。")
+        else:
+            scene_workbench.update_job(
+                job_id,
+                status="failed",
+                reason=f"几何处理退出 code={returncode}；请查看 {status.get('raw_log_path')}",
+            )
+    finally:
+        active_geometry_job_id = None
 
 
 def _resident_models_active() -> bool:
@@ -1419,7 +1441,7 @@ threading.Thread(target=run_gpu_sampler, args=(gpu_stop,), daemon=True).start()
 def latest_files(patterns: list[str], limit: int = 8, *, min_mtime: float | None = None) -> list[dict[str, Any]]:
     files: list[Path] = []
     for pattern in patterns:
-        files.extend(ROOT.glob(pattern))
+        files.extend(Path(path) for path in glob.glob(str(pattern)))
     out = []
     for path in files:
         try:
@@ -1474,6 +1496,7 @@ def events() -> Response:
 
 @app.get("/api/status")
 def api_status():
+    _reconcile_geometry_job()
     process = psutil.Process(os.getpid())
     return jsonify(
         {
@@ -1483,8 +1506,10 @@ def api_status():
             "sam6d": sam6d_worker.status(),
             "perception": current_perception_status(),
             "grasp": grasp_process.status(),
+            "geometry": geometry_process.status(),
             "llm": llm_process.status(),
             "latest_perception_result": dict(latest_perception_result),
+            "workbench": scene_workbench.status(),
             "latest_llm_result": dict(latest_llm_result),
             "profile": latest_profile_waterfall(),
             "failure": latest_failure_summary(),
@@ -1494,6 +1519,97 @@ def api_status():
             "logs": list(log_history)[-200:],
         }
     )
+
+
+@app.get("/api/workbench")
+def api_workbench():
+    return jsonify({"ok": True, "state": scene_workbench.status(), "assets": sorted(OBJECT_SPECS)})
+
+
+@app.post("/api/workbench/refresh")
+def api_workbench_refresh():
+    if not latest_perception_result:
+        return jsonify({"ok": False, "error": "还没有感知结果，请先扫描场景"}), 400
+    try:
+        state = scene_workbench.refresh(dict(latest_perception_result))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "state": state})
+
+
+@app.post("/api/workbench/instance/<instance_id>")
+def api_workbench_instance(instance_id: str):
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        state = scene_workbench.update_instance(
+            instance_id,
+            knownness=str(payload.get("knownness") or ""),
+            asset_name=payload.get("asset_name"),
+        )
+    except (ValueError, KeyError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "state": state})
+
+
+@app.post("/api/workbench/jobs")
+def api_workbench_jobs():
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        result = scene_workbench.create_jobs(
+            payload.get("instance_ids") or [],
+            provider=str(payload.get("provider") or "observed"),
+        )
+    except (ValueError, KeyError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    emit("summary", f"未见物体：已生成 {len(result['jobs'])} 个几何处理任务包。")
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/workbench/jobs/<job_id>/start")
+def api_workbench_job_start(job_id: str):
+    global active_geometry_job_id
+    _reconcile_geometry_job()
+    try:
+        job = scene_workbench.job(job_id)
+        if job.get("status") not in {"capture_ready", "failed"}:
+            raise ValueError(f"job cannot start from status={job.get('status')}")
+        if geometry_process.is_running():
+            raise ValueError("另一个几何任务正在运行")
+        if current_perception_status().get("running") or grasp_process.is_running():
+            raise ValueError("感知或抓取正在运行，不能同时启动几何重建")
+        if job.get("provider") == "rayst3r" and _resident_models_active():
+            raise ValueError("RaySt3R 会占用GPU，请先停止SAM3/SAM6D常驻模型")
+        command = [str(value) for value in job.get("command") or []]
+        if not command:
+            raise ValueError("job has no command")
+        geometry_process.start(command, cwd=ROOT)
+        active_geometry_job_id = job_id
+        scene_workbench.update_job(job_id, status="running", reason="几何重建正在运行")
+    except (ValueError, KeyError, OSError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "state": scene_workbench.status(), "process": geometry_process.status()})
+
+
+@app.post("/api/workbench/jobs/stop")
+def api_workbench_job_stop():
+    geometry_process.stop()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/workbench/plan")
+def api_workbench_plan():
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        state = scene_workbench.save_plan(payload.get("actions") or [], freeze=bool(payload.get("freeze", True)))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    plan = state.get("plan") or {}
+    return jsonify({"ok": True, "state": state, "plan": plan})
+
+
+@app.post("/api/workbench/unfreeze")
+def api_workbench_unfreeze():
+    return jsonify({"ok": True, "state": scene_workbench.unfreeze()})
 
 
 @app.post("/api/preflight")
@@ -1685,7 +1801,8 @@ def _resident_provider_payload(config: dict[str, Any]) -> dict[str, Any]:
         "camera_extrinsic_opencv_path": DEFAULT_CAMERA_EXTRINSIC_OPENCV,
         "use_direct_camera_extrinsic": False,
         "sam3_morph_kernel": 3,
-        "sam3_max_masks_per_item": 1,
+        "sam3_max_masks_per_item": int(config.get("known_max_instances_per_asset") or 3),
+        "sam3_full_scene_keep_multi_instances": True,
         "min_mask_area": 64,
         "sam3_require_full_scene_masks": bool(config.get("confirm_segmentation", True)),
         "sam3_full_scene_mask_confirm": False,
@@ -1701,7 +1818,7 @@ def _resident_provider_payload(config: dict[str, Any]) -> dict[str, Any]:
 
 def _run_resident_perception(config: dict[str, Any]) -> None:
     global latest_perception_result
-    object_names = _as_names(config.get("object_names"), DEFAULT_OBJECTS, DEFAULT_OBJECTS)
+    object_names = _as_names(config.get("object_names"), sorted(OBJECT_SPECS), DEFAULT_OBJECTS)
     started_at = time.time()
     update_perception_task(
         phase="warming",
@@ -1747,6 +1864,7 @@ def _run_resident_perception(config: dict[str, Any]) -> None:
                 "items": capture["items"],
                 "morph_kernel": int(provider_payload["sam3_morph_kernel"]),
                 "min_mask_area": int(provider_payload["min_mask_area"]),
+                "sam3_max_masks_per_item": int(provider_payload["sam3_max_masks_per_item"]),
             },
             timeout=240.0,
         )
@@ -1769,21 +1887,36 @@ def _run_resident_perception(config: dict[str, Any]) -> None:
                 pose_missing_objects=list(object_names),
             )
             raise RuntimeError(f"SAM3 mask matched multiple object names; conflicts={mask_conflicts}")
-        pose_object_names = [name for name in object_names if name in set(mask_found)]
-        if not pose_object_names:
-            update_perception_task(
-                phase="error",
-                running=False,
-                ready=False,
-                returncode=1,
-                last_result=sam3_result,
-                mask_found_objects=mask_found,
-                mask_missing_objects=mask_missing,
-                pose_found_objects=[],
-                pose_missing_objects=list(object_names),
-            )
-            raise RuntimeError(f"SAM3 did not segment any requested object; missing={mask_missing}")
 
+        # A second, class-agnostic pass enumerates physical tabletop instances.
+        # It is deliberately kept separate from known-asset prompting: an absent
+        # requested asset is not evidence that an unknown object exists.
+        discovery_result: dict[str, Any] = {"results": [], "error": None}
+        try:
+            discovery_resp = sam3_worker.request_json(
+                {
+                    "cmd": "segment",
+                    "rgb_path": capture["rgb_path"],
+                    "output_dir": str(Path(capture["scene_dir"]) / "sam3_open_world"),
+                    "items": [
+                        {
+                            "id": "tabletop_objects",
+                            "prompt": str(config.get("open_world_prompt") or "physical objects on the table."),
+                            "mode": "text",
+                        }
+                    ],
+                    "morph_kernel": int(provider_payload["sam3_morph_kernel"]),
+                    "min_mask_area": max(300, int(provider_payload["min_mask_area"])),
+                    "sam3_max_masks_per_item": int(config.get("open_world_max_instances") or 32),
+                },
+                timeout=240.0,
+            )
+            discovery_result = discovery_resp.get("result") or discovery_result
+            emit("summary", f"场景扫描：得到 {len(discovery_result.get('results') or [])} 个桌面实例候选。")
+        except Exception as discovery_exc:
+            discovery_result["error"] = repr(discovery_exc)
+            emit("summary", f"场景扫描：开放世界候选失败，已知资产定位继续：{discovery_exc!r}")
+        pose_object_names = [name for name in object_names if name in set(mask_found)]
         update_perception_task(
             phase="posing",
             running=True,
@@ -1796,18 +1929,23 @@ def _run_resident_perception(config: dict[str, Any]) -> None:
             f"分割定位：SAM3 找到 {len(mask_found)}/{len(object_names)}，"
             f"缺失={mask_missing or []}；只对已分割对象做 SAM6D 定位。",
         )
-        pose_resp = sam6d_worker.request_json(
-            {
-                "cmd": "pose_from_sam3",
-                "object_names": pose_object_names,
-                "frame_dir": capture["frame_dir"],
-                "scene_dir": capture["scene_dir"],
-                "sam3_result_path": sam3_result["result_path"],
-                **provider_payload,
-            },
-            timeout=360.0,
-        )
-        result = pose_resp.get("result") or {}
+        if pose_object_names:
+            pose_resp = sam6d_worker.request_json(
+                {
+                    "cmd": "pose_from_sam3",
+                    "object_names": pose_object_names,
+                    "frame_dir": capture["frame_dir"],
+                    "scene_dir": capture["scene_dir"],
+                    "sam3_result_path": sam3_result["result_path"],
+                    **provider_payload,
+                },
+                timeout=360.0,
+            )
+            result = pose_resp.get("result") or {}
+        else:
+            pose_resp = {"ok": True, "result": {}}
+            result = {"scene_dir": capture.get("scene_dir"), "results": [], "ok_count": 0, "object_count": 0}
+            emit("summary", "分割定位：没有已知资产通过SAM3，保留开放世界实例清单，不运行SAM6D。")
         ok_count = int(result.get("ok_count", 0) or 0)
         pose_object_count = int(result.get("object_count", len(pose_object_names)) or len(pose_object_names))
         pose_found, pose_missing = _pose_result_object_marks(object_names, result)
@@ -1848,8 +1986,17 @@ def _run_resident_perception(config: dict[str, Any]) -> None:
             "pose_found_objects": pose_found,
             "pose_missing_objects": pose_missing,
             "pose_details": result["pose_details"],
+            "pose_results": list(result.get("results") or []),
+            "rgb_path": capture.get("rgb_path"),
+            "known_mask_results": list(sam3_result.get("results") or []),
+            "discovery_results": list(discovery_result.get("results") or []),
+            "discovery_error": discovery_result.get("error"),
             "updated_at": time.time(),
         }
+        workbench_state = scene_workbench.refresh(latest_perception_result)
+        snapshot = workbench_state.get("snapshot") or {}
+        latest_perception_result["scene_snapshot_id"] = snapshot.get("snapshot_id")
+        latest_perception_result["scene_inventory_counts"] = snapshot.get("counts") or {}
         update_perception_task(
             phase="stopped",
             running=False,
@@ -1885,7 +2032,7 @@ def api_perception_run():
     command = str(payload.get("command") or "").strip()
     if not command:
         config = payload.get("config") or payload
-        object_names = _as_names(config.get("object_names"), DEFAULT_OBJECTS, DEFAULT_OBJECTS)
+        object_names = _as_names(config.get("object_names"), sorted(OBJECT_SPECS), DEFAULT_OBJECTS)
         if not object_names:
             return jsonify({"ok": False, "error": "至少选择一个分割定位对象"}), 400
         current = current_perception_status()
@@ -1969,6 +2116,52 @@ def api_grasp_start():
     grasp_process.start(cmd, cwd=ROOT)
     emit("summary", "抓取流程已从 Web 启动。")
     return jsonify({"ok": True, "status": grasp_process.status(), "command": command})
+
+
+@app.post("/api/curobo2/start")
+def api_curobo2_start():
+    """Start the new layered planner in its dedicated dependency environment."""
+    payload = request.get_json(force=True, silent=True) or {}
+    result_path = Path(str(payload.get("cached_pose_result") or DEFAULT_CUROBO2_CACHED_RESULT)).expanduser()
+    if not result_path.is_file():
+        return jsonify({"ok": False, "error": f"缓存位姿结果不存在: {result_path}"}), 400
+    if not CUROBO2_PYTHON.is_file():
+        return jsonify({"ok": False, "error": f"Curobo2 Python 不存在: {CUROBO2_PYTHON}"}), 400
+    output_dir = RUNTIME_DIR / "curobo2_web" / time.strftime("%Y%m%d_%H%M%S")
+    cmd = [
+        str(CUROBO2_PYTHON), "-m", "rm75_app", "curobo2-pickplace", "--",
+        "--cached-pose-result", str(result_path.resolve()),
+        "--output-dir", str(output_dir.resolve()),
+    ]
+    grasp_process.start(cmd, cwd=APP_ROOT)
+    emit("summary", "已启动 Curobo2 分层缓存回放；当前使用记录执行器，不连接真机。")
+    return jsonify({"ok": True, "status": grasp_process.status(), "command": shell_join(cmd)})
+
+
+@app.post("/api/curobo2/sim-start")
+def api_curobo2_sim_start():
+    """Replay the newest portable planner result in the separate ManiSkill env."""
+    payload = request.get_json(force=True, silent=True) or {}
+    explicit = str(payload.get("manifest") or "").strip()
+    if explicit:
+        manifest = Path(explicit).expanduser().resolve()
+    else:
+        candidates = list((RUNTIME_DIR / "curobo2_web").glob("*/execution.json"))
+        candidates += list(RUNTIME_DIR.glob("curobo2_*/execution.json"))
+        manifest = max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+    if manifest is None or not manifest.is_file():
+        return jsonify({"ok": False, "error": "还没有可回放的 Curobo2 execution.json"}), 400
+    if not FOUNDATIONPOSE_PYTHON.is_file():
+        return jsonify({"ok": False, "error": f"ManiSkill Python 不存在: {FOUNDATIONPOSE_PYTHON}"}), 400
+    video_dir = manifest.parent / "maniskill_replay"
+    cmd = [
+        str(FOUNDATIONPOSE_PYTHON), "-m", "rm75_app", "curobo2-sim-replay", "--",
+        "--manifest", str(manifest.resolve()),
+        "--video-dir", str(video_dir.resolve()),
+    ]
+    grasp_process.start(cmd, cwd=APP_ROOT)
+    emit("summary", f"已启动 ManiSkill 回放: {manifest}")
+    return jsonify({"ok": True, "status": grasp_process.status(), "command": shell_join(cmd)})
 
 
 @app.post("/api/grasp/stdin")
@@ -2460,10 +2653,53 @@ INDEX_HTML = r"""<!doctype html>
       overflow-wrap: anywhere;
     }
     .note { font-size: 12px; color: var(--muted); line-height: 1.4; }
+    .inventory-columns {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .inventory-group {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px;
+      min-height: 92px;
+      background: #f8fafc;
+    }
+    .inventory-group h3 { margin: 0 0 8px; font-size: 13px; }
+    .inventory-card {
+      border: 1px solid var(--line);
+      border-left-width: 4px;
+      border-radius: 7px;
+      padding: 8px;
+      margin-top: 7px;
+      background: #fff;
+    }
+    .inventory-card.known { border-left-color: var(--green); }
+    .inventory-card.uncertain { border-left-color: var(--amber); }
+    .inventory-card.unknown { border-left-color: var(--red); }
+    .inventory-card.ignored { border-left-color: #94a3b8; opacity: .72; }
+    .inventory-title { display: flex; justify-content: space-between; gap: 8px; font-weight: 650; }
+    .inventory-meta { color: var(--muted); font-size: 12px; margin: 5px 0; line-height: 1.35; }
+    .compact-select { height: 30px; min-width: 115px; }
+    .action-queue { display: grid; gap: 7px; }
+    .action-row {
+      display: grid;
+      grid-template-columns: 34px minmax(120px, 1fr) minmax(100px, .8fr) auto;
+      align-items: center;
+      gap: 7px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 7px;
+      background: #fff;
+    }
+    .action-row small { color: var(--muted); overflow-wrap: anywhere; }
+    .job-card { border: 1px solid var(--line); border-radius: 7px; padding: 8px; margin-top: 7px; background: #fbfcfe; }
+    .job-card code { display: block; margin-top: 5px; font-size: 11px; overflow-wrap: anywhere; color: var(--muted); }
     @media (max-width: 1000px) {
       main { grid-template-columns: 1fr; }
       .images { grid-template-columns: 1fr; }
       .mapping-board { grid-template-columns: 1fr; }
+      .inventory-columns { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -2480,10 +2716,77 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </header>
   <div class="tabbar">
-    <button class="tab-btn active" data-tab="pickTab">PickPlace</button>
+    <button class="tab-btn active" data-tab="sceneTab">场景工作台</button>
+    <button class="tab-btn" data-tab="pickTab">PickPlace</button>
     <button class="tab-btn" data-tab="llmTab">LLM 控制</button>
   </div>
-  <main id="pickTab" class="tab-panel active">
+  <main id="sceneTab" class="tab-panel active">
+    <div class="stack">
+      <section>
+        <h2>开放世界场景扫描</h2>
+        <div class="dashboard-grid">
+          <div class="metric-card"><b>场景版本</b><span id="sceneVersion">暂无</span></div>
+          <div class="metric-card"><b>已见 / 不确定</b><span id="knownCount">0 / 0</span></div>
+          <div class="metric-card"><b>未见物体</b><span id="unknownCount">0</span></div>
+          <div class="metric-card"><b>快照状态</b><span id="snapshotState">未扫描</span></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="scanSceneBtn">扫描桌面并定位</button>
+          <button id="refreshInventoryBtn">从最近感知刷新</button>
+          <button id="unfreezeSceneBtn">解冻并继续编辑</button>
+        </div>
+        <p class="note">扫描同时运行已知资产定位和类别无关桌面实例发现。红色候选只进入待处理区，不会直接参与真机抓取。</p>
+      </section>
+
+      <section>
+        <h2>场景画面</h2>
+        <div class="image-slot"><div class="caption" id="sceneCaption">当前场景快照</div><div class="empty-image" id="sceneEmpty">扫描后显示</div><img id="sceneImg" /></div>
+      </section>
+
+      <section>
+        <h2>场景资产清单</h2>
+        <div class="inventory-columns" id="inventoryRoot"></div>
+      </section>
+    </div>
+
+    <div class="stack">
+      <section>
+        <h2>未见物体处理</h2>
+        <div class="row">
+          <div class="field">
+            <label for="geometryProvider">几何 Provider</label>
+            <select id="geometryProvider"><option value="observed" selected>Observed（当前可用）</option><option value="rayst3r">RaySt3R</option></select>
+          </div>
+          <button class="primary" id="prepareUnknownBtn">为选中未见物体生成任务包</button>
+          <button class="danger" id="stopGeometryBtn">停止几何任务</button>
+        </div>
+        <p class="note">任务包包含 RGB、深度、相机参数和实例 mask。生成任务包不等于几何已就绪；完成重建和碰撞体检查后才允许加入抓取动作。</p>
+        <div id="geometryJobs"></div>
+      </section>
+
+      <section>
+        <h2>动作编排</h2>
+        <div class="row">
+          <button id="autoPlanBtn">按当前场景生成</button>
+          <button id="clearPlanBtn">清空</button>
+          <button id="syncPlanBtn">同步已知抓取到 PickPlace</button>
+          <button class="primary" id="validatePlanBtn">校验并冻结快照</button>
+        </div>
+        <div class="action-queue" id="actionQueue" style="margin-top:10px"></div>
+        <div class="failure-card" id="scenePlanStatus" style="margin-top:10px">计划尚未校验</div>
+      </section>
+
+      <section>
+        <h2>工作台约束</h2>
+        <div class="preflight-list">
+          <div class="preflight-item ok"><b>实例身份</b><small>动作绑定 scene_version + instance_id，冻结后不会静默换场景。</small></div>
+          <div class="preflight-item warn"><b>不确定实例</b><small>需要人工指定资产或忽略，不能进入执行计划。</small></div>
+          <div class="preflight-item bad"><b>未见实例</b><small>必须完成几何重建与碰撞体检查，不能仅凭任务包执行抓取。</small></div>
+        </div>
+      </section>
+    </div>
+  </main>
+  <main id="pickTab" class="tab-panel">
     <div class="stack">
       <section>
         <h2>运行总览</h2>
@@ -2595,6 +2898,8 @@ INDEX_HTML = r"""<!doctype html>
         <textarea id="command"></textarea>
         <div class="row" style="margin-top: 10px;">
           <button id="buildCmdBtn">预览当前配置命令</button>
+          <button id="startCurobo2Btn">Curobo2 缓存全链路</button>
+          <button id="startCurobo2SimBtn">仿真回放最新规划</button>
           <button class="primary" id="startConfiguredBtn">按配置开始抓取</button>
           <button id="startBtn">运行命令框（高级）</button>
           <button class="danger" id="stopBtn">停止抓取</button>
@@ -2732,6 +3037,7 @@ const defaultCommand = __DEFAULT_COMMAND_JSON__;
 const graspObjects = __GRASP_OBJECTS_JSON__;
 const trackedObjects = __TRACKED_OBJECTS_JSON__;
 const allSceneObjects = __ALL_OBJECTS_JSON__;
+const knownScanObjects = __KNOWN_SCAN_OBJECTS_JSON__;
 document.getElementById('command').value = defaultCommand;
 let gpu = [];
 const logEl = document.getElementById('log');
@@ -2742,6 +3048,177 @@ const fixedBitongTargets = new Set(['bi']);
 let placementPreviewTimer = null;
 let placementPreviewSignature = '';
 let latestLlmResult = null;
+let workbenchState = {snapshot:null, jobs:[], plan:null};
+let workbenchAssets = __ASSET_NAMES_JSON__;
+let workbenchActions = [];
+let workbenchSnapshotId = null;
+
+function instanceById(instanceId) {
+  return (workbenchState.snapshot?.instances || []).find((item) => item.instance_id === instanceId);
+}
+
+function addWorkbenchAction(type, instanceId) {
+  const instance = instanceById(instanceId);
+  if (!instance) return;
+  const destination = type === 'pick_place' ? `slot_${Math.min(workbenchActions.filter(x => x.type === 'pick_place').length + 1, 6)}` : null;
+  workbenchActions.push({type, instance_id: instanceId, destination});
+  renderActionQueue();
+}
+
+function renderActionQueue() {
+  const root = document.getElementById('actionQueue');
+  if (!root) return;
+  root.innerHTML = '';
+  workbenchActions.forEach((action, index) => {
+    const instance = instanceById(action.instance_id) || {};
+    const row = document.createElement('div');
+    row.className = 'action-row';
+    const number = document.createElement('b');
+    number.textContent = String(index + 1);
+    const description = document.createElement('div');
+    description.innerHTML = `<b>${action.type}</b><small>${instance.display_name || action.instance_id} · ${action.instance_id}</small>`;
+    const destination = document.createElement('select');
+    destination.className = 'compact-select';
+    destination.disabled = action.type !== 'pick_place';
+    destination.innerHTML = action.type === 'pick_place'
+      ? ['slot_1','slot_2','slot_3','slot_4','slot_5','slot_6','bitong'].map(value => `<option value="${value}">${value}</option>`).join('')
+      : '<option value="">无需目的地</option>';
+    destination.value = action.destination || '';
+    destination.onchange = () => { action.destination = destination.value || null; };
+    const controls = document.createElement('div');
+    controls.className = 'row';
+    [['↑', -1], ['↓', 1]].forEach(([label, delta]) => {
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.disabled = index + delta < 0 || index + delta >= workbenchActions.length;
+      button.onclick = () => {
+        const target = index + delta;
+        [workbenchActions[index], workbenchActions[target]] = [workbenchActions[target], workbenchActions[index]];
+        renderActionQueue();
+      };
+      controls.appendChild(button);
+    });
+    const remove = document.createElement('button');
+    remove.textContent = '删';
+    remove.className = 'danger';
+    remove.onclick = () => { workbenchActions.splice(index, 1); renderActionQueue(); };
+    controls.appendChild(remove);
+    row.append(number, description, destination, controls);
+    root.appendChild(row);
+  });
+  if (!workbenchActions.length) root.innerHTML = '<div class="note">暂无动作。可以从资产卡片加入，或按当前场景自动生成。</div>';
+}
+
+async function updateWorkbenchInstance(instanceId, knownness, assetName=null) {
+  const data = await postJSON(`/api/workbench/instance/${encodeURIComponent(instanceId)}`, {knownness, asset_name: assetName});
+  workbenchState = data.state;
+  renderWorkbench(workbenchState);
+}
+
+function buildInventoryCard(instance) {
+  const card = document.createElement('div');
+  card.className = `inventory-card ${instance.knownness}`;
+  const score = instance.confidence === null || instance.confidence === undefined ? '' : ` · score ${Number(instance.confidence).toFixed(3)}`;
+  card.innerHTML = `<div class="inventory-title"><span>${instance.display_name || instance.instance_id}</span><span>${instance.instance_id}</span></div><div class="inventory-meta">${instance.reason || ''}${score}<br>bbox ${(instance.bbox_xyxy || []).join(', ') || '未知'}${instance.asset?.rrtrack_bank_ready ? ' · RRTrack库就绪' : ''}</div>`;
+  const controls = document.createElement('div');
+  controls.className = 'row';
+  if (instance.knownness === 'known') {
+    const add = document.createElement('button');
+    add.textContent = '加入抓取动作';
+    add.onclick = () => addWorkbenchAction('pick_place', instance.instance_id);
+    controls.appendChild(add);
+  } else if (instance.knownness === 'uncertain') {
+    const select = document.createElement('select');
+    select.className = 'compact-select';
+    select.innerHTML = workbenchAssets.map(name => `<option value="${name}" ${name === instance.asset_name ? 'selected' : ''}>${name}</option>`).join('');
+    const confirm = document.createElement('button');
+    confirm.textContent = '设为资产候选';
+    confirm.onclick = () => updateWorkbenchInstance(instance.instance_id, 'known', select.value).catch(err => appendLog(err.message));
+    controls.append(select, confirm);
+  } else if (instance.knownness === 'unknown') {
+    const choose = document.createElement('label');
+    choose.className = 'check';
+    choose.innerHTML = `<input type="checkbox" class="unknown-selection" data-instance-id="${instance.instance_id}"> 选中处理`;
+    const process = document.createElement('button');
+    process.textContent = '加入处理动作';
+    process.onclick = () => addWorkbenchAction('process_unknown', instance.instance_id);
+    const assign = document.createElement('button');
+    assign.textContent = '指定资产候选';
+    assign.onclick = () => {
+      const name = window.prompt(`输入资产名：\n${workbenchAssets.join(', ')}`);
+      if (name) updateWorkbenchInstance(instance.instance_id, 'known', name.trim()).catch(err => appendLog(err.message));
+    };
+    controls.append(choose, process, assign);
+  } else {
+    const restore = document.createElement('button');
+    restore.textContent = '恢复为未见';
+    restore.onclick = () => updateWorkbenchInstance(instance.instance_id, 'unknown').catch(err => appendLog(err.message));
+    controls.appendChild(restore);
+  }
+  if (instance.knownness !== 'ignored') {
+    const ignore = document.createElement('button');
+    ignore.textContent = '忽略';
+    ignore.onclick = () => updateWorkbenchInstance(instance.instance_id, 'ignored').catch(err => appendLog(err.message));
+    controls.appendChild(ignore);
+  }
+  card.appendChild(controls);
+  return card;
+}
+
+function renderWorkbench(state) {
+  workbenchState = state || {snapshot:null, jobs:[], plan:null};
+  const snapshot = workbenchState.snapshot;
+  if (workbenchSnapshotId && snapshot?.snapshot_id && workbenchSnapshotId !== snapshot.snapshot_id) {
+    workbenchActions = [];
+    renderActionQueue();
+  }
+  workbenchSnapshotId = snapshot?.snapshot_id || null;
+  const counts = snapshot?.counts || {};
+  document.getElementById('sceneVersion').textContent = snapshot ? `v${snapshot.version}` : '暂无';
+  document.getElementById('knownCount').textContent = `${counts.known || 0} / ${counts.uncertain || 0}`;
+  document.getElementById('unknownCount').textContent = String(counts.unknown || 0);
+  document.getElementById('snapshotState').textContent = snapshot ? (snapshot.frozen ? '已冻结' : '可编辑') : '未扫描';
+  setPathImage('scene', snapshot?.rgb_path || null, snapshot ? `${snapshot.snapshot_id} · v${snapshot.version}` : '当前场景快照');
+  const root = document.getElementById('inventoryRoot');
+  root.innerHTML = '';
+  const groups = [['known','已见'], ['uncertain','不确定'], ['unknown','未见'], ['ignored','忽略']];
+  groups.forEach(([key, label]) => {
+    const group = document.createElement('div');
+    group.className = 'inventory-group';
+    const items = (snapshot?.instances || []).filter(item => item.knownness === key);
+    group.innerHTML = `<h3>${label}（${items.length}）</h3>`;
+    items.forEach(item => group.appendChild(buildInventoryCard(item)));
+    if (!items.length) group.insertAdjacentHTML('beforeend', '<div class="note">暂无</div>');
+    root.appendChild(group);
+  });
+  const jobs = document.getElementById('geometryJobs');
+  jobs.innerHTML = '';
+  (workbenchState.jobs || []).slice(-8).reverse().forEach(job => {
+    const card = document.createElement('div');
+    card.className = 'job-card';
+    card.innerHTML = `<b>${job.instance_id} · ${job.status}</b><div class="note">${job.reason || ''}</div><code>${(job.command || []).join(' ')}</code>`;
+    if (['capture_ready', 'failed'].includes(job.status)) {
+      const start = document.createElement('button');
+      start.textContent = job.status === 'failed' ? '重试几何处理' : '开始几何处理';
+      start.style.marginTop = '7px';
+      start.onclick = async () => {
+        try {
+          const data = await postJSON(`/api/workbench/jobs/${encodeURIComponent(job.job_id)}/start`, {});
+          renderWorkbench(data.state);
+        } catch (err) { appendLog(`几何任务启动失败：${err.message || err}`); }
+      };
+      card.appendChild(start);
+    }
+    jobs.appendChild(card);
+  });
+  if (!(workbenchState.jobs || []).length) jobs.innerHTML = '<div class="note">暂无处理任务。</div>';
+  const savedPlan = workbenchState.plan;
+  const status = document.getElementById('scenePlanStatus');
+  if (savedPlan) {
+    status.className = `failure-card ${savedPlan.valid ? '' : 'bad'}`;
+    status.textContent = savedPlan.valid ? `计划已校验并绑定 ${savedPlan.snapshot_id}` : `计划未通过：${(savedPlan.errors || []).join('；')}`;
+  } else status.textContent = '计划尚未校验';
+}
 
 function switchTab(tabId) {
   document.querySelectorAll('.tab-panel').forEach((el) => el.classList.toggle('active', el.id === tabId));
@@ -3303,6 +3780,7 @@ async function refreshStatus() {
     renderLlmResult(data.latest_llm_result);
   }
   updatePerceptionAssetMarks(data);
+  renderWorkbench(data.workbench || workbenchState);
   renderTargetStatus(data);
   renderTimeline(data);
   renderSafety(data);
@@ -3528,6 +4006,55 @@ function drawGpu() {
 }
 
 document.getElementById('hotAllBtn').onclick = async () => { appendLog('请求热启动 SAM3 + SAM6D'); await postJSON('/api/hotstart/all'); };
+document.getElementById('scanSceneBtn').onclick = async () => {
+  appendLog('场景工作台：开始已知资产定位和开放世界桌面扫描');
+  await postJSON('/api/perception/run', {config: {object_names: knownScanObjects, confirm_segmentation: true, open_world_max_instances: 32}});
+};
+document.getElementById('refreshInventoryBtn').onclick = async () => {
+  const data = await postJSON('/api/workbench/refresh', {});
+  renderWorkbench(data.state);
+  appendLog('场景资产清单已从最近感知结果刷新');
+};
+document.getElementById('unfreezeSceneBtn').onclick = async () => {
+  const data = await postJSON('/api/workbench/unfreeze', {});
+  renderWorkbench(data.state);
+};
+document.getElementById('prepareUnknownBtn').onclick = async () => {
+  const ids = Array.from(document.querySelectorAll('.unknown-selection:checked')).map(input => input.dataset.instanceId);
+  if (!ids.length) { appendLog('请先勾选需要处理的未见物体'); return; }
+  const data = await postJSON('/api/workbench/jobs', {instance_ids: ids, provider: document.getElementById('geometryProvider').value});
+  renderWorkbench(data.state);
+  appendLog(`已生成 ${data.jobs.length} 个未见物体任务包`);
+};
+document.getElementById('stopGeometryBtn').onclick = async () => { await postJSON('/api/workbench/jobs/stop', {}); };
+document.getElementById('autoPlanBtn').onclick = () => {
+  workbenchActions = [];
+  const instances = workbenchState.snapshot?.instances || [];
+  instances.filter(item => item.knownness === 'unknown').forEach(item => workbenchActions.push({type:'process_unknown', instance_id:item.instance_id, destination:null}));
+  let slot = 1;
+  instances.filter(item => item.knownness === 'known' && graspObjects.includes(item.asset_name)).forEach(item => {
+    const destination = item.asset_name === 'bi' ? 'bitong' : `slot_${Math.min(slot++, 6)}`;
+    workbenchActions.push({type:'pick_place', instance_id:item.instance_id, destination});
+  });
+  renderActionQueue();
+};
+document.getElementById('clearPlanBtn').onclick = () => { workbenchActions = []; renderActionQueue(); };
+document.getElementById('syncPlanBtn').onclick = () => {
+  const picks = workbenchActions.filter(item => item.type === 'pick_place');
+  const names = picks.map(item => instanceById(item.instance_id)?.asset_name).filter(name => graspObjects.includes(name));
+  setChecks('grasp-object', names);
+  targetOrder = [...new Set(names)];
+  const plannedSlots = picks.map(item => String(item.destination || '')).filter(value => value.startsWith('slot_')).map(value => value.slice(5));
+  slotOrderState = [...new Set([...plannedSlots, ...slotOrderState])].slice(0, 6);
+  renderPlacementMapping();
+  switchTab('pickTab');
+  appendLog(`已同步 ${targetOrder.length} 个已知抓取动作到 PickPlace`);
+};
+document.getElementById('validatePlanBtn').onclick = async () => {
+  const data = await postJSON('/api/workbench/plan', {actions: workbenchActions, freeze: true});
+  renderWorkbench(data.state);
+  appendLog(data.plan.valid ? '场景计划校验通过，快照已冻结' : `场景计划未通过：${(data.plan.errors || []).join('；')}`);
+};
 document.getElementById('hotSam3Btn').onclick = async () => { appendLog('请求热启动 SAM3'); await postJSON('/api/hotstart/sam3'); };
 document.getElementById('hotSam6dBtn').onclick = async () => { appendLog('请求热启动 SAM6D'); await postJSON('/api/hotstart/sam6d'); };
 document.getElementById('stopHotBtn').onclick = async () => { await postJSON('/api/hotstart/stop'); };
@@ -3554,6 +4081,18 @@ document.getElementById('buildCmdBtn').onclick = async () => {
   const data = await postJSON('/api/grasp/command', {config: taskConfig()});
   document.getElementById('command').value = data.command;
   appendLog('已生成当前配置的命令预览；开始抓取不依赖这一步');
+};
+document.getElementById('startCurobo2Btn').onclick = async () => {
+  if (!window.confirm('运行 Curobo2 缓存感知→建模→规划→记录执行？此入口不会连接真机。')) return;
+  const data = await postJSON('/api/curobo2/start', {});
+  document.getElementById('command').value = data.command || '';
+  appendLog('已从前端启动 Curobo2 分层全链路');
+};
+document.getElementById('startCurobo2SimBtn').onclick = async () => {
+  if (!window.confirm('在 ManiSkill 中回放最新 Curobo2 轨迹并保存视频？')) return;
+  const data = await postJSON('/api/curobo2/sim-start', {});
+  document.getElementById('command').value = data.command || '';
+  appendLog('已从前端启动最新 Curobo2 规划的 ManiSkill 回放');
 };
 document.getElementById('startConfiguredBtn').onclick = async () => {
   const config = taskConfig();
@@ -3605,6 +4144,7 @@ es.onmessage = (ev) => {
 setInterval(refreshStatus, 2000);
 setInterval(refreshImages, 2500);
 initControls();
+renderActionQueue();
 loadLlmScenes().catch((err) => appendLog(`LLM 场景列表加载失败：${err.message || err}`));
 renderLlmResult(null);
 renderPreflight({ok:false, checks:[], mapping:buildLocalMappingPreview()});
@@ -3618,6 +4158,10 @@ refreshImages();
     "__TRACKED_OBJECTS_JSON__", json.dumps(DEFAULT_TRACKED_OBJECTS, ensure_ascii=False)
 ).replace(
     "__ALL_OBJECTS_JSON__", json.dumps(DEFAULT_OBJECTS, ensure_ascii=False)
+).replace(
+    "__KNOWN_SCAN_OBJECTS_JSON__", json.dumps(KNOWN_SCAN_OBJECTS, ensure_ascii=False)
+).replace(
+    "__ASSET_NAMES_JSON__", json.dumps(sorted(OBJECT_SPECS), ensure_ascii=False)
 )
 
 

@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import shlex
 
-from .config import base_pick_args
 from .pickplace.backends import command_for_mode, get_backend
 
 
-DIRECT_MODULE = get_backend("direct").module
-WRIST_REFINED_MODULE = get_backend("wrist").module
-ROOF_ASSEMBLY_MODULE = "rm75_app.runtime.roof_assembly_pick_place"
-SAM6D_MODULE = get_backend("sam6d").module
+DIRECT_MODULE = get_backend("curobo2").module
 WEB_MODULE = "rm75_app.web.control_panel"
 LLM_MODULE = "rm75_app.llm.orchestrator"
 CALIB_BASE_MODULE = "rm75_app.calibration.base_camera_visual_calibration"
@@ -28,39 +24,8 @@ def shell_join(parts: list[str]) -> str:
 
 
 def direct_pick_command(*, python: str = "python", render_mode: str = "human", execute_real: bool = False) -> list[str]:
-    args = base_pick_args(render_mode=render_mode, execute_real=execute_real)
-    return command_for_mode("direct", args, python=python).as_list()
-
-
-def sam6d_pick_command(*, python: str = "python", render_mode: str = "human", execute_real: bool = False) -> list[str]:
-    args = base_pick_args(render_mode=render_mode, execute_real=execute_real)
-    return command_for_mode("sam6d", args, python=python).as_list()
-
-
-def wrist_refined_pick_command(*, python: str = "python", render_mode: str = "human", execute_real: bool = False) -> list[str]:
-    args = base_pick_args(render_mode=render_mode, execute_real=execute_real)
-    return command_for_mode("wrist", args, python=python).as_list()
-
-
-def _remove_nargs_star_option(args: list[str], option: str) -> list[str]:
-    cleaned: list[str] = []
-    idx = 0
-    while idx < len(args):
-        if str(args[idx]) == option:
-            idx += 1
-            while idx < len(args) and not str(args[idx]).startswith("--"):
-                idx += 1
-            continue
-        cleaned.append(args[idx])
-        idx += 1
-    return cleaned
-
-
-def roof_assembly_pick_command(*, python: str = "python", render_mode: str = "human", execute_real: bool = False) -> list[str]:
-    args = base_pick_args(render_mode=render_mode, execute_real=execute_real)
-    args = _remove_nargs_star_option(args, "--cycle-object-names")
-    args = _remove_nargs_star_option(args, "--tracked-scene-object-names")
-    return [python, "-m", ROOF_ASSEMBLY_MODULE, *args]
+    del render_mode, execute_real
+    return command_for_mode("curobo2", python=python).as_list()
 
 
 def web_command(*, python: str = "python", host: str = "127.0.0.1", port: int = 7860) -> list[str]:

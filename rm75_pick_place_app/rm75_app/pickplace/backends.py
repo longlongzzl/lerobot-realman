@@ -13,25 +13,20 @@ class PickPlaceBackend:
 
 
 PICKPLACE_BACKENDS: dict[str, PickPlaceBackend] = {
-    "direct": PickPlaceBackend(
-        mode="direct",
-        module="rm75_app.runtime.direct_pre_place",
-        description="FoundationPose/direct pick-place",
-    ),
-    "sam6d": PickPlaceBackend(
-        mode="sam6d",
-        module="rm75_app.runtime.sam6d_pick_place",
-        description="SAM3/SAM6D scene-aware pick-place",
+    "curobo2": PickPlaceBackend(
+        mode="curobo2",
+        module="rm75_app.runtime.curobo2_pick_place",
+        description="Layered Curobo2 batch pick-place with explicit attachment boundaries",
     ),
     "rrtrack": PickPlaceBackend(
         mode="rrtrack",
         module="rm75_app.runtime.rrtrack_pose_tracking",
         description="Recoverable CUTIE + 6D closed-loop perception for pick-place",
     ),
-    "wrist": PickPlaceBackend(
-        mode="wrist",
-        module="rm75_app.runtime.wrist_refined_pick_place",
-        description="Direct pick-place with held-object wrist refinement",
+    "openworld-geometry": PickPlaceBackend(
+        mode="openworld-geometry",
+        module="rm75_app.runtime.openworld_geometry",
+        description="RaySt3R-style generated prior plus dynamic RGB-D collision geometry",
     ),
     "tabletop-refine": PickPlaceBackend(
         mode="tabletop-refine",
@@ -41,15 +36,19 @@ PICKPLACE_BACKENDS: dict[str, PickPlaceBackend] = {
 }
 
 PICKPLACE_MODE_ALIASES = {
-    "pick": "direct",
-    "pick-place": "direct",
-    "pick-place-direct": "direct",
+    "pick": "curobo2",
+    "pick-place": "curobo2",
+    "pick-place-direct": "curobo2",
+    "direct": "curobo2",
     "tabletop": "tabletop-refine",
+    "openworld": "openworld-geometry",
+    "unknown-object": "openworld-geometry",
+    "v2": "curobo2",
 }
 
 
 def normalize_mode(mode: str | None) -> str:
-    requested = str(mode or "direct").strip().lower().replace("_", "-")
+    requested = str(mode or "curobo2").strip().lower().replace("_", "-")
     return PICKPLACE_MODE_ALIASES.get(requested, requested)
 
 

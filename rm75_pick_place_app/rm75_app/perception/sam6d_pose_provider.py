@@ -3535,7 +3535,9 @@ def main():
     if not (sam6d_root / "Pose_Estimation_Model" / "run_inference_custom.py").exists():
         raise FileNotFoundError(f"invalid SAM-6D root: {sam6d_root}")
 
-    output_root = Path(args.output_root).expanduser()
+    # BlenderProc renders from SAM-6D/Render, so every artifact path passed to
+    # it must remain valid after the subprocess changes its working directory.
+    output_root = Path(args.output_root).expanduser().resolve()
 
     if len(object_names) == 1:
         single_name = object_names[0]

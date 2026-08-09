@@ -3,13 +3,18 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
+import trimesh
+from PIL import Image
 
+from rm75_app.assets.object_specs import OBJECT_SPECS
 from rm75_app.perception.rrtrack.agreement import rendered_mask_agreement, snap_translation_from_mask_depth
 from rm75_app.perception.rrtrack.banks import FeaturePoseBank
 from rm75_app.perception.rrtrack.config import RRTrackConfig
+from rm75_app.perception.rrtrack.foundationpose_adapter import foundationpose_compatible_mesh
 from rm75_app.perception.rrtrack.models import FrameObservation, PoseEstimate, SegmentationPrediction, TrackerState
 from rm75_app.perception.rrtrack.scene_registry import build_scene_registry, resolve_active_result
 from rm75_app.perception.rrtrack.tracker import RRTracker
+from rm75_app.runtime.rrtrack_build_all_banks import _geometry_groups
 
 
 class FakeSegmenter:
@@ -63,6 +68,28 @@ def make_frame(index=0):
 
 
 class RRTrackCoreTest(unittest.TestCase):
+    def test_all_object_bank_groups_cover_specs_and_deduplicate_shared_meshes(self):
+        groups = _geometry_groups(OBJECT_SPECS)
+        covered = sorted(name for group in groups for name in group["object_names"])
+        self.assertEqual(covered, sorted(OBJECT_SPECS))
+        self.assertLess(len(groups), len(OBJECT_SPECS))
+        triangle = next(group for group in groups if "red_triangle_front" in group["object_names"])
+        self.assertEqual(len(triangle["object_names"]), 4)
+        pillars = next(group for group in groups if "tingzi_pillar_front_left" in group["object_names"])
+        self.assertEqual(len(pillars["object_names"]), 4)
+
+    def test_pbr_texture_is_normalized_for_foundationpose(self):
+        mesh = trimesh.creation.box()
+        mesh.visual = trimesh.visual.texture.TextureVisuals(
+            uv=np.zeros((len(mesh.vertices), 2), dtype=np.float64),
+            material=trimesh.visual.material.PBRMaterial(
+                baseColorTexture=Image.new("RGB", (4, 4), (255, 128, 0))
+            ),
+        )
+        compatible = foundationpose_compatible_mesh(mesh)
+        self.assertIsInstance(compatible.visual.material, trimesh.visual.material.SimpleMaterial)
+        self.assertIsNotNone(compatible.visual.material.image)
+
     def test_paper_agreement_equation(self):
         observed = np.zeros((5, 5), bool)
         rendered = np.zeros((5, 5), bool)

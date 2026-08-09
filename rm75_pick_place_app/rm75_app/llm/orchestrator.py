@@ -26,7 +26,7 @@ from rm75_app.paths import APP_ROOT, DEFAULT_CUROBO_CFG, RUNTIME_DIR
 
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/rm75_matplotlib")
-DEFAULT_DIRECT_SCRIPT = "rm75_app.runtime.direct_pre_place"
+DEFAULT_DIRECT_SCRIPT = "rm75_app.runtime.curobo2_pick_place"
 DEFAULT_OUTPUT_ROOT = RUNTIME_DIR / "llm_pick_place_runs"
 LLM_PLAN_SCHEMA_VERSION = "rm75_pick_place_plan_v1"
 DEFAULT_ROBOT_BASE_WORLD_XYZ = np.asarray([-0.615, 0.0, 0.0], dtype=np.float32)

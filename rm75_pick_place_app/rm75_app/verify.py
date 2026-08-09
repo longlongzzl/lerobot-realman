@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .commands import direct_pick_command, roof_assembly_pick_command, sam6d_pick_command, web_command, wrist_refined_pick_command
+from .commands import direct_pick_command, web_command
 from .core.contracts import TaskRequest
 from .launch import local_runtime
 from .paths import APP_ROOT, DEFAULT_CUROBO_CFG, DEFAULT_RM75_URDF, MESH_DIR, RUNTIME_DIR, TEST_SCENE_DIR
@@ -36,22 +36,30 @@ def run_checks() -> list[Check]:
         ("meshs", MESH_DIR),
         ("test scenes", TEST_SCENE_DIR),
         ("runtime data", RUNTIME_DIR),
-        ("direct module", APP_ROOT / "rm75_app" / "runtime" / "direct_pre_place.py"),
-        ("wrist module", APP_ROOT / "rm75_app" / "runtime" / "wrist_refined_pick_place.py"),
-        ("roof module", APP_ROOT / "rm75_app" / "runtime" / "roof_assembly_pick_place.py"),
         ("wrist relation adapter", APP_ROOT / "rm75_app" / "perception" / "wrist_relation.py"),
         ("wrist relation cli", APP_ROOT / "rm75_app" / "perception" / "wrist_gripper_object_relation.py"),
-        ("sam6d module", APP_ROOT / "rm75_app" / "runtime" / "sam6d_pick_place.py"),
+        ("sam6d pose provider", APP_ROOT / "rm75_app" / "perception" / "sam6d_pose_provider.py"),
         ("rrtrack module", APP_ROOT / "rm75_app" / "runtime" / "rrtrack_pose_tracking.py"),
         ("rrtrack bank builder", APP_ROOT / "rm75_app" / "runtime" / "rrtrack_build_bank.py"),
+        ("rrtrack all-object bank builder", APP_ROOT / "rm75_app" / "runtime" / "rrtrack_build_all_banks.py"),
         ("rrtrack core", APP_ROOT / "rm75_app" / "perception" / "rrtrack" / "tracker.py"),
         ("rrtrack CUTIE adapter", APP_ROOT / "rm75_app" / "perception" / "rrtrack" / "cutie_adapter.py"),
         ("rrtrack FoundationPose adapter", APP_ROOT / "rm75_app" / "perception" / "rrtrack" / "foundationpose_adapter.py"),
         ("rrtrack scene registry", APP_ROOT / "rm75_app" / "perception" / "rrtrack" / "scene_registry.py"),
         ("rrtrack SAM3 fallback", APP_ROOT / "rm75_app" / "perception" / "rrtrack" / "sam3_relocalizer.py"),
+        ("openworld geometry runtime", APP_ROOT / "rm75_app" / "runtime" / "openworld_geometry.py"),
+        ("openworld geometry session", APP_ROOT / "rm75_app" / "perception" / "openworld_geometry" / "session.py"),
+        ("dynamic geometry cuRobo world", APP_ROOT / "rm75_app" / "planning" / "dynamic_geometry_world.py"),
+        ("planning contracts", APP_ROOT / "rm75_app" / "planning" / "contracts.py"),
+        ("Curobo2 backend", APP_ROOT / "rm75_app" / "planning" / "backends" / "curobo2.py"),
+        ("pick-place coordinator", APP_ROOT / "rm75_app" / "pickplace" / "coordinator.py"),
+        ("Curobo2 runtime", APP_ROOT / "rm75_app" / "runtime" / "curobo2_pick_place.py"),
+        ("Curobo2 sim replay", APP_ROOT / "rm75_app" / "runtime" / "curobo2_sim_replay.py"),
+        ("portable trajectory executor", APP_ROOT / "rm75_app" / "execution" / "trajectory_executor.py"),
         ("tabletop refine module", APP_ROOT / "rm75_app" / "runtime" / "tabletop_pose_refine.py"),
         ("tabletop refine entrypoint", APP_ROOT / "rm75_app" / "entrypoints" / "tabletop_pose_refine.py"),
         ("web module", APP_ROOT / "rm75_app" / "web" / "control_panel.py"),
+        ("scene workbench", APP_ROOT / "rm75_app" / "web" / "scene_workbench.py"),
         ("llm module", APP_ROOT / "rm75_app" / "llm" / "orchestrator.py"),
         ("core contracts", APP_ROOT / "rm75_app" / "core" / "contracts.py"),
         ("task adapters", APP_ROOT / "rm75_app" / "tasks"),
@@ -63,10 +71,7 @@ def run_checks() -> list[Check]:
         checks.append(Check(name, Path(path).exists(), str(path)))
 
     for name, cmd in (
-        ("direct command local", direct_pick_command()),
-        ("wrist command local", wrist_refined_pick_command()),
-        ("roof command local", roof_assembly_pick_command()),
-        ("sam6d command local", sam6d_pick_command()),
+        ("Curobo2 direct alias local", direct_pick_command()),
         ("web command local", web_command()),
     ):
         old_dir_markers = ("pick_" + "jiaobang/", "pick_" + "jiaobang\\")
@@ -86,10 +91,8 @@ def run_checks() -> list[Check]:
         checks.append(Check(f"pick-place layer {layer.key}", not missing_modules, "missing=" + repr(missing_modules)))
 
     source_boundary_files = (
-        APP_ROOT / "rm75_app" / "runtime" / "direct_pre_place.py",
-        APP_ROOT / "rm75_app" / "runtime" / "sam6d_pick_place.py",
-        APP_ROOT / "rm75_app" / "runtime" / "targeted_place.py",
-        APP_ROOT / "rm75_app" / "runtime" / "targeted_curobo.py",
+        APP_ROOT / "rm75_app" / "runtime" / "curobo2_pick_place.py",
+        APP_ROOT / "rm75_app" / "runtime" / "rrtrack_pose_tracking.py",
         APP_ROOT / "rm75_app" / "assets" / "object_specs.py",
     )
     forbidden_source_markers = ("pick_jiaobang", "rm75_lego_snap_place_app", "Beta_demo-codex")
@@ -100,6 +103,20 @@ def run_checks() -> list[Check]:
             if marker in text:
                 boundary_hits.append(f"{source_file.name}:{marker}")
     checks.append(Check("pick-place source boundary", not boundary_hits, "hits=" + repr(boundary_hits)))
+
+    mainline_files = (
+        APP_ROOT / "rm75_app" / "planning" / "backends" / "curobo2.py",
+        APP_ROOT / "rm75_app" / "pickplace" / "coordinator.py",
+        APP_ROOT / "rm75_app" / "runtime" / "curobo2_pick_place.py",
+        APP_ROOT / "rm75_app" / "runtime" / "curobo2_sim_replay.py",
+        APP_ROOT / "rm75_app" / "execution" / "trajectory_executor.py",
+    )
+    legacy_import_hits = []
+    for source_file in mainline_files:
+        text = source_file.read_text(encoding="utf-8", errors="ignore")
+        if "runtime.direct_pre_place" in text or "runtime import direct_pre_place" in text:
+            legacy_import_hits.append(source_file.name)
+    checks.append(Check("Curobo2 mainline excludes 20k legacy executor", not legacy_import_hits, "hits=" + repr(legacy_import_hits)))
 
     pipeline = TaskPipeline()
     for adapter in list_task_adapters():

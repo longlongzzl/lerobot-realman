@@ -8,7 +8,7 @@
 
 | 任务 key | 任务类型 | 状态 | 入口模式 |
 | --- | --- | --- | --- |
-| `pickplace` | 通用抓取放置 | active/mainline | `direct`, `sam6d`, `wrist`, `tabletop-refine` |
+| `pickplace` | 通用抓取放置 | active/mainline | `curobo2`, `rrtrack`, `openworld-geometry`, `tabletop-refine` |
 | `jimu` | 磁吸积木装配 | compatibility | `four-wall`, `triangle-roof` |
 | `lego` | 固定连接头 Lego snap | compatibility | `real`, `dry-run` |
 
@@ -41,28 +41,28 @@
 这是当前已经收敛的 pick-place 主线：
 
 - `config.py`：默认对象、跟踪障碍物和安全运行参数；
-- `backends.py`：`direct/sam6d/wrist/tabletop-refine` 到 in-app runtime 的唯一映射；
+- `backends.py`：`curobo2/rrtrack/openworld-geometry/tabletop-refine` 到 in-app runtime 的唯一映射；
 - `layers.py`：任务、感知、放置、规划、执行和编排的责任边界；
 - `runner.py`：统一的本地模块启动器。
 
-旧的 `pick_jiaobang` 目录不再是 direct/SAM6D 的运行依赖；外部 FoundationPose、SAM-6D、cuRobo 和 ManiSkill 仍属于允许的第三方运行环境。
+旧的 direct/SAM6D 单体执行链已从 1.0.24 工作树删除；外部 FoundationPose、SAM-6D、Curobo2 和 ManiSkill 仍属于允许的第三方运行环境。
 
 ### 能力层
 
 - `perception/`：场景、目标、障碍物和持物关系；
 - `placement/`：放置语义和候选生成策略；
-- `planning/`：IK、候选配对、cuRobo/PyRoki 轨迹；
+- `planning/`：批量 IK、候选配对和 Curobo2 轨迹；
 - `execution/`：仿真或 RM75 真机执行；
-- `runtime/`：当前历史流程的兼容装配层，逐步收敛为薄入口。
+- `runtime/`：感知、规划和回放的薄入口。
 
 能力层通过 `core/interfaces.py` 暴露协议，不把任务类型硬编码进通用 planner/executor。
 
 ## 迁移顺序
 
-1. `pickplace` 已完成主线入口收敛，保持 `direct/sam6d/wrist` CLI 不变。
+1. `pickplace` 已完成 Curobo2 主线入口收敛；`direct` 仅作为 Curobo2 别名，SAM6D 为独立感知入口。
 2. 把 Jimu 的对象角色、装配状态和四墙/三角屋顶步骤整理成任务 JSON/状态模型；旧 portable 脚本变成后端。
 3. 把 Lego 的 grid task、snap action 和固定连接头状态迁入主线；复用主线 perception/planning/execution，不再复制整套 app。
-4. 将 pick-place runtime 内部的重型流程继续按阶段拆成 provider、candidate generator、planner、executor、validator；每次只迁移一条可验证链路。
+4. 腕带硬件到位后，实现 `HeldObjectFrameSource`，不再恢复旧 wrist/direct 单体流程。
 5. Jimu/Lego 验证完成后，再清理 `legacy/backends.py` 中对应的外部路径。
 
 ## 当前刻意保留的兼容边界

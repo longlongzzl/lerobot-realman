@@ -9,19 +9,24 @@ from rm75_app.perception.rrtrack.banks import DinoV2Descriptor, build_sam6d_temp
 
 DEFAULT_CAM_POSES = (
     "/home/zhangzhao/PycharmProjects/SAM-6D/SAM-6D/"
-    "Instance_Segmentation_Model/utils/poses/predefined_poses/cam_poses_level2.npy"
+    "Instance_Segmentation_Model/utils/poses/predefined_poses/cam_poses_level0.npy"
 )
 DEFAULT_DINOV2_ROOT = "/home/zhangzhao/.cache/torch/hub/facebookresearch_dinov2_main"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build RRTrack's 256-view offline DINOv2 recovery bank")
+    parser = argparse.ArgumentParser(description="Build an RRTrack offline DINOv2 recovery bank from available SAM6D views")
     parser.add_argument("--templates-dir", required=True, help="SAM-6D templates containing rgb_N.png and mask_N.png")
     parser.add_argument("--cam-poses", default=DEFAULT_CAM_POSES)
     parser.add_argument("--output", required=True)
     parser.add_argument("--dinov2-root", default=DEFAULT_DINOV2_ROOT)
     parser.add_argument("--dino-model-name", default="dinov2_vits14")
-    parser.add_argument("--base-views", type=int, default=128, help="128 views plus 180-degree augmentation gives 256")
+    parser.add_argument(
+        "--base-views",
+        type=int,
+        default=128,
+        help="Maximum base views; each gets 180-degree augmentation (standard 42-view cache gives 84 entries)",
+    )
     parser.add_argument("--device", default="cuda")
     return parser.parse_args(argv)
 
