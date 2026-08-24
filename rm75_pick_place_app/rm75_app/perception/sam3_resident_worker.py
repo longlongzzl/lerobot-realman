@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import json
 import sys
 import time
@@ -53,7 +54,34 @@ class SAM3ResidentWorker:
 
         sam3_provider._sanitize_proxy_env_for_hf()
         from sam3.model.sam3_image_processor import Sam3Processor
-        from sam3.model_builder import build_sam3_image_model
+        import sam3.model_builder as sam3_model_builder
+
+        # The official loader opens the 3.3GB checkpoint as a file object, which
+        # prevents torch.load(mmap=True). On 16GB hosts that creates a large RAM
+        # peak and can fill swap. Memory mapping keeps checkpoint pages reclaimable.
+        def load_checkpoint_mmap(model, path):
+            ckpt = torch.load(str(Path(path).expanduser()), map_location="cpu", weights_only=True, mmap=True)
+            if "model" in ckpt and isinstance(ckpt["model"], dict):
+                ckpt = ckpt["model"]
+            image_ckpt = {
+                name.replace("detector.", ""): value
+                for name, value in ckpt.items()
+                if "detector" in name
+            }
+            if model.inst_interactive_predictor is not None:
+                image_ckpt.update(
+                    {
+                        name.replace("tracker.", "inst_interactive_predictor.model."): value
+                        for name, value in ckpt.items()
+                        if "tracker" in name
+                    }
+                )
+            model.load_state_dict(image_ckpt, strict=False)
+            del image_ckpt, ckpt
+            gc.collect()
+
+        sam3_model_builder._load_checkpoint = load_checkpoint_mmap
+        build_sam3_image_model = sam3_model_builder.build_sam3_image_model
 
         t0 = time.perf_counter()
         _log(f"[sam3 resident] loading model device={device} resolution={resolution}")

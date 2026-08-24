@@ -23,6 +23,7 @@ from transforms3d.quaternions import mat2quat
 from rm75_app.assets.object_specs import OBJECT_SPECS, get_object_spec, normalize_object_name, resolve_object_spec_scales
 from rm75_app.placement.place_rules import DESK_SLOT_LAYOUT_XZ, get_place_rule
 from rm75_app.paths import APP_ROOT, DEFAULT_CUROBO_CFG, RUNTIME_DIR
+from rm75_app.tasks.manipulation_plan import compile_resolved_steps
 
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/rm75_matplotlib")
@@ -34,6 +35,7 @@ DEFAULT_LLM_PROVIDER = os.environ.get("RM75_LLM_PROVIDER", "mock")
 DEFAULT_LLM_MODEL = os.environ.get("RM75_LLM_MODEL", "")
 DEFAULT_LLM_API_BASE = os.environ.get("RM75_LLM_API_BASE", "")
 DEFAULT_LLM_API_KEY_ENV = os.environ.get("RM75_LLM_API_KEY_ENV", "")
+DEFAULT_LLM_PROXY = os.environ.get("RM75_LLM_PROXY", os.environ.get("RM75_VLM_PROXY", "http://127.0.0.1:7897")).strip()
 
 
 def _table_direction_xy(direction: str) -> np.ndarray:
@@ -1514,6 +1516,8 @@ def call_external_llm_plan(args, command: str, scene: SceneState, out_dir: Path)
     model = str(getattr(args, "llm_model", None) or DEFAULT_LLM_MODEL or default_model)
     api_base = str(getattr(args, "llm_api_base", None) or DEFAULT_LLM_API_BASE or default_base)
     key_env = str(getattr(args, "llm_api_key_env", None) or DEFAULT_LLM_API_KEY_ENV or default_key_env)
+    proxy_arg = getattr(args, "llm_proxy_url", None)
+    proxy_url = str(DEFAULT_LLM_PROXY if proxy_arg is None else proxy_arg).strip()
     api_key = os.environ.get(key_env)
     if not api_key:
         raise RuntimeError(f"LLM API key env var {key_env!r} is not set")
@@ -1563,13 +1567,21 @@ def call_external_llm_plan(args, command: str, scene: SceneState, out_dir: Path)
         )
         t0 = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=float(getattr(args, "llm_timeout_s", 60.0) or 60.0)) as resp:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler(
+                    {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+                )
+            )
+            with opener.open(req, timeout=float(getattr(args, "llm_timeout_s", 60.0) or 60.0)) as resp:
                 raw_bytes = resp.read()
                 response = json.loads(raw_bytes.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             _write_attempt_file("llm_error.txt", attempt_idx, body)
             raise RuntimeError(f"LLM HTTP {exc.code}: {body[:1200]}")
+        except urllib.error.URLError as exc:
+            route = f"proxy {proxy_url}" if proxy_url else "direct connection"
+            raise RuntimeError(f"LLM request failed via {route}: {exc.reason}") from exc
         elapsed_ms_total += (time.perf_counter() - t0) * 1000.0
         _write_attempt_file("llm_raw_response.json", attempt_idx, json.dumps(response, ensure_ascii=False, indent=2))
         choices = response.get("choices") or []
@@ -4337,6 +4349,7 @@ def materialize_plan(
                 "target_object_id": step.target_object_id,
                 "place_mode": step.place_mode,
                 "primitive": step.primitive,
+                "semantic_step": step.mock_llm_step,
                 "target_pose": np.asarray(step.target_pose, dtype=np.float32).tolist(),
                 "target_pose_xyz_m": [round(float(v), 5) for v in step.target_pose[:3, 3]],
                 "target_pose_quat_wxyz": [float(v) for v in mat2quat(step.target_pose[:3, :3])],
@@ -4354,6 +4367,18 @@ def materialize_plan(
         artifacts[-1]["context_after_file"] = str(context_after_path)
     final_scene_file = out_dir / "final_predicted_scene.json"
     working_scene.write_fixed_scene(final_scene_file)
+    task_plan = compile_resolved_steps(
+        plan_id=out_dir.name,
+        scene_file=scene.scene_file,
+        steps=artifacts,
+        user_command=command,
+        metadata={"llm_plan_source": llm_plan_source},
+    )
+    task_plan_file = out_dir / "manipulation_plan.json"
+    task_plan_file.write_text(
+        json.dumps(task_plan.as_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     combined_info: dict[str, Any] = {"available": False, "reason": "no steps"}
     if artifacts:
         source_specs = [str(item["source_spec"]) for item in artifacts]
@@ -4413,6 +4438,7 @@ def materialize_plan(
         "llm_call": llm_call_info,
         "step_count": len(artifacts),
         "steps": artifacts,
+        "manipulation_plan_file": str(task_plan_file),
         "combined_command": combined_info,
         "final_predicted_scene_file": str(final_scene_file),
     }
@@ -4689,6 +4715,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", type=str, default=DEFAULT_LLM_MODEL, help="Model name. DeepSeek default is deepseek-v4-flash.")
     parser.add_argument("--llm-api-base", type=str, default=DEFAULT_LLM_API_BASE, help="OpenAI-compatible API base URL.")
     parser.add_argument("--llm-api-key-env", type=str, default=DEFAULT_LLM_API_KEY_ENV, help="Environment variable containing the API key.")
+    parser.add_argument("--llm-proxy-url", type=str, default=DEFAULT_LLM_PROXY, help="HTTP(S) proxy URL; pass an empty string for direct access.")
     parser.add_argument("--llm-timeout-s", type=float, default=60.0)
     parser.add_argument("--llm-temperature", type=float, default=0.0)
     parser.add_argument("--llm-max-tokens", type=int, default=4096)

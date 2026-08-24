@@ -23,11 +23,20 @@ from flask import Flask, Response, jsonify, request, send_file
 
 from rm75_app.assets.object_specs import ASSET_DIR, OBJECT_SPECS
 from rm75_app.paths import APP_ROOT, DEFAULT_CAMERA_EXTRINSIC, DEFAULT_CUROBO_CFG, RUNTIME_DIR, TEST_SCENE_DIR
+from rm75_app.perception.remote_vlm_provider import (
+    RemoteQwenVLProvider,
+    RemoteVLMConfig,
+    inventory_to_sam3_items,
+    load_env_file,
+    merge_inventory_metadata,
+)
+from rm75_app.perception.tabletop_roi import crop_polygon_roi, load_tabletop_roi, save_tabletop_roi
 from rm75_app.web.scene_workbench import SceneWorkbench
 
 
 ROOT = APP_ROOT
 PICK_DIR = APP_ROOT
+load_env_file(APP_ROOT / ".env")
 DEFAULT_SAM3_PYTHON = "/home/zhangzhao/anaconda3/envs/sam3/bin/python"
 DEFAULT_FOUNDATIONPOSE_PYTHON = "/home/zhangzhao/anaconda3/envs/foundationpose310/bin/python"
 DEFAULT_SAM3_CHECKPOINT = "/home/zhangzhao/Downloads/sam3.pt"
@@ -43,6 +52,37 @@ CUROBO2_PYTHON = Path("/home/zhangzhao/anaconda3/envs/curobo2/bin/python")
 FOUNDATIONPOSE_PYTHON = Path("/home/zhangzhao/anaconda3/envs/foundationpose310/bin/python")
 DEFAULT_CUROBO2_CACHED_RESULT = RUNTIME_DIR / "rrtrack_manual_init/20260808_203311_carriot_pid1169281/sam6d_pose_result.json"
 DEFAULT_GRASP_OBJECTS = ["lvmukuai", "carriot", "shuazi", "hongshupian", "gluestick", "bi", "tennis"]
+
+
+def resolve_sam3_checkpoint(payload: dict[str, Any] | None = None) -> Path:
+    """Resolve an explicit, environment, default, or Hugging Face cached SAM3 checkpoint."""
+    payload = payload or {}
+    candidates: list[Path] = []
+    configured = str(payload.get("checkpoint_path") or os.environ.get("RM75_SAM3_CHECKPOINT") or "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.append(Path(DEFAULT_SAM3_CHECKPOINT).expanduser())
+    candidates.extend(
+        sorted(
+            Path.home().glob(".cache/huggingface/hub/models--facebook--sam3/snapshots/*/sam3.pt"),
+            reverse=True,
+        )
+    )
+    invalid_candidates: list[tuple[Path, int]] = []
+    for candidate in candidates:
+        if candidate.is_file() and candidate.stat().st_size >= 1024 * 1024:
+            return candidate.resolve()
+        if candidate.is_file():
+            invalid_candidates.append((candidate, candidate.stat().st_size))
+    requested = candidates[0]
+    invalid_note = ""
+    if invalid_candidates:
+        bad_path, bad_size = invalid_candidates[0]
+        invalid_note = f"（检测到无效文件 {bad_path}，大小仅 {bad_size} 字节）"
+    raise FileNotFoundError(
+        f"SAM3 权重不存在或不完整：{requested}{invalid_note}。请将官方 sam3.pt 放到该路径，"
+        "或设置环境变量 RM75_SAM3_CHECKPOINT 后重启前端；facebook/sam3 是需授权模型。"
+    )
 DEFAULT_TRACKED_OBJECTS = ["desk", "bitong"]
 DEFAULT_OBJECTS = DEFAULT_GRASP_OBJECTS + DEFAULT_TRACKED_OBJECTS
 
@@ -70,6 +110,66 @@ KNOWN_SCAN_OBJECTS = _canonical_known_scan_objects()
 SERVER_STARTED_AT = time.time()
 latest_perception_result: dict[str, Any] = {}
 latest_llm_result: dict[str, Any] = {}
+llm_process_mode: str | None = None
+
+
+def _compact_pose_details(details: Any) -> dict[str, dict[str, Any]]:
+    compact: dict[str, dict[str, Any]] = {}
+    for name, raw in (details.items() if isinstance(details, dict) else []):
+        if not isinstance(raw, dict):
+            continue
+        compact[str(name)] = {
+            key: raw.get(key)
+            for key in ("ok", "score", "translation_m", "refine_applied")
+            if raw.get(key) is not None
+        }
+    return compact
+
+
+def compact_perception_result(result: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep polling responses small while raw perception artifacts stay on disk."""
+    raw = result or {}
+    keys = (
+        "result_path",
+        "scene_dir",
+        "rgb_path",
+        "object_names",
+        "requested_object_names",
+        "ok_count",
+        "object_count",
+        "pose_object_count",
+        "mask_found_objects",
+        "mask_missing_objects",
+        "pose_found_objects",
+        "pose_missing_objects",
+        "discovery_error",
+        "updated_at",
+        "scene_snapshot_id",
+        "scene_inventory_counts",
+    )
+    compact = {key: raw.get(key) for key in keys if raw.get(key) is not None}
+    pose_details = _compact_pose_details(raw.get("pose_details"))
+    if pose_details:
+        compact["pose_details"] = pose_details
+    return compact
+
+
+def latest_task_validation_report() -> dict[str, Any] | None:
+    """Return the newest complete three-gate report for frontend observability."""
+    root = RUNTIME_DIR / "task_validation"
+    candidates = list(root.glob("*/three_gate_report.json"))
+    if not candidates:
+        return None
+    try:
+        path = max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+        report = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(report, dict):
+            return None
+        report["report_file"] = str(path.resolve())
+        report["updated_at"] = path.stat().st_mtime
+        return report
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def shell_join(cmd: list[str]) -> str:
@@ -256,6 +356,7 @@ scene_workbench = SceneWorkbench(
     python_executable=sys.executable,
     initial_camera_transform=DEFAULT_CAMERA_EXTRINSIC,
 )
+TABLETOP_ROI_PATH = RUNTIME_DIR / "scene_workbench" / "tabletop_roi.json"
 log_history: deque[dict[str, Any]] = deque(maxlen=1000)
 gpu_history: deque[dict[str, Any]] = deque(maxlen=900)
 event_clients: list[queue.Queue] = []
@@ -625,6 +726,11 @@ class ResidentProcess(ManagedProcess):
         try:
             self.send_json(payload)
             response = q.get(timeout=float(timeout))
+        except queue.Empty as exc:
+            with self.lock:
+                self.pending.pop(request_id, None)
+            command = str(payload.get("cmd") or "command")
+            raise TimeoutError(f"{self.name} {command} 超过 {float(timeout):.0f}s 仍未返回") from exc
         except Exception:
             with self.lock:
                 self.pending.pop(request_id, None)
@@ -636,6 +742,7 @@ class ResidentProcess(ManagedProcess):
 
 grasp_process = ManagedProcess("抓取流程")
 llm_process = ManagedProcess("LLM执行")
+maniskill_preview_process = ManagedProcess("ManiSkill场景预览")
 perception_process = ManagedProcess("分割定位")
 geometry_process = ManagedProcess("未见物体几何")
 sam3_worker = ResidentProcess("SAM3 常驻")
@@ -838,6 +945,15 @@ def _list_llm_scene_files(limit: int = 160) -> list[dict[str, Any]]:
                     "name": resolved.name,
                     "mtime": resolved.stat().st_mtime,
                     "object_count": len(objects),
+                    "category": (
+                        "随机扰动"
+                        if "generated_random" in str(data.get("source") or "") or "generated_random" in rel
+                        else "搭建任务"
+                        if "assembly" in resolved.stem or "assembly" in str(data.get("schema_version") or data.get("schema") or "")
+                        else "真实缓存"
+                        if str(data.get("source") or "").startswith("foundationpose")
+                        else "虚拟场景"
+                    ),
                 }
             )
             if len(out) >= limit:
@@ -869,6 +985,7 @@ def _llm_result_summary(result: dict[str, Any]) -> dict[str, Any]:
         "command": result.get("command"),
         "output_dir": result.get("output_dir"),
         "manifest_file": str(Path(str(result.get("output_dir"))) / "manifest.json") if result.get("output_dir") else None,
+        "manipulation_plan_file": result.get("manipulation_plan_file"),
         "llm_plan_source": result.get("llm_plan_source"),
         "llm_plan": result.get("llm_plan"),
         "raw_external_llm_plan": result.get("raw_external_llm_plan"),
@@ -909,6 +1026,8 @@ def _materialize_llm_from_web(config: dict[str, Any], command: str) -> dict[str,
         str(float(config.get("real_max_delta_per_step") or 0.1)),
         "--llm-provider",
         provider,
+        "--llm-timeout-s",
+        str(float(config.get("llm_timeout_s") or 120.0)),
     ]
     model = str(config.get("llm_model") or "").strip()
     if model:
@@ -919,6 +1038,8 @@ def _materialize_llm_from_web(config: dict[str, Any], command: str) -> dict[str,
     key_env = str(config.get("llm_api_key_env") or "").strip()
     if key_env:
         argv.extend(["--llm-api-key-env", key_env])
+    proxy_url = str(config.get("llm_proxy_url") or "").strip()
+    argv.extend(["--llm-proxy-url", proxy_url])
     if bool(config.get("execute_real", False)):
         argv.append("--execute-real")
     args = llm.build_arg_parser().parse_args(argv)
@@ -932,23 +1053,16 @@ def _materialize_llm_from_web(config: dict[str, Any], command: str) -> dict[str,
 def _llm_manifest_execution_command(manifest_file: str | Path) -> tuple[list[str], dict[str, Any]]:
     manifest_path = _safe_json_file(manifest_file)
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    combined = data.get("combined_command") if isinstance(data.get("combined_command"), dict) else {}
-    command_file = None
-    if combined.get("available") and combined.get("command_file"):
-        command_file = combined.get("command_file")
-    else:
-        steps = list(data.get("steps") or [])
-        if steps and steps[0].get("command_file"):
-            command_file = steps[0].get("command_file")
-    if not command_file:
-        raise ValueError("LLM manifest has no executable command_file")
-    command_path = Path(str(command_file)).expanduser().resolve()
-    allowed_roots = [APP_ROOT.resolve(), RUNTIME_DIR.resolve(), Path("/tmp").resolve()]
-    if not any(str(command_path).startswith(str(root)) for root in allowed_roots):
-        raise ValueError(f"command file outside allowed roots: {command_path}")
-    if not command_path.exists():
-        raise FileNotFoundError(str(command_path))
-    return ["bash", str(command_path)], data
+    steps = list(data.get("steps") or [])
+    if not steps:
+        raise ValueError("LLM manifest has no executable steps")
+    return [
+        sys.executable,
+        "-m",
+        "rm75_app.runtime.llm_manifest_execution",
+        "--manifest",
+        str(manifest_path),
+    ], data
 
 
 def update_perception_task(**fields) -> dict[str, Any]:
@@ -962,6 +1076,9 @@ def current_perception_status() -> dict[str, Any]:
     with perception_task_lock:
         task = dict(perception_task)
     if task.get("running") or task.get("started_at") is not None:
+        if isinstance(task.get("last_result"), dict):
+            task["last_result"] = compact_perception_result(task["last_result"])
+        task.pop("last_json", None)
         return task
     return perception_process.status()
 
@@ -1294,7 +1411,7 @@ def preflight_report(config: dict[str, Any]) -> dict[str, Any]:
     def add(level: str, title: str, detail: str = "") -> None:
         checks.append({"level": level, "title": title, "detail": detail})
 
-    add("ok" if sam3_worker.status().get("ready") else "warn", "SAM3 常驻", "ready" if sam3_worker.status().get("ready") else "尚未热启动，启动感知时会自动加载")
+    add("ok" if sam3_worker.status().get("ready") else "warn", "SAM3 常驻", "ready" if sam3_worker.status().get("ready") else "尚未热启动；请手动热启动，扫描不会自动冷加载")
     add("ok" if sam6d_worker.status().get("ready") else "warn", "SAM6D 常驻", "ready" if sam6d_worker.status().get("ready") else "尚未热启动，启动感知时会自动加载")
     if not objects:
         add("bad", "抓取目标", "至少选择一个可抓目标")
@@ -1508,9 +1625,13 @@ def api_status():
             "grasp": grasp_process.status(),
             "geometry": geometry_process.status(),
             "llm": llm_process.status(),
-            "latest_perception_result": dict(latest_perception_result),
+            "llm_mode": llm_process_mode,
+            "maniskill_preview": maniskill_preview_process.status(),
+            "latest_perception_result": compact_perception_result(latest_perception_result),
             "workbench": scene_workbench.status(),
+            "tabletop_roi": load_tabletop_roi(TABLETOP_ROI_PATH),
             "latest_llm_result": dict(latest_llm_result),
+            "latest_task_validation": latest_task_validation_report(),
             "profile": latest_profile_waterfall(),
             "failure": latest_failure_summary(),
             "run_id": time.strftime("%Y%m%d_%H%M%S", time.localtime(SERVER_STARTED_AT)),
@@ -1523,7 +1644,37 @@ def api_status():
 
 @app.get("/api/workbench")
 def api_workbench():
-    return jsonify({"ok": True, "state": scene_workbench.status(), "assets": sorted(OBJECT_SPECS)})
+    return jsonify(
+        {
+            "ok": True,
+            "state": scene_workbench.status(),
+            "assets": sorted(OBJECT_SPECS),
+            "tabletop_roi": load_tabletop_roi(TABLETOP_ROI_PATH),
+        }
+    )
+
+
+@app.post("/api/workbench/tabletop-roi")
+def api_workbench_tabletop_roi():
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        roi = save_tabletop_roi(
+            TABLETOP_ROI_PATH,
+            payload.get("points_normalized") or [],
+            camera_serial=payload.get("camera_serial"),
+            image_size=payload.get("image_size"),
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    emit("summary", "桌面 ROI：五点多边形已保存，后续开放世界扫描自动复用。")
+    return jsonify({"ok": True, "tabletop_roi": roi})
+
+
+@app.post("/api/workbench/tabletop-roi/clear")
+def api_workbench_tabletop_roi_clear():
+    TABLETOP_ROI_PATH.unlink(missing_ok=True)
+    emit("summary", "桌面 ROI：已清除。")
+    return jsonify({"ok": True, "tabletop_roi": None})
 
 
 @app.post("/api/workbench/refresh")
@@ -1628,6 +1779,35 @@ def api_llm_scenes():
     return jsonify({"ok": True, "scenes": _list_llm_scene_files()})
 
 
+@app.post("/api/llm/scene/load")
+def api_llm_scene_load():
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        from rm75_app.llm.orchestrator import SceneState
+
+        scene_file = _safe_scene_file(payload.get("scene_file"))
+        scene = SceneState.load(scene_file)
+        context = scene.context()
+        objects = list(context.get("objects") or [])
+        if not objects:
+            raise ValueError("场景没有可用于任务规划的对象")
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify(
+        {
+            "ok": True,
+            "scene": {
+                "path": str(scene_file),
+                "name": scene_file.name,
+                "object_count": len(objects),
+                "objects": objects,
+                "slots": context.get("small_desk_slots") or [],
+                "coordinate_frame": context.get("coordinate_frame") or {},
+            },
+        }
+    )
+
+
 @app.get("/api/llm/interface")
 def api_llm_interface():
     try:
@@ -1640,12 +1820,19 @@ def api_llm_interface():
 
 @app.post("/api/llm/plan")
 def api_llm_plan():
-    global latest_llm_result
+    global latest_llm_result, llm_process_mode
     payload = request.get_json(force=True, silent=True) or {}
     command = str(payload.get("command") or "").strip()
     if not command:
         return jsonify({"ok": False, "error": "请输入自然语言命令"}), 400
+    if llm_process.is_running():
+        active_name = "三级验证" if llm_process_mode == "validate" else "任务执行"
+        return jsonify({"ok": False, "error": f"{active_name}仍在运行，请完成或停止后再生成新计划"}), 409
     config = dict(payload.get("config") or {})
+    # Plan generation is synchronous and does not use llm_process.  Mark it
+    # explicitly so status polling cannot repaint a stale validation exit code
+    # over the plan-generation message in the browser.
+    llm_process_mode = "plan"
     try:
         emit("summary", f"LLM：开始解析命令：{command}")
         result = _materialize_llm_from_web(config, command)
@@ -1658,11 +1845,15 @@ def api_llm_plan():
     except Exception as exc:
         emit("summary", f"LLM：生成失败：{exc!r}")
         return jsonify({"ok": False, "error": str(exc)}), 400
+    finally:
+        if llm_process_mode == "plan":
+            llm_process_mode = None
     return jsonify({"ok": True, "result": summary})
 
 
 @app.post("/api/llm/start")
 def api_llm_start():
+    global llm_process_mode
     payload = request.get_json(force=True, silent=True) or {}
     manifest_file = payload.get("manifest_file") or latest_llm_result.get("manifest_file")
     try:
@@ -1675,11 +1866,98 @@ def api_llm_start():
             command_text = str((manifest.get("steps") or [{}])[0].get("command") or "")
         if bool(payload.get("execute_real", False)) and "--execute-real" not in command_text:
             raise ValueError("这个 manifest 不是按真机执行生成的；请先用真机模式重新生成 LLM 计划")
+        if bool(payload.get("require_validation", False)):
+            report = latest_task_validation_report()
+            plan_file = manifest.get("manipulation_plan_file")
+            if not report or not plan_file:
+                raise ValueError("当前计划还没有三级验证报告")
+            report_plan = Path(str(report.get("plan_file") or "")).expanduser().resolve()
+            manifest_plan = Path(str(plan_file)).expanduser().resolve()
+            if report_plan != manifest_plan:
+                raise ValueError("三级验证报告属于旧计划，请重新验证当前计划")
+            if not bool(report.get("passed")):
+                raise ValueError("当前计划未通过三级验证，禁止执行")
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     llm_process.start(cmd, cwd=ROOT)
+    llm_process_mode = "execute"
     emit("summary", f"LLM：按 manifest 执行计划，steps={len(manifest.get('steps') or [])}")
     return jsonify({"ok": True, "status": llm_process.status(), "command": shell_join(cmd)})
+
+
+@app.post("/api/llm/validate")
+def api_llm_validate():
+    global llm_process_mode
+    payload = request.get_json(force=True, silent=True) or {}
+    manifest_file = payload.get("manifest_file") or latest_llm_result.get("manifest_file")
+    try:
+        manifest_path = _safe_json_file(manifest_file)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        plan_file = _safe_json_file(manifest.get("manipulation_plan_file"))
+        through = str(payload.get("through") or "maniskill")
+        if through not in {"geometry", "curobo2", "maniskill"}:
+            raise ValueError(f"未知验证级别: {through}")
+        output_dir = RUNTIME_DIR / "task_validation" / time.strftime("%Y%m%d_%H%M%S")
+        cmd = [
+            sys.executable,
+            "-m",
+            "rm75_app",
+            "task-validate",
+            "--",
+            "--plan",
+            str(plan_file),
+            "--through",
+            through,
+            "--output-dir",
+            str(output_dir),
+            "--render-mode",
+            "rgb_array",
+        ]
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    llm_process.start(cmd, cwd=APP_ROOT)
+    llm_process_mode = "validate"
+    emit("summary", f"LLM：已启动三级验证 through={through}，结果目录={output_dir}")
+    return jsonify({"ok": True, "status": llm_process.status(), "command": shell_join(cmd), "output_dir": str(output_dir)})
+
+
+@app.post("/api/llm/maniskill-preview")
+def api_llm_maniskill_preview():
+    payload = request.get_json(force=True, silent=True) or {}
+    manifest_file = payload.get("manifest_file") or latest_llm_result.get("manifest_file")
+    try:
+        manifest_path = _safe_json_file(manifest_file)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        plan_file = _safe_json_file(manifest.get("manipulation_plan_file"))
+        output_dir = RUNTIME_DIR / "maniskill_scene_preview" / time.strftime("%Y%m%d_%H%M%S")
+        cmd = [
+            str(FOUNDATIONPOSE_PYTHON),
+            "-m",
+            "rm75_app.runtime.maniskill_scene_preview",
+            "--plan",
+            str(plan_file),
+            "--output-dir",
+            str(output_dir),
+            "--snapshot",
+        ]
+        maniskill_preview_process.start(cmd, cwd=APP_ROOT)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    emit("summary", f"ManiSkill：正在打开当前场景与目标位姿，输出目录={output_dir}")
+    return jsonify(
+        {
+            "ok": True,
+            "status": maniskill_preview_process.status(),
+            "command": shell_join(cmd),
+            "output_dir": str(output_dir),
+        }
+    )
+
+
+@app.post("/api/llm/maniskill-preview/stop")
+def api_llm_maniskill_preview_stop():
+    maniskill_preview_process.stop()
+    return jsonify({"ok": True, "status": maniskill_preview_process.status()})
 
 
 @app.post("/api/llm/stop")
@@ -1699,11 +1977,12 @@ def api_hotstart_sam3():
 def ensure_sam3_resident(payload: dict | None = None, *, wait: bool = True) -> dict[str, Any]:
     payload = dict(payload or {})
     python_path = str(payload.get("python") or DEFAULT_SAM3_PYTHON)
+    checkpoint_path = resolve_sam3_checkpoint(payload)
     cmd = [
         python_path,
         str(SAM3_RESIDENT_WORKER_SCRIPT),
         "--checkpoint-path",
-        str(payload.get("checkpoint_path") or DEFAULT_SAM3_CHECKPOINT),
+        str(checkpoint_path),
         "--device",
         str(payload.get("device") or "cuda"),
         "--resolution",
@@ -1715,7 +1994,7 @@ def ensure_sam3_resident(payload: dict | None = None, *, wait: bool = True) -> d
         sam3_worker.start(cmd, cwd=APP_ROOT)
     if wait:
         if not bool(sam3_worker.status().get("ready", False)):
-            sam3_worker.request_json({"cmd": "warmup"}, timeout=180.0)
+            sam3_worker.request_json({"cmd": "warmup"}, timeout=600.0)
     else:
         sam3_worker.send_json({"cmd": "warmup"})
     return sam3_worker.status()
@@ -1888,31 +2167,97 @@ def _run_resident_perception(config: dict[str, Any]) -> None:
             )
             raise RuntimeError(f"SAM3 mask matched multiple object names; conflicts={mask_conflicts}")
 
-        # A second, class-agnostic pass enumerates physical tabletop instances.
-        # It is deliberately kept separate from known-asset prompting: an absent
-        # requested asset is not evidence that an unknown object exists.
-        discovery_result: dict[str, Any] = {"results": [], "error": None}
+        # The remote VLM enumerates concrete tabletop instances and turns each
+        # one into a bounded SAM3 tool call. A generic text prompt remains only
+        # as a degraded fallback because SAM3 is not prompt-free objectness.
+        discovery_result: dict[str, Any] = {"results": [], "error": None, "vlm_inventory": None}
         try:
+            discovery_items: list[dict[str, Any]] = []
+            vlm_error: str | None = None
+            if bool(config.get("open_world_vlm", True)):
+                update_perception_task(phase="understanding", running=True, last_result=sam3_result)
+                emit("summary", "场景扫描：Qwen3-VL 正在枚举桌面物体并生成 SAM3 提示。")
+                try:
+                    roi = load_tabletop_roi(TABLETOP_ROI_PATH)
+                    vlm_image_path = Path(capture["rgb_path"])
+                    roi_geometry: dict[str, Any] | None = None
+                    if roi:
+                        roi_geometry = crop_polygon_roi(
+                            vlm_image_path,
+                            roi["points_normalized"],
+                            Path(capture["scene_dir"]) / "qwen_vl_tabletop_roi.jpg",
+                        )
+                        vlm_image_path = Path(roi_geometry["image_path"])
+                        emit("summary", "场景扫描：已应用固定五点桌面 ROI。")
+                    else:
+                        emit("summary", "场景扫描：尚未标定桌面 ROI，本次使用完整相机画面。")
+                    vlm = RemoteQwenVLProvider(
+                        RemoteVLMConfig(
+                            base_url=str(config.get("vlm_base_url") or RemoteVLMConfig.base_url),
+                            model=str(config.get("vlm_model") or RemoteVLMConfig.model),
+                            api_key_env=str(config.get("vlm_api_key_env") or RemoteVLMConfig.api_key_env),
+                            timeout_s=float(config.get("vlm_timeout_s") or 90.0),
+                            proxy_url=str(config.get("vlm_proxy_url") or RemoteVLMConfig.proxy_url),
+                        ),
+                        env_file=APP_ROOT / ".env",
+                    )
+                    known_catalog = {name: spec.grounding_prompt for name, spec in OBJECT_SPECS.items()}
+                    inventory = vlm.inventory(vlm_image_path, known_catalog)
+                    inventory["tabletop_roi"] = roi
+                    inventory["roi_geometry"] = roi_geometry
+                    inventory_path = Path(capture["scene_dir"]) / "qwen_vl_inventory.json"
+                    inventory_path.write_text(json.dumps(inventory, ensure_ascii=False, indent=2), encoding="utf-8")
+                    discovery_result["vlm_inventory"] = inventory
+                    discovery_result["vlm_inventory_path"] = str(inventory_path)
+                    if roi_geometry:
+                        discovery_items = inventory_to_sam3_items(
+                            inventory,
+                            int(roi_geometry["crop_width"]),
+                            int(roi_geometry["crop_height"]),
+                            offset_x=float(roi_geometry["offset_x"]),
+                            offset_y=float(roi_geometry["offset_y"]),
+                        )
+                    else:
+                        discovery_items = inventory_to_sam3_items(
+                            inventory,
+                            int(inventory.get("image_width") or 640),
+                            int(inventory.get("image_height") or 480),
+                        )
+                    emit("summary", f"场景扫描：Qwen3-VL 枚举出 {len(discovery_items)} 个桌面实例。")
+                except Exception as exc:
+                    vlm_error = repr(exc)
+                    emit("summary", f"场景扫描：Qwen3-VL 失败，降级到通用提示：{exc!r}")
+            if not discovery_items:
+                discovery_items = [
+                    {
+                        "id": "tabletop_objects",
+                        "prompt": str(config.get("open_world_prompt") or "physical objects on the table."),
+                        "mode": "text",
+                    }
+                ]
+            update_perception_task(phase="discovering", running=True, last_result=sam3_result)
             discovery_resp = sam3_worker.request_json(
                 {
                     "cmd": "segment",
                     "rgb_path": capture["rgb_path"],
                     "output_dir": str(Path(capture["scene_dir"]) / "sam3_open_world"),
-                    "items": [
-                        {
-                            "id": "tabletop_objects",
-                            "prompt": str(config.get("open_world_prompt") or "physical objects on the table."),
-                            "mode": "text",
-                        }
-                    ],
+                    "items": discovery_items,
                     "morph_kernel": int(provider_payload["sam3_morph_kernel"]),
                     "min_mask_area": max(300, int(provider_payload["min_mask_area"])),
                     "sam3_max_masks_per_item": int(config.get("open_world_max_instances") or 32),
                 },
                 timeout=240.0,
             )
-            discovery_result = discovery_resp.get("result") or discovery_result
-            emit("summary", f"场景扫描：得到 {len(discovery_result.get('results') or [])} 个桌面实例候选。")
+            segmented = discovery_resp.get("result") or {}
+            results = list(segmented.get("results") or [])
+            inventory = discovery_result.get("vlm_inventory")
+            if isinstance(inventory, dict):
+                results = merge_inventory_metadata(results, inventory)
+            discovery_result.update(segmented)
+            discovery_result["results"] = results
+            discovery_result["vlm_error"] = vlm_error
+            successful = sum(bool(item.get("ok", False)) for item in results if isinstance(item, dict))
+            emit("summary", f"场景扫描：SAM3 得到 {successful}/{len(discovery_items)} 个桌面实例 mask。")
         except Exception as discovery_exc:
             discovery_result["error"] = repr(discovery_exc)
             emit("summary", f"场景扫描：开放世界候选失败，已知资产定位继续：{discovery_exc!r}")
@@ -2038,6 +2383,20 @@ def api_perception_run():
         current = current_perception_status()
         if current.get("running"):
             return jsonify({"ok": False, "error": "分割定位正在运行"}), 409
+        try:
+            resolve_sam3_checkpoint(config)
+        except FileNotFoundError as exc:
+            update_perception_task(phase="error", running=False, ready=False, returncode=1, last_error=str(exc))
+            emit("summary", f"扫描未启动：{exc}")
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        sam3_status = sam3_worker.status()
+        if not bool(sam3_status.get("ready", False)):
+            if sam3_worker.is_running():
+                error = "SAM3 仍在热启动，请等待状态变为 ready 后再扫描；扫描不会重复启动模型。"
+            else:
+                error = "SAM3 尚未热启动。请先点击“只启动 SAM3”，等待 ready 后再扫描。"
+            emit("summary", f"扫描未启动：{error}")
+            return jsonify({"ok": False, "error": error, "sam3": sam3_status}), 409
         threading.Thread(target=_run_resident_perception, args=(dict(config),), daemon=True).start()
         return jsonify({"ok": True, "status": current_perception_status(), "resident": True})
 
@@ -2397,6 +2756,18 @@ INDEX_HTML = r"""<!doctype html>
     .timeline-step.active { border-color: #93c5fd; background: #eff6ff; color: #1d4ed8; }
     .timeline-step.done { border-color: #86efac; background: #f0fdf4; color: #166534; }
     .timeline-step.bad { border-color: #fecaca; background: #fff1f2; color: #991b1b; }
+    .maniskill-dialog {
+      width: min(96vw, 1500px);
+      max-width: none;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      background: #111827;
+      color: #f8fafc;
+    }
+    .maniskill-dialog::backdrop { background: rgba(15, 23, 42, 0.72); }
+    .maniskill-dialog img { display: block; width: 100%; max-height: 78vh; object-fit: contain; background: #020617; }
+    .maniskill-dialog .note { color: #cbd5e1; }
     textarea {
       width: 100%;
       min-height: 164px;
@@ -2539,6 +2910,10 @@ INDEX_HTML = r"""<!doctype html>
     .target-card.ok, .preflight-item.ok { border-color: #86efac; background: #f0fdf4; }
     .target-card.warn, .preflight-item.warn { border-color: #fde68a; background: #fffbeb; }
     .target-card.bad, .preflight-item.bad, .failure-card.bad { border-color: #fecaca; background: #fff1f2; }
+    .collision-list { display: grid; gap: 6px; margin-top: 9px; }
+    .collision-row { border-left: 3px solid #f97316; padding: 5px 8px; background: rgba(255,255,255,.72); }
+    .collision-row small { display: block; color: var(--muted); margin-top: 2px; }
+    .collision-badge { display: inline-block; margin-right: 6px; padding: 1px 6px; border-radius: 999px; background: #ffedd5; color: #9a3412; font-size: 11px; }
     .sequence-list {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -2629,6 +3004,19 @@ INDEX_HTML = r"""<!doctype html>
       position: relative;
     }
     .image-slot img { width: 100%; display: block; }
+    .image-stage { position: relative; width: 100%; }
+    .roi-overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    .roi-overlay.calibrating { pointer-events: auto; cursor: crosshair; }
+    .roi-overlay polygon { fill: rgba(37, 99, 235, 0.18); stroke: #2563eb; stroke-width: 5; }
+    .roi-overlay polyline { fill: none; stroke: #f59e0b; stroke-width: 5; stroke-dasharray: 14 9; }
+    .roi-overlay circle { fill: #fff; stroke: #dc2626; stroke-width: 5; }
+    .roi-overlay text { fill: #fff; stroke: #111827; stroke-width: 5; paint-order: stroke; font-size: 34px; font-weight: 700; }
     .empty-image {
       min-height: 190px;
       display: flex;
@@ -2695,11 +3083,54 @@ INDEX_HTML = r"""<!doctype html>
     .action-row small { color: var(--muted); overflow-wrap: anywhere; }
     .job-card { border: 1px solid var(--line); border-radius: 7px; padding: 8px; margin-top: 7px; background: #fbfcfe; }
     .job-card code { display: block; margin-top: 5px; font-size: 11px; overflow-wrap: anywhere; color: var(--muted); }
+    .workflow-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .workflow-step {
+      border: 1px solid var(--line);
+      border-left: 4px solid #94a3b8;
+      border-radius: 8px;
+      padding: 9px;
+      background: #f8fafc;
+    }
+    .workflow-step.ready { border-left-color: var(--green); background: #f0fdf4; }
+    .workflow-step.active { border-left-color: #2563eb; background: #eff6ff; }
+    .workflow-step.blocked { border-left-color: var(--amber); background: #fffbeb; }
+    .workflow-step b { display: block; font-size: 12px; }
+    .workflow-step small { display: block; margin-top: 4px; color: var(--muted); line-height: 1.35; }
+    .stage-label {
+      display: inline-block;
+      margin-right: 7px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      color: #1d4ed8;
+      background: #dbeafe;
+      font-size: 11px;
+      vertical-align: 2px;
+    }
+    .advanced-note {
+      border-left: 3px solid #64748b;
+      padding-left: 9px;
+    }
+    .virtual-scene-panel {
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #f8fafc;
+    }
+    #virtualSceneCanvas { width: 100%; height: 360px; display: block; background: #f8fafc; }
+    .scene-object-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 9px; border-top: 1px solid var(--line); }
+    .scene-object-chip { padding: 4px 7px; border-radius: 999px; background: #e2e8f0; color: #334155; font-size: 11px; }
     @media (max-width: 1000px) {
       main { grid-template-columns: 1fr; }
       .images { grid-template-columns: 1fr; }
       .mapping-board { grid-template-columns: 1fr; }
       .inventory-columns { grid-template-columns: 1fr; }
+      .workflow-strip { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
@@ -2716,14 +3147,24 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </header>
   <div class="tabbar">
-    <button class="tab-btn active" data-tab="sceneTab">场景工作台</button>
-    <button class="tab-btn" data-tab="pickTab">PickPlace</button>
-    <button class="tab-btn" data-tab="llmTab">LLM 控制</button>
+    <button class="tab-btn active" data-tab="sceneTab">任务工作台</button>
+    <button class="tab-btn" data-tab="pickTab">感知与执行调试</button>
   </div>
   <main id="sceneTab" class="tab-panel active">
     <div class="stack">
       <section>
-        <h2>开放世界场景扫描</h2>
+        <h2>任务流程</h2>
+        <p class="note">一个场景快照贯穿对象确认、任务编排、三级验证和执行。自然语言是主入口，手工队列用于快速指定或排障。</p>
+        <div class="workflow-strip">
+          <div class="workflow-step" id="flowScene"><b>1 · 场景</b><small>等待扫描</small></div>
+          <div class="workflow-step" id="flowTask"><b>2 · 任务</b><small>等待编排</small></div>
+          <div class="workflow-step" id="flowValidation"><b>3 · 验证</b><small>等待计划</small></div>
+          <div class="workflow-step" id="flowExecution"><b>4 · 执行</b><small>尚未启动</small></div>
+        </div>
+      </section>
+
+      <section>
+        <h2><span class="stage-label">阶段 1</span>扫描并确认场景</h2>
         <div class="dashboard-grid">
           <div class="metric-card"><b>场景版本</b><span id="sceneVersion">暂无</span></div>
           <div class="metric-card"><b>已见 / 不确定</b><span id="knownCount">0 / 0</span></div>
@@ -2735,23 +3176,37 @@ INDEX_HTML = r"""<!doctype html>
           <button id="refreshInventoryBtn">从最近感知刷新</button>
           <button id="unfreezeSceneBtn">解冻并继续编辑</button>
         </div>
+        <p class="note" id="scanSceneStatus">尚未开始扫描。</p>
         <p class="note">扫描同时运行已知资产定位和类别无关桌面实例发现。红色候选只进入待处理区，不会直接参与真机抓取。</p>
       </section>
 
       <section>
-        <h2>场景画面</h2>
-        <div class="image-slot"><div class="caption" id="sceneCaption">当前场景快照</div><div class="empty-image" id="sceneEmpty">扫描后显示</div><img id="sceneImg" /></div>
+        <h2>场景画面与桌面 ROI</h2>
+        <div class="image-slot">
+          <div class="caption" id="sceneCaption">当前场景快照</div>
+          <div class="image-stage" id="sceneImageStage">
+            <div class="empty-image" id="sceneEmpty">扫描后显示</div>
+            <img id="sceneImg" />
+            <svg id="sceneRoiOverlay" class="roi-overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>
+          </div>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button id="calibrateRoiBtn">标定五点ROI</button>
+          <button id="cancelRoiBtn" style="display:none">取消标定</button>
+          <button class="danger" id="clearRoiBtn">清除ROI</button>
+        </div>
+        <p class="note" id="roiStatusText">桌面ROI：尚未标定。</p>
       </section>
 
       <section>
-        <h2>场景资产清单</h2>
+        <h2>对象清单</h2>
         <div class="inventory-columns" id="inventoryRoot"></div>
       </section>
     </div>
 
     <div class="stack">
       <section>
-        <h2>未见物体处理</h2>
+        <h2><span class="stage-label">阶段 1</span>未见物体处理</h2>
         <div class="row">
           <div class="field">
             <label for="geometryProvider">几何 Provider</label>
@@ -2765,11 +3220,53 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section>
-        <h2>动作编排</h2>
+        <h2><span class="stage-label">阶段 2</span>自然语言任务</h2>
+        <div class="llm-command-box">
+          <textarea id="llmCommand" placeholder="例如：把网球放进笔筒，然后把笔靠在笔筒右侧">把网球放进笔筒，然后把笔靠在笔筒右侧</textarea>
+        </div>
+        <div class="field-grid" style="margin-top: 10px;">
+          <div class="field">
+            <label for="llmSceneFile">计划场景 JSON</label>
+            <select id="llmSceneFile"></select>
+          </div>
+          <div class="field">
+            <label for="llmProvider">语义规划后端</label>
+            <select id="llmProvider">
+              <option value="openai-compatible" selected>Qwen / OpenAI compatible</option>
+              <option value="deepseek">deepseek</option>
+              <option value="mock">mock 本地规则</option>
+            </select>
+          </div>
+          <div class="field"><label for="llmModel">模型</label><input id="llmModel" type="text" value="qwen3.8-max" /></div>
+          <div class="field"><label for="llmApiBase">API Base</label><input id="llmApiBase" type="text" value="https://llm-q7nh1xonye3vc6id.cn-beijing.maas.aliyuncs.com/compatible-mode/v1" /></div>
+          <div class="field"><label for="llmApiKeyEnv">Key 环境变量</label><input id="llmApiKeyEnv" type="text" value="RM75_VLM_API_KEY" /></div>
+          <div class="field"><label for="llmProxyUrl">网络代理</label><input id="llmProxyUrl" type="text" value="http://127.0.0.1:7897" /></div>
+          <div class="field">
+            <label for="llmRenderMode">渲染模式</label>
+            <select id="llmRenderMode"><option value="human" selected>human</option><option value="rgb_array">rgb_array</option><option value="none">none</option></select>
+          </div>
+        </div>
+        <div class="row" style="margin-top: 10px;">
+          <label class="check"><input type="checkbox" id="llmExecuteReal" /> 真机执行</label>
+          <button id="llmReloadScenesBtn">刷新场景</button>
+          <button id="llmLoadSceneBtn">加载虚拟场景</button>
+          <button class="primary" id="llmPlanBtn">生成任务计划</button>
+        </div>
+        <p class="note" id="llmStatusText">选择场景 JSON 并加载到工作台，然后生成结构化任务和目标位姿。</p>
+        <div class="virtual-scene-panel" id="virtualScenePanel" style="display:none">
+          <div class="caption" id="virtualSceneCaption">虚拟场景</div>
+          <canvas id="virtualSceneCanvas" width="900" height="520"></canvas>
+          <div class="scene-object-chips" id="virtualSceneObjects"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2><span class="stage-label">阶段 2 · 手工</span>动作队列</h2>
+        <p class="note">手工队列是独立的快速编排入口，适合直接指定对象、顺序和 slot；校验后会冻结当前场景快照。上方执行按钮只执行自然语言生成并通过三级验证的计划。</p>
         <div class="row">
           <button id="autoPlanBtn">按当前场景生成</button>
           <button id="clearPlanBtn">清空</button>
-          <button id="syncPlanBtn">同步已知抓取到 PickPlace</button>
+          <button id="syncPlanBtn">送到底层调试</button>
           <button class="primary" id="validatePlanBtn">校验并冻结快照</button>
         </div>
         <div class="action-queue" id="actionQueue" style="margin-top:10px"></div>
@@ -2777,7 +3274,36 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section>
-        <h2>工作台约束</h2>
+        <h2><span class="stage-label">阶段 3</span>计划、验证与执行</h2>
+        <div class="row">
+          <button id="llmValidateBtn">运行三级验证</button>
+          <button id="llmManiskillPreviewBtn">查看 Pregrasp / Grasp</button>
+          <button id="llmManiskillPreviewStopBtn">关闭场景预览</button>
+          <button class="primary" id="llmRunBtn">执行已验证计划</button>
+          <button class="danger" id="llmStopBtn">停止验证 / 执行</button>
+        </div>
+        <div class="llm-step-list" id="llmStepList" style="margin-top:10px">
+          <div class="llm-step"><b>暂无计划</b><small>输入任务后点击生成。</small></div>
+        </div>
+        <div class="failure-card" id="validationStatus" style="margin-top:10px">三级验证尚未运行</div>
+      </section>
+
+      <section>
+        <h2>目标位姿预览</h2>
+        <div class="images">
+          <div class="image-slot"><div class="caption" id="llmPreview3dCaption">3D 预览</div><div class="empty-image" id="llmPreview3dEmpty">暂无</div><img id="llmPreview3dImg" /></div>
+          <div class="image-slot"><div class="caption" id="llmPreviewCaption">俯视预览</div><div class="empty-image" id="llmPreviewEmpty">暂无</div><img id="llmPreviewImg" /></div>
+        </div>
+        <p class="note" id="llmManifestText">manifest：暂无</p>
+        <details style="margin-top:8px">
+          <summary>查看结构化计划与底层命令</summary>
+          <textarea id="llmCommandPreview" readonly style="margin-top:8px"></textarea>
+          <div class="json-panel" id="llmJsonPanel" style="margin-top:8px">暂无</div>
+        </details>
+      </section>
+
+      <section>
+        <h2>执行约束</h2>
         <div class="preflight-list">
           <div class="preflight-item ok"><b>实例身份</b><small>动作绑定 scene_version + instance_id，冻结后不会静默换场景。</small></div>
           <div class="preflight-item warn"><b>不确定实例</b><small>需要人工指定资产或忽略，不能进入执行计划。</small></div>
@@ -2786,10 +3312,22 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
   </main>
+  <dialog id="maniskillPreviewDialog" class="maniskill-dialog">
+    <div class="row" style="justify-content:space-between; margin-bottom:10px">
+      <div>
+        <b>ManiSkill Pregrasp / Grasp 诊断</b>
+        <div class="note" id="maniskillPreviewStatus">正在加载 GPU 场景…</div>
+      </div>
+      <button id="maniskillPreviewDialogCloseBtn">关闭</button>
+    </div>
+    <img id="maniskillPreviewImage" alt="ManiSkill 四视角场景与目标位姿" />
+    <p class="note">四幅图依次为前视、俯视、左侧斜视、右侧斜视。橙色线框/半透明盒是桌面物体在 cuRobo2 中的有效碰撞代理；青色球链是 pregrasp IK 的机械臂碰撞球，紫红色球链是 grasp IK 的碰撞球。同色示意夹爪标记 TCP 位姿，黄色点列是世界 Z 接近路径，RGB 是 TCP 的 X/Y/Z 轴。</p>
+  </dialog>
   <main id="pickTab" class="tab-panel">
     <div class="stack">
       <section>
-        <h2>运行总览</h2>
+        <h2>底层运行总览</h2>
+        <p class="note advanced-note">这里是感知、规划和执行的诊断入口。日常多物体任务请在“任务工作台”完成场景确认、编排和三级验证。</p>
         <div class="dashboard-grid">
           <div class="metric-card"><b>执行模式</b><span id="safetyMode">-</span></div>
           <div class="metric-card"><b>真机参数</b><span id="realParamText">-</span></div>
@@ -2813,11 +3351,11 @@ INDEX_HTML = r"""<!doctype html>
           <button id="hotSam6dBtn">只启动 SAM6D</button>
           <button class="danger" id="stopHotBtn">停止常驻</button>
         </div>
-        <p class="note">热启动只加载模型和模板缓存，不会拍照、分割或定位。摆好物体后，用下面的“重新分割定位”按钮单独跑感知。</p>
+        <p class="note">SAM3 权重约 3.3GB，首次加载会明显占用内存。请先单独启动 SAM3 并等待 ready；扫描不会再自动触发冷加载。</p>
       </section>
 
       <section>
-        <h2>任务配置</h2>
+        <h2>PickPlace 执行参数（高级）</h2>
         <div class="subhead">抓取目标</div>
         <div class="check-grid" id="graspObjectChecks"></div>
         <div class="row" style="margin-top: 8px;">
@@ -2894,7 +3432,7 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <section>
-        <h2>抓取命令</h2>
+        <h2>底层命令与单链路执行</h2>
         <textarea id="command"></textarea>
         <div class="row" style="margin-top: 10px;">
           <button id="buildCmdBtn">预览当前配置命令</button>
@@ -2952,86 +3490,6 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
   </main>
-  <main id="llmTab" class="tab-panel">
-    <div class="stack">
-      <section>
-        <h2>自然语言任务</h2>
-        <div class="llm-command-box">
-          <textarea id="llmCommand" placeholder="例如：把网球扔进笔筒，然后把笔靠在笔筒右侧">把网球扔进笔筒，然后把笔靠在笔筒右侧</textarea>
-        </div>
-        <div class="field-grid" style="margin-top: 10px;">
-          <div class="field">
-            <label for="llmSceneFile">场景 JSON</label>
-            <select id="llmSceneFile"></select>
-          </div>
-          <div class="field">
-            <label for="llmProvider">LLM 后端</label>
-            <select id="llmProvider">
-              <option value="deepseek" selected>deepseek</option>
-              <option value="mock">mock 本地规则</option>
-              <option value="openai-compatible">OpenAI compatible</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="llmModel">模型</label>
-            <input id="llmModel" type="text" value="deepseek-v4-flash" />
-          </div>
-          <div class="field">
-            <label for="llmApiBase">API Base</label>
-            <input id="llmApiBase" type="text" value="https://api.deepseek.com" />
-          </div>
-          <div class="field">
-            <label for="llmApiKeyEnv">Key 环境变量</label>
-            <input id="llmApiKeyEnv" type="text" value="DEEPSEEK_API_KEY" />
-          </div>
-          <div class="field">
-            <label for="llmRenderMode">渲染模式</label>
-            <select id="llmRenderMode">
-              <option value="human" selected>human</option>
-              <option value="rgb_array">rgb_array</option>
-              <option value="none">none</option>
-            </select>
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <label class="check"><input type="checkbox" id="llmExecuteReal" /> 真机执行</label>
-          <button id="llmReloadScenesBtn">刷新场景</button>
-          <button class="primary" id="llmPlanBtn">生成目标位姿预览</button>
-          <button class="primary" id="llmRunBtn">按当前计划执行</button>
-          <button class="danger" id="llmStopBtn">停止 LLM 执行</button>
-        </div>
-        <p class="note" id="llmStatusText">先选择固定场景 JSON，再生成目标位姿预览。真实相机 SAM6D 定位仍在 PickPlace 页运行；LLM 页目前使用固定 JSON 场景做语义规划。</p>
-      </section>
-
-      <section>
-        <h2>计划步骤</h2>
-        <div class="llm-step-list" id="llmStepList">
-          <div class="llm-step"><b>暂无计划</b><small>输入命令后点击生成。</small></div>
-        </div>
-      </section>
-
-      <section>
-        <h2>低层命令</h2>
-        <textarea id="llmCommandPreview" readonly></textarea>
-        <p class="note" id="llmManifestText">manifest：暂无</p>
-      </section>
-    </div>
-
-    <div class="stack">
-      <section>
-        <h2>目标位姿预览</h2>
-        <div class="images">
-          <div class="image-slot"><div class="caption" id="llmPreview3dCaption">3D 预览</div><div class="empty-image" id="llmPreview3dEmpty">暂无</div><img id="llmPreview3dImg" /></div>
-          <div class="image-slot"><div class="caption" id="llmPreviewCaption">俯视预览</div><div class="empty-image" id="llmPreviewEmpty">暂无</div><img id="llmPreviewImg" /></div>
-        </div>
-      </section>
-
-      <section>
-        <h2>LLM JSON</h2>
-        <div class="json-panel" id="llmJsonPanel">暂无</div>
-      </section>
-    </div>
-  </main>
 <script>
 const defaultCommand = __DEFAULT_COMMAND_JSON__;
 const graspObjects = __GRASP_OBJECTS_JSON__;
@@ -3048,10 +3506,164 @@ const fixedBitongTargets = new Set(['bi']);
 let placementPreviewTimer = null;
 let placementPreviewSignature = '';
 let latestLlmResult = null;
+let suppressLatestLlmRestore = false;
 let workbenchState = {snapshot:null, jobs:[], plan:null};
 let workbenchAssets = __ASSET_NAMES_JSON__;
 let workbenchActions = [];
 let workbenchSnapshotId = null;
+let loadedVirtualScene = null;
+let tabletopRoi = null;
+let roiDraftPoints = [];
+let roiCalibrating = false;
+
+function sceneObjectColor(name, alpha=1) {
+  let hash = 0;
+  for (const char of String(name)) hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0;
+  const hue = Math.abs(hash) % 360;
+  return `hsla(${hue}, 62%, 55%, ${alpha})`;
+}
+
+function drawVirtualScene(scene) {
+  const canvas = document.getElementById('virtualSceneCanvas');
+  if (!canvas || !scene) return;
+  const ctx = canvas.getContext('2d');
+  const objects = [...(scene.objects || [])];
+  const width = canvas.width, height = canvas.height;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#f8fafc';
+  ctx.fillRect(0, 0, width, height);
+  if (!objects.length) return;
+
+  const bounds = objects.map((obj) => {
+    const p = obj.position_xyz_m || [0, 0, 0];
+    const extent = obj.asset_extent_xyz_m || [0.04, 0.04, 0.04];
+    const radius = Math.max(Number(extent[0]) || 0.04, Number(extent[1]) || 0.04) * 0.6;
+    return [Number(p[0]), Number(p[1]), radius];
+  });
+  let minX = Math.min(...bounds.map(x => x[0] - x[2]));
+  let maxX = Math.max(...bounds.map(x => x[0] + x[2]));
+  let minY = Math.min(...bounds.map(x => x[1] - x[2]));
+  let maxY = Math.max(...bounds.map(x => x[1] + x[2]));
+  const spanX = Math.max(maxX - minX, 0.25), spanY = Math.max(maxY - minY, 0.25);
+  minX -= spanX * .10; maxX += spanX * .10;
+  minY -= spanY * .10; maxY += spanY * .10;
+  const pad = 48;
+  const scale = Math.min((width - 2 * pad) / (maxY - minY), (height - 2 * pad) / (maxX - minX));
+  const toPixel = (x, y) => [pad + (maxY - y) * scale, pad + (maxX - x) * scale];
+
+  ctx.strokeStyle = '#d7dee8';
+  ctx.lineWidth = 1;
+  for (let x = Math.ceil(minX / .1) * .1; x <= maxX; x += .1) {
+    const a = toPixel(x, minY), b = toPixel(x, maxY);
+    ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke();
+  }
+  for (let y = Math.ceil(minY / .1) * .1; y <= maxY; y += .1) {
+    const a = toPixel(minX, y), b = toPixel(maxX, y);
+    ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke();
+  }
+
+  objects.sort((a, b) => Number(a.spec_name !== 'desk') - Number(b.spec_name !== 'desk'));
+  objects.forEach((obj) => {
+    const p = obj.position_xyz_m || [0, 0, 0];
+    const extent = obj.asset_extent_xyz_m || [.04, .04, .04];
+    const T = obj.T_world_obj || [[1,0,0],[0,1,0]];
+    const [cx, cy] = toPixel(Number(p[0]), Number(p[1]));
+    const objectWidth = Math.max(8, Number(extent[1] || .04) * scale);
+    const objectHeight = Math.max(8, Number(extent[0] || .04) * scale);
+    const angle = -Math.atan2(Number(T?.[1]?.[0] || 0), Number(T?.[0]?.[0] || 1));
+    ctx.save();
+    ctx.translate(cx, cy); ctx.rotate(angle);
+    ctx.fillStyle = obj.spec_name === 'desk' ? 'rgba(148,163,184,.20)' : sceneObjectColor(obj.spec_name, .66);
+    ctx.strokeStyle = obj.spec_name === 'desk' ? '#64748b' : sceneObjectColor(obj.spec_name, 1);
+    ctx.lineWidth = obj.spec_name === 'desk' ? 2 : 3;
+    ctx.fillRect(-objectWidth/2, -objectHeight/2, objectWidth, objectHeight);
+    ctx.strokeRect(-objectWidth/2, -objectHeight/2, objectWidth, objectHeight);
+    ctx.restore();
+    if (obj.spec_name !== 'desk') {
+      ctx.font = '12px sans-serif';
+      ctx.fillStyle = '#0f172a';
+      ctx.fillText(obj.object_id, cx + 6, cy - 7);
+    }
+  });
+  ctx.font = '13px sans-serif';
+  ctx.fillStyle = '#475569';
+  ctx.fillText('俯视图 · 上方为桌面 +X（前）· 左方为 +Y（左）', 16, 22);
+}
+
+function renderVirtualScene(scene) {
+  const changed = Boolean(scene && loadedVirtualScene?.path !== scene.path);
+  loadedVirtualScene = scene || null;
+  const panel = document.getElementById('virtualScenePanel');
+  const executeReal = document.getElementById('llmExecuteReal');
+  if (panel) panel.style.display = scene ? 'block' : 'none';
+  if (executeReal) {
+    executeReal.checked = false;
+    executeReal.disabled = Boolean(scene);
+    executeReal.title = scene ? '虚拟场景只允许规划和仿真验证' : '';
+  }
+  if (!scene) return;
+  if (changed) {
+    suppressLatestLlmRestore = true;
+    renderLlmResult(null);
+  }
+  document.getElementById('virtualSceneCaption').textContent = `虚拟场景 · ${scene.name} · ${scene.object_count} objects`;
+  const chips = document.getElementById('virtualSceneObjects');
+  chips.innerHTML = (scene.objects || []).map((obj) => `<span class="scene-object-chip">${obj.object_id} · ${obj.spec_name}</span>`).join('');
+  drawVirtualScene(scene);
+  updateWorkspaceFlow(window.lastStatusData || {});
+}
+
+async function loadVirtualScene(showLog=true) {
+  const sceneFile = document.getElementById('llmSceneFile').value;
+  if (!sceneFile) throw new Error('没有可加载的虚拟场景');
+  const data = await postJSON('/api/llm/scene/load', {scene_file: sceneFile});
+  renderVirtualScene(data.scene);
+  document.getElementById('llmStatusText').textContent = `已加载虚拟场景：${data.scene.name}，可开始生成任务计划。`;
+  if (showLog) appendLog(`虚拟场景已加载：${data.scene.name} · ${data.scene.object_count} objects`);
+  return data.scene;
+}
+
+function drawTabletopRoi() {
+  const overlay = document.getElementById('sceneRoiOverlay');
+  const status = document.getElementById('roiStatusText');
+  if (!overlay || !status) return;
+  const points = roiCalibrating ? roiDraftPoints : (tabletopRoi?.points_normalized || []);
+  overlay.classList.toggle('calibrating', roiCalibrating);
+  const scaled = points.map(point => [Number(point[0]) * 1000, Number(point[1]) * 1000]);
+  let markup = '';
+  if (!roiCalibrating && scaled.length === 5) {
+    markup += `<polygon points="${scaled.map(point => point.join(',')).join(' ')}"></polygon>`;
+  } else if (scaled.length > 1) {
+    markup += `<polyline points="${scaled.map(point => point.join(',')).join(' ')}"></polyline>`;
+  }
+  scaled.forEach((point, index) => {
+    markup += `<circle cx="${point[0]}" cy="${point[1]}" r="15"></circle>`;
+    markup += `<text x="${point[0] + 20}" y="${point[1] - 20}">${index + 1}</text>`;
+  });
+  overlay.innerHTML = markup;
+  if (roiCalibrating) status.textContent = `桌面ROI：请沿边界按顺序点击，已选 ${points.length}/5 个点。`;
+  else if (tabletopRoi) status.textContent = '桌面ROI：五点多边形已保存，开放世界扫描会自动复用。';
+  else status.textContent = '桌面ROI：尚未标定。';
+}
+
+function setTabletopRoi(value) {
+  if (!roiCalibrating) tabletopRoi = value || null;
+  drawTabletopRoi();
+}
+
+async function saveRoiDraft() {
+  const img = document.getElementById('sceneImg');
+  const data = await postJSON('/api/workbench/tabletop-roi', {
+    points_normalized: roiDraftPoints,
+    image_size: [img.naturalWidth || 640, img.naturalHeight || 480],
+  });
+  tabletopRoi = data.tabletop_roi;
+  roiDraftPoints = [];
+  roiCalibrating = false;
+  document.getElementById('cancelRoiBtn').style.display = 'none';
+  drawTabletopRoi();
+  appendLog('五点桌面ROI已保存');
+}
 
 function instanceById(instanceId) {
   return (workbenchState.snapshot?.instances || []).find((item) => item.instance_id === instanceId);
@@ -3107,6 +3719,7 @@ function renderActionQueue() {
     root.appendChild(row);
   });
   if (!workbenchActions.length) root.innerHTML = '<div class="note">暂无动作。可以从资产卡片加入，或按当前场景自动生成。</div>';
+  updateWorkspaceFlow(window.lastStatusData || {});
 }
 
 async function updateWorkbenchInstance(instanceId, knownness, assetName=null) {
@@ -3767,20 +4380,40 @@ async function postJSON(url, body={}) {
 async function refreshStatus() {
   const data = await (await fetch('/api/status')).json();
   window.lastStatusData = data;
+  updateManiskillPreview(data.maniskill_preview || {});
+  setTabletopRoi(data.tabletop_roi);
   document.getElementById('serverStatus').textContent = `server pid=${data.server_pid} rss=${data.rss_mb}MB`;
   document.getElementById('runMeta').textContent = `run ${data.run_id || '-'} · started ${new Date((data.server_started_at || 0) * 1000).toLocaleString()}`;
   document.getElementById('sam3State').innerHTML = stateText(data.sam3);
   document.getElementById('sam6dState').innerHTML = stateText(data.sam6d);
   document.getElementById('perceptionState').innerHTML = stateText(data.perception);
+  const scanBtn = document.getElementById('scanSceneBtn');
+  const scanStatus = document.getElementById('scanSceneStatus');
+  if (scanBtn && data.perception?.running) {
+    scanBtn.disabled = true;
+    scanBtn.textContent = '扫描定位中…';
+    if (scanStatus) scanStatus.textContent = `正在执行：${data.perception.phase || 'starting'}`;
+  } else if (scanBtn) {
+    scanBtn.disabled = false;
+    scanBtn.textContent = '扫描桌面并定位';
+    if (scanStatus && data.perception?.phase === 'error') {
+      scanStatus.textContent = `扫描失败：${data.perception.last_error || '未知错误'}`;
+    } else if (scanStatus && data.perception?.ready) {
+      scanStatus.textContent = '扫描定位完成。';
+    }
+  }
   document.getElementById('graspState').innerHTML = stateText(data.grasp);
   const llmStatus = document.getElementById('llmStatusText');
-  if (llmStatus && data.llm?.running) llmStatus.textContent = `LLM 执行运行中 pid=${data.llm.pid}`;
-  else if (llmStatus && data.llm?.returncode !== undefined && data.llm?.returncode !== null) llmStatus.textContent = `LLM 执行已退出 code=${data.llm.returncode}`;
-  if (!latestLlmResult && data.latest_llm_result && data.latest_llm_result.manifest_file) {
+  const managedLlmMode = data.llm_mode === 'validate' || data.llm_mode === 'execute';
+  if (llmStatus && data.llm_mode === 'plan') llmStatus.textContent = 'LLM 正在生成结构化计划和目标位姿...';
+  else if (llmStatus && managedLlmMode && data.llm?.running) llmStatus.textContent = `${data.llm_mode === 'validate' ? '三级验证' : '任务执行'}运行中 pid=${data.llm.pid}`;
+  else if (llmStatus && managedLlmMode && data.llm?.returncode !== undefined && data.llm?.returncode !== null) llmStatus.textContent = `${data.llm_mode === 'validate' ? '三级验证' : '任务执行'}已退出 code=${data.llm.returncode}`;
+  if (!suppressLatestLlmRestore && !latestLlmResult && data.latest_llm_result && data.latest_llm_result.manifest_file) {
     renderLlmResult(data.latest_llm_result);
   }
   updatePerceptionAssetMarks(data);
   renderWorkbench(data.workbench || workbenchState);
+  updateWorkspaceFlow(data);
   renderTargetStatus(data);
   renderTimeline(data);
   renderSafety(data);
@@ -3851,7 +4484,7 @@ async function loadLlmScenes() {
   (data.scenes || []).forEach((item) => {
     const opt = document.createElement('option');
     opt.value = item.path;
-    opt.textContent = `${item.rel} (${item.object_count} objects)`;
+    opt.textContent = `[${item.category || '场景'}] ${item.rel} (${item.object_count} objects)`;
     select.appendChild(opt);
   });
   if (current && Array.from(select.options).some((opt) => opt.value === current)) select.value = current;
@@ -3864,6 +4497,7 @@ function llmConfig() {
     llm_model: document.getElementById('llmModel').value.trim(),
     llm_api_base: document.getElementById('llmApiBase').value.trim(),
     llm_api_key_env: document.getElementById('llmApiKeyEnv').value.trim(),
+    llm_proxy_url: document.getElementById('llmProxyUrl').value.trim(),
     render_mode: document.getElementById('llmRenderMode').value,
     execute_real: document.getElementById('llmExecuteReal').checked,
     real_control_hz: Number(document.getElementById('realHz').value || 30),
@@ -3906,6 +4540,118 @@ function renderLlmResult(result) {
   const preview = result.target_pose_preview || {};
   setPathImage('llmPreview', preview.target_pose_preview_image, '俯视预览');
   setPathImage('llmPreview3d', preview.target_pose_preview_3d_image, '3D 预览');
+  updateWorkspaceFlow(window.lastStatusData || {});
+}
+
+function setWorkflowStep(id, state, detail) {
+  const root = document.getElementById(id);
+  if (!root) return;
+  root.classList.remove('ready', 'active', 'blocked');
+  if (state) root.classList.add(state);
+  const detailNode = root.querySelector('small');
+  if (detailNode) detailNode.textContent = detail;
+}
+
+function appendCollisionReport(root, report) {
+  const curoboGate = (report.gates || []).find((gate) => gate.gate === 'curobo2');
+  if (!curoboGate) return;
+  const failedChecks = (curoboGate.checks || []).filter((check) => check.status === 'failed');
+  for (const check of failedChecks) {
+    const title = document.createElement('div');
+    title.style.marginTop = '9px';
+    title.textContent = `${check.atom_id || '未知动作'} · ${check.message || '规划失败'}`;
+    root.appendChild(title);
+    if ((check.batch_collision_sources || []).length) {
+      const batchNote = document.createElement('small');
+      batchNote.textContent = `批量阻断源：${check.batch_collision_sources.join('、')}；该候选触发 PRM 整批拒绝，其余候选可能被连带判失败。`;
+      root.appendChild(batchNote);
+    }
+    const list = document.createElement('div');
+    list.className = 'collision-list';
+    const collisions = check.collisions || [];
+    for (const item of collisions) {
+      const row = document.createElement('div');
+      row.className = 'collision-row';
+      const badge = document.createElement('span');
+      badge.className = 'collision-badge';
+      badge.textContent = item.collision_type === 'self' ? '自碰撞' : '场景碰撞';
+      const pair = document.createElement('span');
+      pair.textContent = item.collision_type === 'self'
+        ? `${item.robot_link} ↔ ${item.other_robot_link}`
+        : `${item.robot_link} ↔ ${item.world_object}`;
+      const detail = document.createElement('small');
+      const depth = Number(item.penetration_m || 0) * 1000;
+      detail.textContent = `${item.state || 'endpoint'} · 候选 ${item.candidate_id ?? '-'} · 穿透 ${depth.toFixed(2)} mm`;
+      row.append(badge, pair, detail);
+      list.appendChild(row);
+    }
+    if (!collisions.length) {
+      const empty = document.createElement('small');
+      const diagnosticErrors = (check.attempts || [])
+        .flatMap((attempt) => (attempt.diagnostics?.candidates || []))
+        .map((candidate) => candidate.diagnostic_error)
+        .filter(Boolean);
+      empty.textContent = diagnosticErrors.length
+        ? `碰撞复核失败：${diagnosticErrors.join('；')}`
+        : '已复核 approach_end / grasp_goal，未发现可枚举碰撞对；请查看该阶段的其他规划约束。';
+      list.appendChild(empty);
+    }
+    root.appendChild(list);
+  }
+}
+
+function updateWorkspaceFlow(data) {
+  const snapshot = workbenchState?.snapshot;
+  const virtualScene = loadedVirtualScene;
+  setWorkflowStep(
+    'flowScene',
+    virtualScene ? 'ready' : (snapshot ? (snapshot.frozen ? 'ready' : 'active') : ''),
+    virtualScene ? `虚拟 · ${virtualScene.name}` : (snapshot ? `真实 v${snapshot.version} · ${snapshot.frozen ? '已冻结' : '待确认'}` : '等待扫描或加载虚拟场景'),
+  );
+
+  const generatedSteps = Number(latestLlmResult?.step_count || (latestLlmResult?.steps || []).length || 0);
+  const manualPlan = workbenchState?.plan;
+  const hasTask = generatedSteps > 0 || workbenchActions.length > 0;
+  const taskDetail = generatedSteps > 0
+    ? `自然语言计划 · ${generatedSteps} 步`
+    : (workbenchActions.length ? `手工队列 · ${workbenchActions.length} 步` : '等待编排');
+  setWorkflowStep('flowTask', hasTask ? (manualPlan?.valid || generatedSteps ? 'ready' : 'active') : '', taskDetail);
+
+  const report = data?.latest_task_validation || null;
+  const currentPlan = latestLlmResult?.manipulation_plan_file || null;
+  const reportMatches = Boolean(report && currentPlan && String(report.plan_file) === String(currentPlan));
+  const validationRunning = Boolean(data?.llm?.running && data?.llm_mode === 'validate' && currentPlan);
+  let validationState = '';
+  let validationDetail = generatedSteps ? '等待三级验证' : '等待计划';
+  if (validationRunning) {
+    validationState = 'active';
+    validationDetail = '验证或执行进程运行中';
+  } else if (reportMatches) {
+    validationState = report.passed ? 'ready' : 'blocked';
+    validationDetail = report.passed ? '几何 / Curobo2 / ManiSkill 通过' : '验证未通过';
+  }
+  setWorkflowStep('flowValidation', validationState, validationDetail);
+
+  const executing = Boolean(data?.grasp?.running || (data?.llm?.running && data?.llm_mode === 'execute'));
+  setWorkflowStep('flowExecution', executing ? 'active' : (reportMatches && report.passed ? 'ready' : ''), executing ? '进程运行中' : (reportMatches && report.passed ? '可以执行' : '尚未就绪'));
+
+  const validationRoot = document.getElementById('validationStatus');
+  const runButton = document.getElementById('llmRunBtn');
+  const validateButton = document.getElementById('llmValidateBtn');
+  if (runButton) runButton.disabled = !(reportMatches && report?.passed) || validationRunning || executing;
+  if (validateButton) validateButton.disabled = !currentPlan || Boolean(data?.llm?.running);
+  if (!validationRoot) return;
+  validationRoot.className = 'failure-card';
+  if (validationRunning) {
+    validationRoot.textContent = '三级验证或计划执行正在运行，完成后会自动显示报告。';
+  } else if (!reportMatches) {
+    validationRoot.textContent = report ? '存在旧验证报告；当前计划尚未完成三级验证。' : '三级验证尚未运行。';
+  } else {
+    const gates = (report.gates || []).map((gate) => `${gate.gate}: ${gate.status}`).join(' · ');
+    validationRoot.textContent = `${report.passed ? '验证通过' : '验证未通过'} · ${gates || '无 gate 明细'}`;
+    validationRoot.className = `failure-card ${report.passed ? 'ok' : 'bad'}`;
+    if (!report.passed) appendCollisionReport(validationRoot, report);
+  }
 }
 
 async function runLlmPlan() {
@@ -3914,8 +4660,11 @@ async function runLlmPlan() {
     appendLog('LLM 命令为空');
     return;
   }
+  const selectedScene = document.getElementById('llmSceneFile').value;
+  if (!loadedVirtualScene || loadedVirtualScene.path !== selectedScene) await loadVirtualScene(false);
   document.getElementById('llmStatusText').textContent = 'LLM 正在生成结构化计划和目标位姿...';
   const data = await postJSON('/api/llm/plan', {command, config: llmConfig()});
+  suppressLatestLlmRestore = false;
   renderLlmResult(data.result);
   document.getElementById('llmStatusText').textContent = `计划已生成：${data.result.step_count || 0} 步`;
   appendLog(`LLM 计划已生成：${data.result.manifest_file || ''}`);
@@ -3928,7 +4677,65 @@ async function startLlmPlan() {
     return;
   }
   if (document.getElementById('llmExecuteReal').checked && !window.confirm('确认按 LLM 计划开始真机执行？')) return;
-  await postJSON('/api/llm/start', {manifest_file: manifest, execute_real: document.getElementById('llmExecuteReal').checked});
+  await postJSON('/api/llm/start', {
+    manifest_file: manifest,
+    execute_real: document.getElementById('llmExecuteReal').checked,
+    require_validation: true,
+  });
+}
+
+async function validateLlmPlan() {
+  const manifest = latestLlmResult?.manifest_file;
+  if (!manifest) {
+    appendLog('还没有 LLM manifest，先生成目标位姿预览');
+    return;
+  }
+  document.getElementById('llmStatusText').textContent = '正在运行：几何 → Curobo2 → ManiSkill...';
+  const data = await postJSON('/api/llm/validate', {manifest_file: manifest, through: 'maniskill'});
+  appendLog(`三级验证已启动：${data.output_dir || ''}`);
+}
+
+async function openManiskillPreview() {
+  const manifest = latestLlmResult?.manifest_file;
+  if (!manifest) {
+    appendLog('还没有 LLM manifest，先生成任务计划');
+    return;
+  }
+  const dialog = document.getElementById('maniskillPreviewDialog');
+  const status = document.getElementById('maniskillPreviewStatus');
+  const image = document.getElementById('maniskillPreviewImage');
+  if (status) status.textContent = '正在加载场景并渲染 pregrasp / grasp TCP 位姿…';
+  if (image) image.removeAttribute('src');
+  if (dialog && !dialog.open) dialog.showModal();
+  const data = await postJSON('/api/llm/maniskill-preview', {manifest_file: manifest});
+  appendLog(`ManiSkill 场景预览正在打开：${data.output_dir || ''}`);
+}
+
+let lastManiskillPreviewImage = '';
+function updateManiskillPreview(process) {
+  const status = document.getElementById('maniskillPreviewStatus');
+  const image = document.getElementById('maniskillPreviewImage');
+  const result = process?.last_json || {};
+  if (process?.running) {
+    if (status) status.textContent = `GPU 渲染中 pid=${process.pid || '-'}…`;
+    return;
+  }
+  if (result.ok && result.image_path) {
+    const grasp = result.grasp_preview || {};
+    const distanceMm = Number(grasp.distance_m || 0) * 1000;
+    const sphereModels = result.robot_collision_models || [];
+    const sphereText = sphereModels.map((item) => `${item.role || 'default'} ${item.sphere_count || 0}球${item.solution_source === 'kinematic_fallback' ? '(运动学回退)' : ''}`).join(' / ');
+    const collisionText = `${result.collision_proxy_count || 0}个物体代理${sphereText ? ` · ${sphereText}` : ''}`;
+    if (status) status.textContent = grasp.candidate_id
+      ? `候选 ${grasp.candidate_id} · ${grasp.approach_axis || 'world_z'} · pregrasp→grasp ${distanceMm.toFixed(1)} mm · ${collisionText}。${result.collision_geometry_error ? ' 机械臂碰撞球导出失败，请查看日志。' : ''}`
+      : `已加载 ${result.object_count || 0} 个物体、${result.target_count || 0} 个目标位姿。`;
+    if (image && lastManiskillPreviewImage !== result.image_path) {
+      lastManiskillPreviewImage = result.image_path;
+      image.src = `/image?path=${encodeURIComponent(result.image_path)}&t=${Date.now()}`;
+    }
+  } else if (process?.phase === 'error') {
+    if (status) status.textContent = `渲染失败：${process.last_error || '请查看进程日志'}`;
+  }
 }
 
 function drawGpu() {
@@ -4006,9 +4813,69 @@ function drawGpu() {
 }
 
 document.getElementById('hotAllBtn').onclick = async () => { appendLog('请求热启动 SAM3 + SAM6D'); await postJSON('/api/hotstart/all'); };
+document.getElementById('calibrateRoiBtn').onclick = () => {
+  const img = document.getElementById('sceneImg');
+  if (!img.getAttribute('src') || img.style.display === 'none') {
+    appendLog('请先完成一次扫描或刷新最近感知结果，再标定桌面ROI');
+    return;
+  }
+  roiDraftPoints = [];
+  roiCalibrating = true;
+  document.getElementById('cancelRoiBtn').style.display = '';
+  drawTabletopRoi();
+};
+document.getElementById('cancelRoiBtn').onclick = () => {
+  roiDraftPoints = [];
+  roiCalibrating = false;
+  document.getElementById('cancelRoiBtn').style.display = 'none';
+  drawTabletopRoi();
+};
+document.getElementById('clearRoiBtn').onclick = async () => {
+  const data = await postJSON('/api/workbench/tabletop-roi/clear', {});
+  tabletopRoi = data.tabletop_roi;
+  roiDraftPoints = [];
+  roiCalibrating = false;
+  document.getElementById('cancelRoiBtn').style.display = 'none';
+  drawTabletopRoi();
+  appendLog('桌面ROI已清除');
+};
+document.getElementById('sceneRoiOverlay').onclick = async (event) => {
+  if (!roiCalibrating || roiDraftPoints.length >= 5) return;
+  const rect = event.currentTarget.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+  roiDraftPoints.push([Number(x.toFixed(6)), Number(y.toFixed(6))]);
+  drawTabletopRoi();
+  if (roiDraftPoints.length === 5) {
+    try { await saveRoiDraft(); }
+    catch (err) {
+      appendLog(`ROI保存失败：${err.message || err}`);
+      roiDraftPoints = [];
+      drawTabletopRoi();
+    }
+  }
+};
 document.getElementById('scanSceneBtn').onclick = async () => {
-  appendLog('场景工作台：开始已知资产定位和开放世界桌面扫描');
-  await postJSON('/api/perception/run', {config: {object_names: knownScanObjects, confirm_segmentation: true, open_world_max_instances: 32}});
+  const btn = document.getElementById('scanSceneBtn');
+  const status = document.getElementById('scanSceneStatus');
+  btn.disabled = true;
+  renderVirtualScene(null);
+  btn.textContent = '正在启动…';
+  status.textContent = '正在检查模型和相机…';
+  appendLog('任务工作台：开始已知资产定位和开放世界桌面扫描');
+  try {
+    await postJSON('/api/perception/run', {config: {object_names: knownScanObjects, confirm_segmentation: true, open_world_max_instances: 32}});
+    status.textContent = '扫描任务已启动，请等待画面和资产清单更新。';
+    appendLog('扫描任务已启动');
+  } catch (err) {
+    const message = err.message || String(err);
+    status.textContent = `扫描未启动：${message}`;
+    appendLog(`扫描未启动：${message}`);
+    btn.disabled = false;
+    btn.textContent = '扫描桌面并定位';
+  }
+  await refreshStatus();
 };
 document.getElementById('refreshInventoryBtn').onclick = async () => {
   const data = await postJSON('/api/workbench/refresh', {});
@@ -4048,7 +4915,7 @@ document.getElementById('syncPlanBtn').onclick = () => {
   slotOrderState = [...new Set([...plannedSlots, ...slotOrderState])].slice(0, 6);
   renderPlacementMapping();
   switchTab('pickTab');
-  appendLog(`已同步 ${targetOrder.length} 个已知抓取动作到 PickPlace`);
+  appendLog(`已将 ${targetOrder.length} 个已知抓取动作送到底层调试配置`);
 };
 document.getElementById('validatePlanBtn').onclick = async () => {
   const data = await postJSON('/api/workbench/plan', {actions: workbenchActions, freeze: true});
@@ -4073,8 +4940,20 @@ document.getElementById('debugPackBtn').onclick = async () => {
   if (el) el.onchange = () => { renderSafety(window.lastStatusData || {}); renderSequencePreview(buildLocalMappingPreview()); };
 });
 document.getElementById('runPerceptionBtn').onclick = async () => {
+  const btn = document.getElementById('runPerceptionBtn');
+  btn.disabled = true;
+  btn.textContent = '正在启动…';
   appendLog('启动一次分割定位，不执行抓取；复用常驻 SAM3/SAM6D');
-  await postJSON('/api/perception/run', {config: perceptionConfig()});
+  try {
+    await postJSON('/api/perception/run', {config: perceptionConfig()});
+    appendLog('分割定位任务已启动');
+  } catch (err) {
+    appendLog(`分割定位未启动：${err.message || err}`);
+  } finally {
+    btn.textContent = '重新分割定位';
+    await refreshStatus();
+    if (!window.lastStatusData?.perception?.running) btn.disabled = false;
+  }
 };
 document.getElementById('stopPerceptionBtn').onclick = async () => { await postJSON('/api/perception/stop'); };
 document.getElementById('buildCmdBtn').onclick = async () => {
@@ -4116,6 +4995,17 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
   btn.onclick = () => switchTab(btn.dataset.tab);
 });
 document.getElementById('llmReloadScenesBtn').onclick = async () => { await loadLlmScenes(); appendLog('LLM 场景列表已刷新'); };
+document.getElementById('llmLoadSceneBtn').onclick = async () => {
+  try { await loadVirtualScene(true); }
+  catch (err) { appendLog(`虚拟场景加载失败：${err.message || err}`); }
+};
+document.getElementById('llmSceneFile').onchange = () => {
+  renderVirtualScene(null);
+  suppressLatestLlmRestore = true;
+  renderLlmResult(null);
+  document.getElementById('llmStatusText').textContent = '场景选择已变化，请点击“加载虚拟场景”。';
+  updateWorkspaceFlow(window.lastStatusData || {});
+};
 document.getElementById('llmPlanBtn').onclick = async () => {
   try { await runLlmPlan(); }
   catch (err) {
@@ -4126,6 +5016,21 @@ document.getElementById('llmPlanBtn').onclick = async () => {
 document.getElementById('llmRunBtn').onclick = async () => {
   try { await startLlmPlan(); }
   catch (err) { appendLog(`LLM 执行启动失败：${err.message || err}`); }
+};
+document.getElementById('llmValidateBtn').onclick = async () => {
+  try { await validateLlmPlan(); }
+  catch (err) { appendLog(`三级验证启动失败：${err.message || err}`); }
+};
+document.getElementById('llmManiskillPreviewBtn').onclick = async () => {
+  try { await openManiskillPreview(); }
+  catch (err) { appendLog(`ManiSkill 场景预览启动失败：${err.message || err}`); }
+};
+document.getElementById('llmManiskillPreviewStopBtn').onclick = async () => {
+  try { await postJSON('/api/llm/maniskill-preview/stop', {}); }
+  catch (err) { appendLog(`ManiSkill 场景预览停止失败：${err.message || err}`); }
+};
+document.getElementById('maniskillPreviewDialogCloseBtn').onclick = () => {
+  document.getElementById('maniskillPreviewDialog').close();
 };
 document.getElementById('llmStopBtn').onclick = async () => { await postJSON('/api/llm/stop'); };
 
@@ -4145,7 +5050,9 @@ setInterval(refreshStatus, 2000);
 setInterval(refreshImages, 2500);
 initControls();
 renderActionQueue();
-loadLlmScenes().catch((err) => appendLog(`LLM 场景列表加载失败：${err.message || err}`));
+loadLlmScenes()
+  .then(() => loadVirtualScene(false))
+  .catch((err) => appendLog(`虚拟场景列表或默认场景加载失败：${err.message || err}`));
 renderLlmResult(null);
 renderPreflight({ok:false, checks:[], mapping:buildLocalMappingPreview()});
 refreshStatus();

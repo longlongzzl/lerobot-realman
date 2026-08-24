@@ -34,6 +34,13 @@ class ObjectSpec:
     sim_linear_damping: float | None = None
     sim_angular_damping: float | None = None
     scene_obstacle_box_scale: float | None = None
+    attachment_num_spheres: int | None = None
+    # Orientation equivalence used by relation search and validation.
+    # ``axial`` preserves the directed long axis but ignores spin around it;
+    # ``axial_bidirectional`` additionally treats +axis/-axis as equivalent;
+    # ``spherical`` ignores the complete object rotation.
+    orientation_symmetry: str = "none"
+    symmetry_axis_local: tuple[float, float, float] | None = None
 
 
 DEFAULT_FIXED_GOAL_JOINTS_DEG = (178.0, -5.0, 0.0, -70.0, 0.0, -102.0, 60.0)
@@ -72,6 +79,8 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
         sim_linear_damping=0.15,
         sim_angular_damping=8.0,
         scene_obstacle_box_scale=1.5,
+        orientation_symmetry="axial_bidirectional",
+        symmetry_axis_local=(0.0, 1.0, 0.0),
     ),
     "beizi": ObjectSpec(
         name="cup",
@@ -107,6 +116,8 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
         real_longest_axis_m=0.15,
         fixed_goal_joints_deg=DEFAULT_FIXED_GOAL_JOINTS_DEG,
         grasp_mode="long_axis_adaptive",
+        orientation_symmetry="axial",
+        symmetry_axis_local=(0.0, 1.0, 0.0),
     ),
     "desk": ObjectSpec(
         name="desk",
@@ -152,7 +163,11 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
         sim_asset_file="meshs/tennis_sim.glb",
         real_longest_axis_m=0.07,
         fixed_goal_joints_deg=DEFAULT_FIXED_GOAL_JOINTS_DEG,
-        grasp_mode="topdown_long_axis",
+        # A sphere has no stable semantic long axis. Mesh-bound noise and the
+        # observed 6D rotation otherwise produce arbitrary, often unreachable
+        # wrist yaw candidates.
+        grasp_mode="topdown_symmetric",
+        orientation_symmetry="spherical",
     ),
     "greenpen": ObjectSpec(
         name="greenpen",
@@ -182,6 +197,8 @@ OBJECT_SPECS: Dict[str, ObjectSpec] = {
         sim_restitution=0.0,
         sim_linear_damping=0.12,
         sim_angular_damping=6.0,
+        orientation_symmetry="axial",
+        symmetry_axis_local=(0.0, 1.0, 0.0),
     ),
     # ---------------  roof assembly  ---------------
     "red_bricks_cube": ObjectSpec(

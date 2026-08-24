@@ -10,6 +10,7 @@ import numpy as np
 import trimesh
 
 from rm75_app.assets.object_specs import get_object_spec, resolve_object_spec_scales
+from rm75_app.assets.collision_proxy import build_automatic_collision_proxy
 from rm75_app.planning.contracts import CollisionObject, PlanningScene, Pose, PoseCandidate
 
 
@@ -97,13 +98,10 @@ def load_cached_known_object_scene(
     mesh_path = Path(spec.mesh_file).expanduser().resolve()
     extents = _mesh_extents(mesh_path, mesh_scale)
     T_base_object = _clamp_to_table(T_base_object, extents, table_z)
-    object_pose = Pose(T_base_object[:3, 3], matrix_to_quaternion_wxyz(T_base_object[:3, :3]))
-    collision = CollisionObject(
+    collision = build_automatic_collision_proxy(
         object_name,
-        "mesh",
-        object_pose,
-        mesh_path=mesh_path,
-        scale=[mesh_scale, mesh_scale, mesh_scale],
+        spec,
+        T_base_object,
     )
     table = CollisionObject(
         "virtual_table_plane",

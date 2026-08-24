@@ -14,7 +14,11 @@ PICKPLACE_LAYERS = (
     PickPlaceLayer(
         key="task",
         responsibility="任务对象、目标和运行模式定义",
-        modules=("rm75_app.tasks.pickplace", "rm75_app.pickplace.config"),
+        modules=(
+            "rm75_app.tasks.pickplace",
+            "rm75_app.tasks.manipulation_plan",
+            "rm75_app.pickplace.config",
+        ),
     ),
     PickPlaceLayer(
         key="perception",
@@ -29,7 +33,11 @@ PICKPLACE_LAYERS = (
     PickPlaceLayer(
         key="placement",
         responsibility="目标对象、放置规则和候选目标姿态",
-        modules=("rm75_app.placement.place_rules", "rm75_app.pickplace.coordinator"),
+        modules=(
+            "rm75_app.placement.place_rules",
+            "rm75_app.pickplace.atom_task_builder",
+            "rm75_app.pickplace.coordinator",
+        ),
     ),
     PickPlaceLayer(
         key="planning",
@@ -44,11 +52,20 @@ PICKPLACE_LAYERS = (
     PickPlaceLayer(
         key="execution",
         responsibility="仿真/真机运动、夹爪动作和结果校验",
-        modules=("rm75_app.execution.trajectory_executor",),
+        modules=(
+            "rm75_app.execution.trajectory_executor",
+            "rm75_app.execution.maniskill_task_bridge",
+        ),
     ),
     PickPlaceLayer(
         key="orchestration",
-        responsibility="显式组织抓取、附着、搬运、释放和撤退状态边界",
-        modules=("rm75_app.pickplace.coordinator", "rm75_app.runtime.curobo2_pick_place"),
+        responsibility="显式组织任务依赖、三级验证、抓取、附着、搬运、释放和撤退状态边界",
+        modules=(
+            "rm75_app.orchestration.multi_object_executor",
+            "rm75_app.validation.three_gate",
+            "rm75_app.pickplace.multi_object_adapter",
+            "rm75_app.pickplace.coordinator",
+            "rm75_app.runtime.curobo2_pick_place",
+        ),
     ),
 )

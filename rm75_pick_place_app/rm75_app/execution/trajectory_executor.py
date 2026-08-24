@@ -67,6 +67,16 @@ class RecordingTrajectoryExecutor:
         )
         self._save()
 
+    def begin_atom(self, atom_id: str) -> None:
+        self.events.append({"type": "atom_start", "atom_id": str(atom_id)})
+        self._save()
+
+    def end_atom(self, atom_id: str, *, success: bool) -> None:
+        self.events.append(
+            {"type": "atom_end", "atom_id": str(atom_id), "success": bool(success)}
+        )
+        self._save()
+
     def set_gripper(self, closed: bool) -> None:
         self.events.append({"type": "gripper", "closed": bool(closed)})
         self._save()
@@ -79,8 +89,10 @@ class ManiSkillTrajectoryExecutor:
         self,
         demo: Any,
         *,
-        gripper_open: float = -1.0,
-        gripper_closed: float = 1.0,
+        # RM75's normalized mimic controller maps +1 to about 0.91 rad
+        # (open) and -1 to the zero-position closed state.
+        gripper_open: float = 1.0,
+        gripper_closed: float = -1.0,
         gripper_steps: int = 20,
         max_path_points: int = 400,
     ):

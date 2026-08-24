@@ -121,6 +121,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_curobo2_sim = sub.add_parser("curobo2-sim-replay", help="Replay a portable Curobo2 trajectory package in ManiSkill")
     p_curobo2_sim.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the ManiSkill replay module")
+    p_task_validation = sub.add_parser("task-validate", help="Run geometry, Curobo2 and ManiSkill task gates")
+    p_task_validation.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the three-gate validator")
+    p_maniskill_preview = sub.add_parser("maniskill-preview", help="Open a task scene and target poses in ManiSkill")
+    p_maniskill_preview.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed to the interactive preview")
 
     p_tabletop_refine = sub.add_parser(
         "tabletop-refine",
@@ -243,6 +247,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_app_module("rm75_app.runtime.curobo2_pick_place", _split_passthrough(ns.args))
     if ns.cmd == "curobo2-sim-replay":
         return run_app_module("rm75_app.runtime.curobo2_sim_replay", _split_passthrough(ns.args))
+    if ns.cmd == "task-validate":
+        return run_app_module("rm75_app.runtime.task_validation", _split_passthrough(ns.args))
+    if ns.cmd == "maniskill-preview":
+        return run_app_module("rm75_app.runtime.maniskill_scene_preview", _split_passthrough(ns.args))
     if ns.cmd == "tabletop-refine":
         return _run_registered_pickplace("tabletop-refine", _split_passthrough(ns.args))
     if ns.cmd == "wrist-live-overlay":

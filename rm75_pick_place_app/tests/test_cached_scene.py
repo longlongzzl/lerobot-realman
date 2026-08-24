@@ -18,8 +18,9 @@ def test_cached_carrot_perception_becomes_planning_scene() -> None:
     assert scene.T_base_object.shape == (4, 4)
     assert scene.T_base_object[2, 3] > 0.0
     assert [item.name for item in scene.scene.objects] == ["virtual_table_plane", "carriot"]
-    assert scene.object_collision.mesh_path.name == "carriot.glb"
-    assert np.all(np.asarray(scene.object_collision.scale) > 0.0)
+    assert scene.object_collision.kind == "cuboid"
+    assert Path(scene.object_collision.metadata["visual_mesh_path"]).name == "carriot.glb"
+    assert np.all(np.asarray(scene.object_collision.dimensions) > 0.0)
 
     candidates = topdown_grasp_candidates(scene)
     assert len(candidates) == 4

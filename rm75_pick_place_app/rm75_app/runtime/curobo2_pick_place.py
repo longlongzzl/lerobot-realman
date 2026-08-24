@@ -53,12 +53,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-ik-seeds", type=int, default=64)
     parser.add_argument("--num-trajopt-seeds", type=int, default=4)
     parser.add_argument("--max-attempts", type=int, default=3)
-    parser.add_argument("--use-cuda-graph", action="store_true")
+    parser.add_argument(
+        "--use-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep cuRobo2 on its warmed CUDA-Graph fast path (default: enabled).",
+    )
     parser.add_argument(
         "--attachment-num-spheres",
         type=int,
-        default=16,
-        help="Attached-object collision approximation; use 0 only for diagnostics.",
+        default=64,
+        help="Maximum slots for cuRobo2 automatic attached-object sphere fitting; use 0 only for diagnostics.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args(argv)

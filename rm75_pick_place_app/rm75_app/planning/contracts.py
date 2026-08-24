@@ -125,6 +125,7 @@ class BatchPlanningRequest:
     current: JointConfiguration
     candidates: tuple[PoseCandidate, ...]
     scene: PlanningScene = field(default_factory=PlanningScene)
+    current_by_candidate: Mapping[str, JointConfiguration] = field(default_factory=dict)
     tool_frame: str = "gripper_tcp"
     max_attempts: int = 2
     prefer_unbiased_ik: bool = False
@@ -139,6 +140,18 @@ class BatchPlanningRequest:
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
         object.__setattr__(self, "candidates", candidates)
+        currents = {str(key): value for key, value in self.current_by_candidate.items()}
+        unknown = set(currents) - set(identifiers)
+        if unknown:
+            raise ValueError(
+                f"candidate current mapping contains unknown ids: {sorted(unknown)}"
+            )
+        for candidate_id, current in currents.items():
+            if current.names != self.current.names:
+                raise ValueError(
+                    f"candidate current {candidate_id!r} uses different joint names"
+                )
+        object.__setattr__(self, "current_by_candidate", currents)
 
 
 @dataclass(frozen=True)
@@ -168,6 +181,10 @@ class CandidatePlan:
     orientation_error: float | None = None
     solve_time: float = 0.0
     status: str | None = None
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
 
 
 @dataclass(frozen=True)
@@ -195,6 +212,12 @@ class GraspPlanningRequest:
     approach_axis: Literal["x", "y", "z"] = "z"
     approach_offset: float = -0.10
     approach_in_tool_frame: bool = True
+    phase: Literal["pick", "place"] = "pick"
+    disable_collision_links: tuple[str, ...] | None = None
+    plan_lift: bool = False
+    lift_axis: Literal["x", "y", "z"] = "z"
+    lift_offset: float = 0.10
+    lift_in_tool_frame: bool = False
 
 
 @dataclass(frozen=True)
@@ -203,13 +226,24 @@ class GraspCandidatePlan:
     success: bool
     approach: JointTrajectory | None = None
     grasp: JointTrajectory | None = None
+    lift: JointTrajectory | None = None
     status: str | None = None
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
 
     @property
     def grasp_configuration(self) -> JointConfiguration | None:
         if self.grasp is None or len(self.grasp.positions) == 0:
             return None
         return JointConfiguration(self.grasp.joint_names, self.grasp.positions[-1])
+
+    @property
+    def lift_configuration(self) -> JointConfiguration | None:
+        if self.lift is None or len(self.lift.positions) == 0:
+            return None
+        return JointConfiguration(self.lift.joint_names, self.lift.positions[-1])
 
 
 @dataclass(frozen=True)

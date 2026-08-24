@@ -102,9 +102,22 @@ class SceneWorkbench:
     def _save(self) -> None:
         _atomic_json(self.state_path, self._state)
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, include_details: bool = False) -> dict[str, Any]:
         with self._lock:
-            return json.loads(json.dumps(self._state))
+            state = json.loads(json.dumps(self._state))
+        if include_details:
+            return state
+        snapshot = state.get("snapshot") or {}
+        for instance in snapshot.get("instances") or []:
+            pose = instance.get("pose")
+            if not isinstance(pose, dict):
+                continue
+            instance["pose"] = {
+                key: pose.get(key)
+                for key in ("ok", "score", "translation_m", "refine_applied")
+                if pose.get(key) is not None
+            }
+        return state
 
     def _asset_readiness(self, name: str) -> dict[str, Any]:
         bank_candidates = sorted(self.bank_root.glob(f"{name}_*.npz"))
@@ -219,7 +232,7 @@ class SceneWorkbench:
                 instances.append(
                     {
                         "asset_name": None,
-                        "display_name": "未见物体",
+                        "display_name": str((item.get("vlm") or {}).get("noun_phrase") or item.get("prompt") or "未见物体"),
                         "knownness": "unknown",
                         "confidence": _score(item),
                         "reason": "桌面实例候选未与任何已知资产掩码匹配",
@@ -227,7 +240,8 @@ class SceneWorkbench:
                         "mask_path": item.get("mask_path"),
                         "pose": None,
                         "asset": {"registered": False, "rrtrack_bank_ready": False, "rrtrack_bank_path": None},
-                        "source": "open_world_scan",
+                        "source": "qwen_vl_sam3" if item.get("vlm") else "open_world_scan",
+                        "vlm": item.get("vlm"),
                     }
                 )
 

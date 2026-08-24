@@ -3,3 +3,6 @@ runtime_data/*
 
 # Local tooling caches.
 .cache/
+
+# Local secrets and service configuration.
+.env

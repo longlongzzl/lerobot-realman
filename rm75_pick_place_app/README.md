@@ -59,6 +59,8 @@ rm75_pick_place_app/
 - `pickplace/coordinator.py` 显式管理 approach、grasp、attach、lift、preplace、place、detach 和 retreat；Curobo2 张量不会越过 `planning/` 边界。
 - 可提前求解的抓取/放置候选 IK 按批处理；attach/detach 改变碰撞世界，因此对应轨迹优化仍保持顺序边界。
 - 1.0.24 已删除旧的 2 万行 direct 单体执行器及其 cuRobo v1/targeted/SAM6D/wrist 包装链；历史实现仍可从 Git 提交 `8aa9fae` 恢复。
+- 1.0.25 补齐多物体原子任务、LLM 清单执行、前端场景工作台与 geometry/cuRobo2/ManiSkill 三级验证，并将 cuRobo2 候选筛选和分段轨迹规划切到常驻批量求解与 CUDA Graph 快速路径。
+- 1.0.25 的固定场景 geometry 与 cuRobo2 验证已通过；ManiSkill 场景预览已接通，但物理夹取仍需继续校准 TCP、夹爪碰撞体和控制跟踪，当前不作为真机流程的通过依据。
 - `direct` 只作为 `curobo2` 的命令别名；`sam6d` 现在只运行位姿感知，不再隐式启动旧抓取执行器。
 - Jimu 和 Lego 现在是明确标记为 `compatibility` 的适配器：统一入口已经在主线，具体旧执行器还没有搬进来，避免把旧耦合伪装成完成迁移。
 
